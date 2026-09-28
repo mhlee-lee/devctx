@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "결정의 상태 변화",
+    "viewBox": [1030, 630],
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "main", "label": "기본 흐름", "focus": ["talk", "judge", "active", "superseded"], "note": "명확한 지시는 바로 active가 되고, 정책이 바뀌면 이전 결정은 superseded가 된다." },
+      { "id": "unclear", "label": "애매한 지시", "focus": ["judge", "proposed", "active", "retired"], "note": "애매한 지시는 proposed로 기다리다가 다시 언급되면 active, 30일 동안 없으면 retired." },
+      { "id": "conflict", "label": "충돌", "focus": ["active", "conflict", "superseded"], "note": "다른 사람의 규칙과 부딪히면 conflict로 두고, 관련 작업을 할 때 한 번 묻는다." }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "기본 흐름" },
+    { "id": "wait", "label": "확인이 필요한 상태" },
+    { "id": "terminal", "label": "종료" }
+  ],
+  "states": [
+    { "id": "talk", "type": "start", "label": "대화", "sublabel": "규칙을 말함", "lane": "main", "col": 0, "step": "01", "tag": "hook" },
+    { "id": "judge", "type": "decision", "label": "판정", "sublabel": "기존 결정과 비교", "lane": "main", "col": 1, "step": "02", "tag": "LLM" },
+    { "id": "active", "type": "active", "label": "active", "sublabel": "모든 도구에 전달", "lane": "main", "col": 2, "step": "03", "tag": "적용" },
+    { "id": "superseded", "type": "neutral", "label": "superseded", "sublabel": "새 결정이 대체", "lane": "main", "col": 4, "step": "04", "tag": "기록만" },
+    { "id": "proposed", "type": "waiting", "label": "proposed", "sublabel": "재확인 대기", "lane": "wait", "col": 0, "tag": "대기" },
+    { "id": "conflict", "type": "waiting", "label": "conflict", "sublabel": "한 번 묻는다", "lane": "wait", "col": 1, "tag": "충돌" },
+    { "id": "retired", "type": "failure", "label": "retired", "sublabel": "30일 미확인", "lane": "terminal", "col": 0, "tag": "만료" }
+  ],
+  "transitions": [
+    { "id": "talk-judge", "from": "talk", "to": "judge" },
+    { "id": "judge-active", "from": "judge", "to": "active", "variant": "emphasis" },
+    { "id": "active-superseded", "from": "active", "to": "superseded", "label": "정책 변경", "variant": "emphasis" },
+    { "id": "judge-proposed", "from": "judge", "to": "proposed", "label": "애매함", "variant": "dashed", "fromSide": "bottom", "toSide": "left", "via": [[248, 307]] },
+    { "id": "proposed-active", "from": "proposed", "to": "active", "label": "다시 언급", "fromSide": "top", "toSide": "bottom", "route": "straight" },
+    { "id": "proposed-retired", "from": "proposed", "to": "retired", "label": "30일", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [402, 393] },
+    { "id": "active-conflict", "from": "active", "to": "conflict", "label": "반대 규칙", "variant": "security", "fromSide": "bottom", "toSide": "top" },
+    { "id": "conflict-superseded", "from": "conflict", "to": "superseded", "label": "사용자 답", "fromSide": "right", "toSide": "bottom", "via": [[710, 307]] }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "바로 적용", "items": ["명확한 지시(앞으로, 항상)는 바로 active", "사용자 지시가 AI 제안보다 우선"] },
+    { "dot": "amber", "title": "자동 정리", "items": ["정책이 바뀌면 이전 결정은 superseded", "애매한 제안은 30일 확인이 없으면 retired"] },
+    { "dot": "rose", "title": "충돌", "items": ["다른 사람의 규칙은 몰래 바꾸지 않는다", "답하면 고른 쪽 active, 나머지 superseded"] }
+  ]
+}

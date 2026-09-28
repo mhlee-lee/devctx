@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "대화 한 턴에서 일어나는 일",
+    "viewBox": [1080, 600],
+    "column_fit": "spread",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "capture", "label": "캡처", "focus": ["dev", "tool", "hook", "state"], "note": "hook은 프롬프트를 기록하고 관련 결정을 붙인 뒤 바로 끝난다." },
+      { "id": "organize", "label": "정리", "focus": ["hook", "worker", "llm", "repo"], "note": "턴이 끝나면 worker가 백그라운드에서 추출과 판정을 하고 파일을 고친다." },
+      { "id": "next", "label": "다음 세션", "focus": ["repo", "tool"], "note": "바뀐 결정은 다음 세션부터 모든 도구에 그대로 전달된다." }
+    ]
+  },
+  "participants": [
+    { "id": "dev", "type": "external", "label": "개발자" },
+    { "id": "tool", "type": "frontend", "label": "AI 도구", "sublabel": "5개 도구" },
+    { "id": "hook", "type": "backend", "label": "devctx hook", "sublabel": "약 0.1초" },
+    { "id": "state", "type": "database", "label": "state.sqlite", "sublabel": "로컬" },
+    { "id": "worker", "type": "backend", "label": "worker", "sublabel": "백그라운드" },
+    { "id": "llm", "type": "external", "label": "도구 CLI", "sublabel": "선택된 모델" },
+    { "id": "repo", "type": "database", "label": "저장소", "sublabel": "Git 공유 파일" }
+  ],
+  "segments": [
+    { "from": 168, "to": 300, "label": "캡처: 도구는 기다리지 않는다" },
+    { "from": 306, "to": 470, "label": "정리: 백그라운드" },
+    { "from": 478, "to": 505, "label": "다음 세션" }
+  ],
+  "messages": [
+    { "id": "say-rule", "from": "dev", "to": "tool", "y": 180, "label": "앞으로 금액은 Long으로 해", "variant": "emphasis" },
+    { "id": "prompt-hook", "from": "tool", "to": "hook", "y": 208, "label": "UserPromptSubmit", "variant": "default" },
+    { "id": "record", "from": "hook", "to": "state", "y": 236, "label": "이벤트 기록", "variant": "default" },
+    { "id": "inject", "from": "hook", "to": "tool", "y": 264, "label": "관련 결정 주입", "variant": "return" },
+    { "id": "stop-hook", "from": "tool", "to": "hook", "y": 292, "label": "답변 후 Stop", "variant": "default" },
+    { "id": "spawn", "from": "hook", "to": "worker", "y": 320, "label": "worker 실행 (분리)", "variant": "dashed" },
+    { "id": "extract", "from": "worker", "to": "llm", "y": 348, "label": "규칙 추출", "variant": "emphasis" },
+    { "id": "candidates", "from": "llm", "to": "worker", "y": 376, "label": "규칙 후보", "variant": "return" },
+    { "id": "judge", "from": "worker", "to": "llm", "y": 404, "label": "기존 결정과 비교", "variant": "default" },
+    { "id": "verdict", "from": "llm", "to": "worker", "y": 432, "label": "supersede", "variant": "return" },
+    { "id": "write", "from": "worker", "to": "repo", "y": 460, "label": "결정 파일 · AGENTS.md 갱신", "variant": "emphasis" },
+    { "id": "next-session", "from": "repo", "to": "tool", "y": 492, "label": "다음 세션에서 읽음", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "tool", "from": 175, "to": 297, "type": "frontend" },
+    { "participant": "hook", "from": 203, "to": 269, "type": "backend" },
+    { "participant": "hook", "from": 287, "to": 325, "type": "backend" },
+    { "participant": "state", "from": 231, "to": 241, "type": "database" },
+    { "participant": "worker", "from": 315, "to": 465, "type": "backend" },
+    { "participant": "llm", "from": 343, "to": 381, "type": "external" },
+    { "participant": "llm", "from": 399, "to": 437, "type": "external" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "할 일 없음", "items": ["hook은 기록하고 바로 끝난다", "추출과 판정은 턴이 끝난 뒤 백그라운드에서 한다"] },
+    { "dot": "violet", "title": "정책 변경", "items": ["바뀐 규칙은 이전 규칙을 대체한다 (superseded)", "다른 사람의 규칙과 부딪히면 conflict로 남기고 한 번 묻는다"] },
+    { "dot": "amber", "title": "토큰", "items": ["프롬프트마다 관련 결정만 600토큰 이내로 붙인다", "AGENTS.md 핵심 규칙은 1500토큰 이내로 유지한다"] }
+  ]
+}

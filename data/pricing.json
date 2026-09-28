@@ -1,0 +1,42 @@
+{
+  "as_of": "2026-09-28",
+  "note": "Seed prices used to rank models inside each provider. usd = USD per 1M tokens (in/out). relative = provider multiplier (Kiro: Auto = 1.0). Community price lists refine unknown models at runtime; qualification decides adequacy.",
+  "units": { "claude": "usd", "codex": "usd", "copilot": "usd", "cursor": "usd", "kiro": "relative", "fake": "usd" },
+  "models": [
+    { "provider": "claude", "model": "haiku", "in": 1.0, "out": 5.0 },
+    { "provider": "claude", "model": "sonnet", "in": 2.0, "out": 10.0 },
+    { "provider": "claude", "model": "opus", "in": 4.0, "out": 20.0 },
+    { "provider": "claude", "model": "fable", "in": 10.0, "out": 50.0 },
+
+    { "provider": "codex", "model": "gpt-6-luna", "in": 0.1, "out": 0.5 },
+    { "provider": "codex", "model": "gpt-6-sol", "in": 2.0, "out": 10.0, "note": "from Codex credit ratio (Luna 2.5 / Sol 50 per 1M input)" },
+    { "provider": "codex", "model": "gpt-6-astra", "in": 10.0, "out": 50.0, "note": "from Codex credit ratio (Astra 250 per 1M input)" },
+    { "provider": "codex", "model": "gpt-5.6-luna", "in": 0.2, "out": 1.2 },
+
+    { "provider": "copilot", "model": "gpt-6-luna", "in": 0.1, "out": 0.5 },
+    { "provider": "copilot", "model": "gpt-5.4-nano", "in": 0.2, "out": 1.25 },
+    { "provider": "copilot", "model": "gpt-5.6-luna", "in": 0.2, "out": 1.2 },
+    { "provider": "copilot", "model": "mai-code-1.1-flash", "in": 0.2, "out": 1.2 },
+    { "provider": "copilot", "model": "gpt-5-mini", "in": 0.25, "out": 2.0 },
+    { "provider": "copilot", "model": "gpt-5.4-mini", "in": 0.75, "out": 4.5 },
+    { "provider": "copilot", "model": "claude-haiku-4.5", "in": 1.0, "out": 5.0 },
+
+    { "provider": "cursor", "model": "gpt-5.6-luna", "in": 0.2, "out": 1.2 },
+    { "provider": "cursor", "model": "composer-2.5", "in": 0.5, "out": 2.5 },
+    { "provider": "cursor", "model": "gemini-3.8-flash", "in": 0.75, "out": 3.5 },
+    { "provider": "cursor", "model": "sonnet-5", "in": 2.0, "out": 10.0 },
+
+    { "provider": "kiro", "model": "qwen3-coder-next", "in": 0.05, "out": 0.05 },
+    { "provider": "kiro", "model": "minimax-m2.1", "in": 0.15, "out": 0.15 },
+    { "provider": "kiro", "model": "deepseek-3.2", "in": 0.25, "out": 0.25 },
+    { "provider": "kiro", "model": "minimax-m2.5", "in": 0.25, "out": 0.25 },
+    { "provider": "kiro", "model": "claude-haiku-4.5", "in": 0.4, "out": 0.4 },
+    { "provider": "kiro", "model": "glm-5", "in": 0.5, "out": 0.5 },
+    { "provider": "kiro", "model": "auto", "in": 1.0, "out": 1.0 },
+    { "provider": "kiro", "model": "gpt-5.6-luna", "in": 1.1, "out": 1.1 },
+    { "provider": "kiro", "model": "claude-sonnet-5", "in": 1.3, "out": 1.3 },
+    { "provider": "kiro", "model": "claude-opus-4.8", "in": 2.2, "out": 2.2 },
+    { "provider": "kiro", "model": "gpt-5.6-terra", "in": 2.2, "out": 2.2 },
+    { "provider": "kiro", "model": "gpt-5.6-sol", "in": 4.4, "out": 4.4 }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "추출 모델 고르기",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "first-use", "label": "처음 쓸 때", "focus": ["request", "host", "ladder", "suite", "call"], "note": "싼 후보부터 요구사항 평가를 돌리고, 처음 통과한 후보를 쓴다." },
+      { "id": "failed", "label": "불합격", "focus": ["suite", "next", "ladder"], "note": "하나라도 틀리면 불합격이고, 다음으로 싼 후보를 평가한다." },
+      { "id": "runtime", "label": "사용 중 위반", "focus": ["call", "demote", "next"], "note": "통과한 모델도 실제 답이 요구사항을 두 번 연속 어기면 강등된다." },
+      { "id": "account", "label": "계정 문제", "focus": ["host", "other"], "note": "로그인 만료나 쿼터 소진은 모델 실패로 치지 않고, 잠시 다른 도구 CLI를 쓴다." }
+    ]
+  },
+  "lanes": [
+    { "id": "work", "label": "worker" },
+    { "id": "route", "label": "모델 선택" },
+    { "id": "fail", "label": "실패 처리", "variant": "exception" }
+  ],
+  "mainPath": ["request", "host", "ladder", "suite", "call"],
+  "nodes": [
+    { "id": "request", "lane": "work", "col": 0, "type": "backend", "label": "추출 · 판정 요청", "sublabel": "작업마다 따로 고른다", "width": 150 },
+    { "id": "host", "lane": "route", "col": 1, "type": "frontend", "label": "작업 중인 도구 CLI", "sublabel": "같은 계정 · 같은 정책", "width": 150 },
+    { "id": "ladder", "lane": "route", "col": 2, "type": "backend", "label": "후보 정렬", "sublabel": "모델 × effort, 싼 순서", "width": 150 },
+    { "id": "suite", "lane": "route", "col": 3, "type": "security", "label": "요구사항 평가", "sublabel": "2회 연속 전부 통과", "tag": "결과 30일 보관", "width": 150 },
+    { "id": "call", "lane": "route", "col": 4, "type": "external", "label": "통과한 첫 후보 사용", "sublabel": "조건을 채우는 최저가", "width": 150 },
+    { "id": "next", "lane": "fail", "col": 3, "type": "messagebus", "label": "다음 후보", "sublabel": "조금 더 비싼 쪽", "width": 150 },
+    { "id": "demote", "lane": "fail", "col": 4, "type": "security", "label": "강등", "sublabel": "사용 중 위반 2회", "width": 150 },
+    { "id": "other", "lane": "fail", "col": 1, "type": "external", "label": "다음 도구 CLI", "sublabel": "로그인 · 쿼터 문제", "width": 150 }
+  ],
+  "edges": [
+    { "id": "request-host", "from": "request", "to": "host", "variant": "emphasis" },
+    { "id": "host-ladder", "from": "host", "to": "ladder", "label": "모델 목록" },
+    { "id": "ladder-suite", "from": "ladder", "to": "suite", "label": "싼 후보부터" },
+    { "id": "suite-call", "from": "suite", "to": "call", "label": "통과", "variant": "emphasis" },
+    { "id": "suite-next", "from": "suite", "to": "next", "label": "불합격", "variant": "security", "role": "error" },
+    { "id": "next-ladder", "from": "next", "to": "ladder", "label": "다음 순서", "variant": "dashed", "role": "return" },
+    { "id": "call-demote", "from": "call", "to": "demote", "label": "위반 반복", "variant": "security", "role": "error" },
+    { "id": "demote-next", "from": "demote", "to": "next", "variant": "dashed", "role": "branch" },
+    { "id": "host-other", "from": "host", "to": "other", "label": "계정 문제", "variant": "dashed", "role": "branch" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "기준", "items": ["작업마다 요구사항을 2회 연속 전부 통과해야 쓴다", "통과한 후보 중 예상 비용이 가장 낮은 것"] },
+    { "dot": "violet", "title": "신규 모델", "items": ["CLI의 모델 목록에서 자동으로 후보가 된다", "작은 모델의 높은 effort를 큰 모델보다 먼저"] },
+    { "dot": "amber", "title": "실측 예시 (2026-09, Codex)", "items": ["추출: gpt-5.6-luna@low (약 $0.0018/회)", "판정: gpt-6-luna@low (약 $0.0006/회)"] }
+  ]
+}
