@@ -1,6 +1,6 @@
-import { planTiers, itemLine } from '../compile/tiers.ts';
+import { isExpired, itemLine, planTiers } from '../compile/tiers.ts';
 import type { DevctxConfig } from '../config.ts';
-import { searchItems } from '../knowledge/retrieve.ts';
+import { scoreAll, type ScoreParts } from '../knowledge/retrieve.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import type { Language } from '../types.ts';
 import { approxTokens } from '../util/text.ts';
@@ -22,29 +22,69 @@ const TEXT: Record<Language, { personal: string; conflict: string; related: stri
   },
 };
 
+/** Relevance hits below this score are not injected. */
+export const PROMPT_MIN_SCORE = 0.12;
+const PROMPT_LIMIT = 8;
+
 export interface InjectedContext {
   text: string | null;
   ids: string[];
 }
 
+/**
+ * Packs lines into a token budget. A line that does not fit is skipped and packing continues
+ * with the next one (Hindsight's packing), so one long rule does not crowd out shorter ones.
+ */
 function fitBudget(lines: { id: string; line: string }[], budget: number): { id: string; line: string }[] {
   const out: { id: string; line: string }[] = [];
   let used = 0;
   for (const entry of lines) {
     const cost = approxTokens(entry.line);
-    if (used + cost > budget) break;
+    if (used + cost > budget) continue;
     out.push(entry);
     used += cost;
   }
   return out;
 }
 
-/** Injected once per session: personal preferences and unresolved conflicts. */
-export function sessionContext(team: readonly KnowledgeItem[], personal: readonly KnowledgeItem[], cfg: DevctxConfig): InjectedContext {
+const ACK =
+  /^(ok(ay)?|k|y(es)?|no?|네|넵|예|응|ㅇㅇ|ㅇㅋ|오케이|좋아(요)?|고마워(요)?|감사(합니다)?|thanks?|thank you|thx|ty|lgtm|done|go( on)?|continue|계속(해)?|진행(해)?|해줘|그래|맞아)[\s.!~?]*$/i;
+
+/**
+ * Prompts that never need project decisions: slash commands and shell escapes (the tool handles
+ * them itself) and bare acknowledgements ("응", "continue"). Their words would only match rules
+ * by accident (OpenViking and Atlas skip them for the same reason).
+ */
+export function promptKind(prompt: string): 'command' | 'ack' | 'normal' {
+  const p = prompt.trim();
+  if (/^[/!]/.test(p)) return 'command';
+  if (p.length === 0 || ACK.test(p)) return 'ack';
+  return 'normal';
+}
+
+const NOTICE: Record<Language, string> = {
+  ko: '[devctx] 사용자에게 한 번만 알릴 것 (devctx 상태):',
+  en: '[devctx] Tell the user once (devctx status):',
+};
+
+/**
+ * Injected once per session: devctx health notices (the agent passes them on), personal
+ * preferences and unresolved conflicts.
+ */
+export function sessionContext(
+  team: readonly KnowledgeItem[],
+  personal: readonly KnowledgeItem[],
+  cfg: DevctxConfig,
+  notices: readonly string[] = [],
+): InjectedContext {
   const t = TEXT[cfg.language];
   let budget = cfg.inject.session_budget_tokens;
   const parts: string[] = [];
   const ids: string[] = [];
+  if (notices.length > 0) {
+    parts.push(NOTICE[cfg.language], ...notices.map((n) => `- ${n}`));
+    budget -= approxTokens(parts.join('\n'));
+  }
   const addBlock = (header: string, items: readonly KnowledgeItem[], render: (i: KnowledgeItem) => string): void => {
     if (items.length === 0) return;
     const fitted = fitBudget(
@@ -56,28 +96,70 @@ export function sessionContext(team: readonly KnowledgeItem[], personal: readonl
     ids.push(...fitted.map((f) => f.id));
     budget -= approxTokens(header) + fitted.reduce((n, f) => n + approxTokens(f.line), 0);
   };
-  addBlock(t.personal, personal.filter((i) => i.status === 'active'), (i) => `- ${i.summary}`);
-  addBlock(
-    t.conflict,
-    team.filter((i) => i.status === 'conflict' && i.audience === 'team'),
-    (i) => `- ${i.summary} [${i.id}]`,
-  );
+  addBlock(t.personal, personal.filter((i) => i.status === 'active' && !isExpired(i) && !i.local), (i) => `- ${i.summary}`);
+  addBlock(t.conflict, openConflicts(team), (i) => `- ${i.summary} [${i.id}]`);
   return { text: parts.length > 0 ? parts.join('\n') : null, ids };
 }
+
+function openConflicts(team: readonly KnowledgeItem[]): KnowledgeItem[] {
+  return team.filter((i) => i.status === 'conflict' && i.audience === 'team' && !isExpired(i));
+}
+
+export type TraceOutcome = 'injected' | 'fresh' | 'always loaded' | 'already injected' | 'below threshold' | 'over budget' | 'over limit' | 'skipped prompt';
+
+export interface TraceEntry {
+  item: KnowledgeItem;
+  score: number;
+  parts: ScoreParts | null;
+  outcome: TraceOutcome;
+}
+
+export interface PromptSelection extends InjectedContext {
+  kind: ReturnType<typeof promptKind>;
+  /** Every live team item and what happened to it (for `devctx why`). */
+  trace: TraceEntry[];
+}
+
+export interface PromptOptions {
+  sessionStartedAt: string | null;
+  alreadyInjected: ReadonlySet<string>;
+  /** Files declaring the code symbols the prompt names (code index). */
+  codePaths?: readonly string[];
+  /**
+   * How often the assistant broke each rule on this PC. Such rules are found more easily
+   * (ranking only: what AGENTS.md contains depends on committed files alone).
+   */
+  violations?: ReadonlyMap<string, number>;
+}
+
+/** Bonus per recorded violation, at most three. */
+const VIOLATION_BOOST = 0.1;
 
 /**
  * Injected per prompt. Two sources, never repeating an id already injected in this session:
  * 1. items recorded during this session (the tool loaded AGENTS.md before they existed)
- * 2. items not delivered by always-loaded files that match the prompt or the files it mentions
+ * 2. items not delivered by always-loaded files that match the prompt, the files it mentions or
+ *    the files declaring the code symbols it mentions
  */
-export function promptContext(
-  team: readonly KnowledgeItem[],
-  prompt: string,
-  cfg: DevctxConfig,
-  opts: { sessionStartedAt: string | null; alreadyInjected: ReadonlySet<string> },
-): InjectedContext {
+export function selectPromptContext(team: readonly KnowledgeItem[], prompt: string, cfg: DevctxConfig, opts: PromptOptions): PromptSelection {
+  const kind = promptKind(prompt);
+  const plan = planTiers(team, cfg);
+  const live = [...plan.core, ...plan.scoped, ...plan.onDemand, ...openConflicts(team)];
+  const trace = new Map<string, TraceEntry>();
+  const note = (item: KnowledgeItem, outcome: TraceOutcome, score = 0, parts: ScoreParts | null = null): void => {
+    trace.set(item.id, { item, score, parts, outcome });
+  };
+  const alwaysLoaded = new Set([...plan.core, ...(plan.scopedInAgents ? plan.scoped : [])].map((i) => i.id));
+  const result = (text: string | null, ids: string[]): PromptSelection => {
+    for (const item of live) if (!trace.has(item.id)) note(item, alwaysLoaded.has(item.id) ? 'always loaded' : 'below threshold');
+    return { text, ids, kind, trace: [...trace.values()].sort((a, b) => b.score - a.score) };
+  };
+
   const budgetTotal = cfg.inject.prompt_budget_tokens;
-  if (budgetTotal <= 0) return { text: null, ids: [] };
+  if (kind === 'command' || budgetTotal <= 0) {
+    for (const item of live) note(item, 'skipped prompt');
+    return result(null, []);
+  }
   const t = TEXT[cfg.language];
   const lang = cfg.language;
   const skip = opts.alreadyInjected;
@@ -87,9 +169,10 @@ export function promptContext(
 
   if (opts.sessionStartedAt) {
     const since = opts.sessionStartedAt;
-    const fresh = team.filter(
-      (i) => i.status === 'active' && i.audience === 'team' && i.source.captured_at >= since && !skip.has(i.id),
-    );
+    const fresh = plan.core
+      .concat(plan.scoped, plan.onDemand)
+      .filter((i) => i.source.captured_at >= since && !skip.has(i.id))
+      .sort((a, b) => (a.source.captured_at < b.source.captured_at ? -1 : 1));
     const fitted = fitBudget(
       fresh.map((i) => ({ id: i.id, line: itemLine(i, lang, true) })),
       budget - approxTokens(t.fresh),
@@ -98,16 +181,22 @@ export function promptContext(
       parts.push(t.fresh, ...fitted.map((f) => f.line));
       ids.push(...fitted.map((f) => f.id));
       budget -= approxTokens(t.fresh) + fitted.reduce((n, f) => n + approxTokens(f.line), 0);
+      for (const f of fitted) note(fresh.find((i) => i.id === f.id) as KnowledgeItem, 'fresh');
     }
   }
 
-  if (prompt.trim()) {
-    const plan = planTiers(team, cfg);
-    const conflicts = team.filter((i) => i.status === 'conflict' && i.audience === 'team');
-    const pool = [...plan.onDemand, ...(plan.scopedInAgents ? [] : plan.scoped), ...conflicts].filter(
-      (i) => !skip.has(i.id) && !ids.includes(i.id),
-    );
-    const hits = pool.length > 0 ? searchItems(pool, prompt, { limit: 8, minScore: 0.12 }) : [];
+  if (kind === 'normal') {
+    const pool = [...plan.onDemand, ...(plan.scopedInAgents ? [] : plan.scoped), ...openConflicts(team)].filter((i) => !ids.includes(i.id));
+    const scored = scoreAll(pool, prompt, { codePaths: opts.codePaths ?? [] });
+    if (opts.violations && opts.violations.size > 0) {
+      for (const s of scored) {
+        const v = opts.violations.get(s.item.id) ?? 0;
+        // Only rules already related to the prompt: a boost must not make an unrelated rule appear.
+        if (v > 0 && s.score > 0 && s.parts.lexical + s.parts.topics + s.parts.path + s.parts.code > 0) s.score += VIOLATION_BOOST * Math.min(3, v);
+      }
+      scored.sort((a, b) => b.score - a.score || (a.item.id < b.item.id ? -1 : 1));
+    }
+    const hits = scored.filter((s) => !skip.has(s.item.id) && s.score >= PROMPT_MIN_SCORE).slice(0, PROMPT_LIMIT);
     const fitted = fitBudget(
       hits.map(({ item }) => ({
         id: item.id,
@@ -115,10 +204,28 @@ export function promptContext(
       })),
       budget - approxTokens(t.related),
     );
+    const chosen = new Set(fitted.map((f) => f.id));
+    for (const s of scored) {
+      const outcome: TraceOutcome = chosen.has(s.item.id)
+        ? 'injected'
+        : skip.has(s.item.id)
+          ? 'already injected'
+          : s.score < PROMPT_MIN_SCORE
+            ? 'below threshold'
+            : hits.some((h) => h.item.id === s.item.id)
+              ? 'over budget'
+              : 'over limit';
+      note(s.item, outcome, s.score, s.parts);
+    }
     if (fitted.length > 0) {
       parts.push(t.related, ...fitted.map((f) => f.line));
       ids.push(...fitted.map((f) => f.id));
     }
   }
-  return { text: parts.length > 0 ? parts.join('\n') : null, ids };
+  return result(parts.length > 0 ? parts.join('\n') : null, ids);
+}
+
+export function promptContext(team: readonly KnowledgeItem[], prompt: string, cfg: DevctxConfig, opts: PromptOptions): InjectedContext {
+  const { text, ids } = selectPromptContext(team, prompt, cfg, opts);
+  return { text, ids };
 }

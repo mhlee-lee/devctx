@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "내장 코드 인덱스",
+    "output": "docs/diagrams/code-index.html",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "build", "label": "1. 색인", "focus": ["hook", "githook", "worker", "parse", "idx", "snap"], "note": "세션 시작과 브랜치 전환 때 worker가 바뀐 파일만 파싱해 사실(심볼·호출·import·타입)을 저장하고, 호출 관계를 해석한 그래프 스냅샷을 만든다." },
+      { "id": "query", "label": "2. 조회", "focus": ["tools", "skill", "cli", "parse", "snap", "know"], "note": "AI가 스킬을 읽고 .devctx/bin/devctx code를 실행한다. 미리 허용돼 승인 창이 없다. 바뀐 파일만 파싱한 뒤 스냅샷에서 답하고, 파일에 적용되는 팀 결정도 붙인다." },
+      { "id": "hint", "label": "3. 프롬프트 힌트", "focus": ["tools", "prompt", "idx"], "note": "프롬프트의 코드 이름을 이름 표에서 찾아 선언 위치를 붙인다. 수 ms." }
+    ]
+  },
+  "components": [
+    { "id": "tools", "type": "frontend", "label": "AI 도구", "sublabel": "Claude·Codex·Copilot·Cursor·Kiro", "pos": [40, 300], "size": [220, 64] },
+    { "id": "skill", "type": "cloud", "label": "스킬 devctx-code", "sublabel": "SKILL.md · 명령 미리 허용", "pos": [40, 100], "size": [220, 64] },
+    { "id": "prompt", "type": "backend", "label": "prompt hook", "sublabel": "코드 이름 → 선언 위치", "pos": [40, 500], "size": [220, 64] },
+    { "id": "hook", "type": "backend", "label": "session_start hook", "sublabel": "색인이 필요한지 확인", "pos": [400, 100], "size": [190, 64] },
+    { "id": "cli", "type": "backend", "label": "devctx code", "sublabel": "명령 7개 · 짧게 끝남", "pos": [400, 300], "size": [190, 64] },
+    { "id": "snap", "type": "database", "label": "그래프 스냅샷", "sublabel": "import · 타입 · 상속 해석 결과", "pos": [980, 500], "size": [190, 64] },
+    { "id": "worker", "type": "backend", "label": "worker", "sublabel": "바뀐 파일만 파싱", "pos": [700, 100], "size": [190, 64] },
+    { "id": "parse", "type": "backend", "label": "tree-sitter WASM", "sublabel": "문법 36개 내장 · 39개 언어", "pos": [700, 300], "size": [190, 64] },
+    { "id": "know", "type": "database", "label": ".devctx/knowledge", "sublabel": "경로별 팀 결정 (Git 공유)", "pos": [980, 700], "size": [190, 64] },
+    { "id": "githook", "type": "security", "label": "git hook", "sublabel": "checkout · merge · rebase", "pos": [980, 100], "size": [190, 64] },
+    { "id": "idx", "type": "database", "label": "code.sqlite", "sublabel": "파일별 사실 · 이름 표", "pos": [980, 300], "size": [190, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "이 PC에서만", "wraps": ["hook", "cli", "snap", "worker", "parse", "githook", "idx"] }
+  ],
+  "connections": [
+    { "id": "skill-to-tools", "from": "skill", "to": "tools", "label": "Git 공유", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [150, 232] },
+    { "id": "tools-to-prompt", "from": "tools", "to": "prompt", "label": "프롬프트", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [150, 432] },
+    { "id": "tools-to-cli", "from": "tools", "to": "cli", "label": "셸 명령", "variant": "emphasis" },
+    { "id": "cli-to-parse", "from": "cli", "to": "parse", "label": "바뀐 파일 먼저", "variant": "dashed" },
+    { "id": "cli-to-snap", "from": "cli", "to": "snap", "label": "읽기", "variant": "emphasis", "fromSide": "bottom", "toSide": "left" },
+    { "id": "snap-to-know", "from": "snap", "to": "know", "label": "관련 결정", "fromSide": "bottom", "toSide": "top", "labelAt": [1075, 632] },
+    { "id": "hook-to-worker", "from": "hook", "to": "worker", "label": "필요할 때만" },
+    { "id": "githook-to-worker", "from": "githook", "to": "worker", "label": "HEAD 변경" },
+    { "id": "worker-to-parse", "from": "worker", "to": "parse", "label": "파싱", "fromSide": "bottom", "toSide": "top", "labelAt": [795, 232] },
+    { "id": "parse-to-idx", "from": "parse", "to": "idx", "label": "사실 저장" },
+    { "id": "idx-to-snap", "from": "idx", "to": "snap", "label": "해석해 저장", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [1075, 432] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "자동", "items": ["init이 도구별 스킬과 명령 미리 허용을 넣는다", "색인은 세션 시작·브랜치 전환 때 백그라운드로", "편집한 파일은 명령을 실행할 때 다시 파싱한다"] },
+    { "dot": "emerald", "title": "내장", "items": ["codebase-memory-mcp·Graft 방식을 바탕으로 구현", "외부 엔진·상주 서버·다운로드·네이티브 빌드 없음", "문법 36개가 압축해 4MB"] },
+    { "dot": "violet", "title": "언어", "items": ["39개 언어 모두 import·모듈 규칙으로 해석", "받는 쪽 타입은 self·필드·생성자로 찾는다", "그 밖의 파일은 search_text로"] }
+  ]
+}

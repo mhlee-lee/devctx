@@ -16,6 +16,8 @@ export interface DevctxConfig {
     scoped_budget_tokens: number;
     prompt_budget_tokens: number;
     session_budget_tokens: number;
+    /** Where the previous session stopped, added once when a new session continues it (0: off). */
+    handoff_budget_tokens: number;
   };
   llm: {
     prefer_host_tool: boolean;
@@ -31,6 +33,20 @@ export interface DevctxConfig {
     pin: Partial<Record<ToolId, string>>;
   };
   memory: { store_evidence_quote: boolean; proposed_ttl_days: number; personal: boolean };
+  code_index: {
+    /** Built-in code index (symbols, call graph, text search), used by agents through the `devctx-code` skill. */
+    enabled: boolean;
+    /** Extra globs to leave out (generated code, fixtures); vendored and dependency dirs are always skipped. */
+    exclude: string[];
+    /** Larger source files are listed but not parsed (minified bundles, generated tables). */
+    max_file_kb: number;
+    /**
+     * Pre-approve `.devctx/bin/devctx code …` in each tool's permission settings so agents run
+     * the skill's commands without an approval prompt (repo files, plus per-machine files for
+     * Copilot CLI and Kiro, which do not read permissions from a repository).
+     */
+    preapprove: boolean;
+  };
 }
 
 export const DEFAULT_CONFIG: DevctxConfig = {
@@ -38,7 +54,7 @@ export const DEFAULT_CONFIG: DevctxConfig = {
   language: 'ko',
   targets: [...TOOL_IDS],
   git: { commit_mode: 'ride-along', auto_install_hooks: true },
-  inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400 },
+  inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400, handoff_budget_tokens: 300 },
   llm: {
     prefer_host_tool: true,
     providers: [...TOOL_IDS],
@@ -51,7 +67,13 @@ export const DEFAULT_CONFIG: DevctxConfig = {
     pin: {},
   },
   memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true },
+  code_index: { enabled: true, exclude: [], max_file_kb: 512, preapprove: true },
 };
+
+function globs(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim());
+}
 
 type Obj = Record<string, unknown>;
 
@@ -81,6 +103,9 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
   const inj = obj(r.inject);
   const llm = obj(r.llm);
   const mem = obj(r.memory);
+  const code = obj(r.code_index);
+  // `engine: off` is the setting of configs written before the index was built in.
+  const enabled = code.engine === 'off' ? false : bool(code.enabled, d.code_index.enabled);
   const pinRaw = obj(llm.pin);
   const pin: Partial<Record<ToolId, string>> = {};
   for (const [k, v] of Object.entries(pinRaw)) if (isToolId(k) && typeof v === 'string' && v.trim()) pin[k] = v.trim();
@@ -98,6 +123,7 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       scoped_budget_tokens: num(inj.scoped_budget_tokens, d.inject.scoped_budget_tokens, 0, 20_000),
       prompt_budget_tokens: num(inj.prompt_budget_tokens, d.inject.prompt_budget_tokens, 0, 5_000),
       session_budget_tokens: num(inj.session_budget_tokens, d.inject.session_budget_tokens, 0, 5_000),
+      handoff_budget_tokens: num(inj.handoff_budget_tokens, d.inject.handoff_budget_tokens, 0, 2_000),
     },
     llm: {
       prefer_host_tool: bool(llm.prefer_host_tool, d.llm.prefer_host_tool),
@@ -115,6 +141,12 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       proposed_ttl_days: num(mem.proposed_ttl_days, d.memory.proposed_ttl_days, 1, 3_650),
       personal: bool(mem.personal, d.memory.personal),
     },
+    code_index: {
+      enabled,
+      exclude: globs(code.exclude),
+      max_file_kb: num(code.max_file_kb, d.code_index.max_file_kb, 16, 16_384),
+      preapprove: bool(code.preapprove, d.code_index.preapprove),
+    },
   };
 }
 
@@ -128,7 +160,7 @@ export function loadConfig(paths: ProjectPaths): DevctxConfig {
   }
 }
 
-export function renderConfigYaml(targets: ToolId[], language: Language): string {
+export function renderConfigYaml(targets: ToolId[], language: Language, codeIndex = true): string {
   const list = targets.map((t) => `  - ${t}`).join('\n');
   return `# devctx 설정. Git으로 공유된다.
 version: 1
@@ -147,6 +179,7 @@ inject:
   scoped_budget_tokens: 800   # 경로별 규칙이 이 이하면 AGENTS.md에 함께 둔다
   prompt_budget_tokens: 600   # 프롬프트마다 hook으로 추가하는 관련 결정 상한
   session_budget_tokens: 400  # 세션 시작 시 추가하는 개인 설정·충돌 안내 상한
+  handoff_budget_tokens: 300  # 새 세션이 직전 작업을 이어갈 때 한 번 붙이는 직전 세션 정보 상한 (0이면 끔)
 
 llm:
   prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출한다 (없으면 providers 순서)
@@ -163,5 +196,11 @@ memory:
   store_evidence_quote: true  # 사용자 발화 일부(200자 이하)를 근거로 저장
   proposed_ttl_days: 30       # 재확인 없는 제안 항목의 보존 기간
   personal: true              # 개인 선호는 저장소 밖(~/.local/share/devctx)에 저장
+
+code_index:
+  enabled: ${String(codeIndex).padEnd(19)}# 내장 코드 인덱스(심볼·호출 관계·텍스트 검색)를 스킬 devctx-code로 제공
+  exclude: []                 # 색인에서 뺄 경로 glob. 예: ["**/generated/**", "fixtures/**"]
+  max_file_kb: 512            # 이보다 큰 소스 파일은 파싱하지 않는다 (번들·생성 코드)
+  preapprove: true            # 도구별 권한 설정에 ".devctx/bin/devctx code" 실행을 미리 허용 (승인 창 없이 실행)
 `;
 }

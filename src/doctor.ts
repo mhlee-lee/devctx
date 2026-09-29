@@ -2,11 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { compile } from './compile/compile.ts';
 import { loadConfig } from './config.ts';
+import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
+import { readExtractionHealth } from './state/health.ts';
 import { hookInstalled, HOOK_FILES } from './init/hookconfigs.ts';
 import { gitHooksInstalled } from './init/githooks.ts';
 import { readToolsLock } from './init/shim.ts';
-import { loadItems, loadPersonalItems } from './knowledge/store.ts';
 import { getProvider } from './llm/providers/index.ts';
+import { codeStatus } from './codeindex/service.ts';
+import { agentAccessStatus } from './init/access.ts';
 import { cachedSelection, providerBlocks, providerOrder } from './llm/router.ts';
 import { SUITE_TASKS } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
@@ -59,14 +62,31 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   const cfg = loadConfig(paths);
   add(nodeOk() ? 'ok' : 'fail', 'node', `v${process.versions.node} (needs >= 22.13 for node:sqlite)`);
 
-  const { items, errors } = loadItems(paths);
-  const count = (s: string): number => items.filter((i) => i.status === s).length;
-  add(
-    errors.length > 0 ? 'warn' : 'ok',
-    'knowledge',
-    `${count('active')} active, ${count('proposed')} proposed, ${count('conflict')} conflict, ${count('superseded')} superseded, ${items.filter((i) => i.needs_review).length} need review, ${loadPersonalItems().items.length} personal` +
-      (errors.length > 0 ? `; unreadable: ${errors.map((e) => path.basename(e.file)).join(', ')}` : ''),
-  );
+  {
+    const kdb = StateDb.open(paths.stateDb);
+    try {
+      const opts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
+      const { items, errors } = loadTeam(paths, kdb, opts);
+      applyCachedStale(kdb, items);
+      const count = (test: (i: (typeof items)[number]) => boolean): number => items.filter(test).length;
+      add(
+        errors.length > 0 ? 'warn' : 'ok',
+        'knowledge',
+        `${count((i) => i.status === 'active')} active, ${count((i) => i.status === 'conflict')} conflict, ${count((i) => i.status === 'proposed')} proposed (this PC), ${count((i) => Boolean(i.archived))} archived, ${count((i) => i.status === 'superseded')} superseded, ${count((i) => i.needs_review)} need review, ${loadPersonal(kdb, opts).items.filter((i) => i.status === 'active').length} personal` +
+          (errors.length > 0 ? `; unreadable: ${errors.map((e) => path.basename(e.file)).join(', ')}` : ''),
+      );
+      const stale = items.filter((i) => i.stale && i.status === 'active');
+      if (stale.length > 0) {
+        add('warn', 'code evidence', `${stale.length} rule(s) may be outdated (what they name is gone from the repository; delivered on demand with a check mark): ${stale.slice(0, 3).map((i) => `${i.id.slice(-6)} ${i.stale}`).join('; ')}`);
+      }
+      const health = readExtractionHealth(kdb);
+      if (health.streak > 0) add(health.streak >= 3 ? 'warn' : 'ok', 'extraction', `failed ${health.streak} worker run(s) in a row since ${health.since?.slice(0, 16) ?? '-'}: ${health.lastError ?? ''}`);
+      const last = kdb.lastHookEventTs();
+      add(last ? 'ok' : 'warn', 'capture', last ? `last AI hook event ${last.slice(0, 16).replace('T', ' ')}` : 'no AI hook event recorded yet (approve the project hooks in each tool)');
+    } finally {
+      kdb.close();
+    }
+  }
 
   const check = compile(paths, cfg, null, { check: true });
   add(check.drift.length > 0 ? 'warn' : 'ok', 'generated files', check.drift.length > 0 ? `out of date: ${check.drift.join(', ')} (run "devctx compile")` : 'up to date');
@@ -86,6 +106,45 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   }
   add(gitHooksInstalled(root) ? 'ok' : 'warn', 'git hooks', gitHooksInstalled(root) ? 'installed' : 'missing (installed automatically at the next session start)');
 
+  const st = codeStatus(root, cfg);
+  if (!st.enabled) {
+    add('ok', 'code index', 'off (code_index.enabled: false)');
+  } else {
+    const m = st.meta;
+    add(
+      m.exists && m.failed === 0 ? 'ok' : 'warn',
+      'code index',
+      m.exists
+        ? `${m.parsed}/${m.files} source files parsed${m.failed ? `, ${m.failed} failed (see "devctx code status")` : ''}; synced ${m.syncedAt?.slice(0, 16).replace('T', ' ') ?? '-'}${st.indexing ? ' (indexing now)' : st.stale ? ' (refresh pending)' : ''}`
+        : 'not built yet (built in the background at the next session, or run "devctx code index")',
+    );
+    const access = agentAccessStatus(root, cfg.targets, { enabled: true, preapprove: cfg.code_index.preapprove, language: cfg.language });
+    const stale = access.filter((x) => !x.ok);
+    add(
+      stale.length > 0 ? 'warn' : 'ok',
+      'code index skill',
+      stale.length > 0
+        ? `missing or outdated: ${stale.map((x) => x.file).join(', ')} (updated at the next session start, or run "devctx init")`
+        : `${access.filter((x) => x.file.includes('SKILL.md')).length} skill file(s)${cfg.code_index.preapprove ? ', command pre-approved' : ''}`,
+    );
+    const noGrammar = st.languages.filter((l) => !l.grammar);
+    add(
+      noGrammar.length > 0 ? 'warn' : 'ok',
+      'code languages',
+      st.languages.length === 0
+        ? 'no source files detected'
+        : `${st.languages.map((l) => `${l.label} ${l.files}`).join(', ')}${noGrammar.length > 0 ? `; grammar missing: ${noGrammar.map((l) => l.label).join(', ')}` : ''}`,
+    );
+    let executable = false;
+    try {
+      fs.accessSync(paths.shim, fs.constants.X_OK);
+      executable = true;
+    } catch {
+      executable = false;
+    }
+    if (!executable) add('warn', 'code index skill', '.devctx/bin/devctx is not executable; the skill runs it directly (chmod +x .devctx/bin/devctx and commit the mode)');
+  }
+
   let shimOk = false;
   try {
     fs.accessSync(paths.shim, fs.constants.X_OK);
@@ -104,6 +163,23 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   try {
     const pending = db.countPending();
     add(pending > 20 ? 'warn' : 'ok', 'events', `${pending} pending`);
+    const inj = db.injectionSummary(new Date(Date.now() - 7 * 86_400_000).toISOString());
+    add(
+      'ok',
+      'injection (7d)',
+      inj.prompts === 0
+        ? 'no prompts seen yet'
+        : `${inj.withContext}/${inj.prompts} prompts got context, avg ${inj.avgTokens} tokens, ${inj.handoffs} session handoff(s) (details: devctx why "<prompt>")`,
+    );
+    // Rules only the prompt hook delivers that it never sent in a month: wording or topics may not
+    // match how people ask (or the rule is dead). Only meaningful with enough traffic.
+    const month = db.injectionSummary(new Date(Date.now() - 30 * 86_400_000).toISOString());
+    if (month.prompts >= 30) {
+      const unused = check.plan.onDemand.filter((i) => !month.perItem.has(i.id));
+      if (unused.length > 0) {
+        add('ok', 'unused decisions', `${unused.length} on-demand decision(s) not injected in 30 days: ${unused.slice(0, 5).map((i) => i.id.slice(-6)).join(', ')}${unused.length > 5 ? ', …' : ''}`);
+      }
+    }
     const usage = db.llmUsageSummary(new Date(Date.now() - 7 * 86_400_000).toISOString());
     add('ok', 'llm usage (7d)', usage.length === 0 ? 'no calls' : usage.map((u) => `${u.model} ${u.task} x${u.calls} (ok ${u.ok})`).join('; '));
   } finally {

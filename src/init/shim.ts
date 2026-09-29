@@ -89,9 +89,13 @@ if ! node_bin=$(find_node); then
 fi
 
 cli=""
+# src/cli.ts runs through Node's type stripping: npm 12 blocks the "prepare" build of git
+# installs, so an installed package may ship sources without dist/.
 for c in "\${DEVCTX_CLI:-}" \\
   "$data/versions/$version/node_modules/devctx/dist/cli.js" \\
   "$data/versions/$version"/node_modules/@*/devctx/dist/cli.js \\
+  "$data/versions/$version/node_modules/devctx/src/cli.ts" \\
+  "$data/versions/$version"/node_modules/@*/devctx/src/cli.ts \\
   "$source/dist/cli.js" \\
   "$source/src/cli.ts" \\
   "$root/node_modules/devctx/dist/cli.js"; do
@@ -118,12 +122,16 @@ if [ -z "$cli" ]; then
     hook_fallback "$@"
   fi
   mkdir -p "$target" && "$npm_bin" install --prefix "$target" --no-save --no-audit --no-fund "$source" >&2 || exit 1
-  for c in "$target/node_modules/devctx/dist/cli.js" "$target"/node_modules/@*/devctx/dist/cli.js; do
+  for c in "$target/node_modules/devctx/dist/cli.js" "$target"/node_modules/@*/devctx/dist/cli.js \\
+    "$target/node_modules/devctx/src/cli.ts" "$target"/node_modules/@*/devctx/src/cli.ts; do
     [ -f "$c" ] && cli="$c" && break
   done
-  [ -n "$cli" ] || { echo "devctx: installed package has no dist/cli.js" >&2; exit 1; }
+  [ -n "$cli" ] || { echo "devctx: installed package has no dist/cli.js or src/cli.ts" >&2; exit 1; }
 fi
 
+case "$cli" in
+  *.ts) exec "$node_bin" --experimental-strip-types --disable-warning=ExperimentalWarning "$cli" "$@" ;;
+esac
 exec "$node_bin" --disable-warning=ExperimentalWarning "$cli" "$@"
 `;
 }

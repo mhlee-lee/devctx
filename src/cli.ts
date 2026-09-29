@@ -7,7 +7,11 @@ import { runGitHook } from './githook-run.ts';
 import { runHook } from './hooks/entry.ts';
 import { runInit } from './init/init.ts';
 import { packageInfo } from './init/shim.ts';
-import { loadItems, loadPersonalItems } from './knowledge/store.ts';
+import type { KnowledgeItem } from './knowledge/types.ts';
+import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
+import { codeStatus, EXIT_MEMORY_CAPPED, indexPass, refreshIndex } from './codeindex/service.ts';
+import { CODE_TOOLS, codeTool, parseToolArgs, usageLine } from './codeindex/tools-meta.ts';
+import { agentAccessStatus } from './init/access.ts';
 import { describeRoutes, qualifyProvider, type Qualification } from './llm/router.ts';
 import { SUITE_TASKS, type SuiteTask } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
@@ -15,11 +19,26 @@ import { isHookKind, isToolId, TOOL_IDS, type ToolId } from './types.ts';
 import { gitToplevel } from './util/git.ts';
 import { findProjectRoot, projectPaths } from './util/paths.ts';
 import { runWorker } from './worker.ts';
+import { explainPrompt, memoryLog } from './explain.ts';
 
 interface Args {
   positional: string[];
   flags: Map<string, string | true>;
 }
+
+/** Flags that never take a value: `remember --no-llm "rule"` must keep "rule" as the argument. */
+const BOOLEAN_FLAGS = new Set([
+  'no-llm',
+  'all',
+  'check',
+  'force',
+  'no-code-index',
+  'no-git-hooks',
+  'refresh',
+  'pass',
+  'help',
+  ...CODE_TOOLS.flatMap((t) => t.args.filter((a) => a.type === 'boolean').map((a) => a.name.replace(/_/g, '-'))),
+]);
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
@@ -33,7 +52,7 @@ function parseArgs(argv: string[]): Args {
         continue;
       }
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
+      if (next !== undefined && !next.startsWith('--') && !BOOLEAN_FLAGS.has(arg.slice(2))) {
         flags.set(arg.slice(2), next);
         i++;
       } else {
@@ -71,14 +90,22 @@ function writeAndExit(text: string | null): void {
 const HELP = `devctx — project decision memory for AI coding tools
 
 사용법:
-  devctx init [--tools claude,codex,copilot,cursor,kiro] [--source <npm|git|path>] [--lang ko|en] [--no-git-hooks] [--force]
+  devctx init [--tools claude,codex,copilot,cursor,kiro] [--source <npm|git|path>] [--lang ko|en]
+              [--no-code-index] [--no-git-hooks] [--force]
   devctx status                  기록된 결정 목록
+  devctx code [status]           코드 인덱스 상태, 저장소 언어, 스킬·사전 허용 설치 상태
+  devctx code index              지금 색인 (바뀐 파일만 다시 파싱)
+  devctx code <도구> [인자...]    코드 인덱스 조회 (AI 도구는 스킬 devctx-code로 같은 명령을 쓴다)
+                                 예: devctx code search_symbols OrderService
+                                 도구: ${CODE_TOOLS.map((t) => t.name).join(' ')}
   devctx doctor                  연결 상태 점검 (LLM 호출 없음)
   devctx compile [--check]       AGENTS.md와 도구별 규칙 파일 재생성 (--check: 변경 여부만 확인)
   devctx models [--refresh] [--host <tool>]
                                  작업(추출/판정)별로 쓰는 모델, 후보 비용 순위와 평가 결과
   devctx models --qualify <provider> [--task extract|judge|all] [--limit N]
                                  싼 후보부터 요구사항 평가를 돌려 통과하는 첫 모델을 찾는다
+  devctx why "<프롬프트>" [--all]  그 프롬프트에 hook이 어떤 결정을 왜 붙이는지 (점수, 제외 이유, 직전 세션 연결)
+  devctx log [--limit N]         자동으로 바뀐 결정 기록 (추가·보강·대체·충돌·만료와 판정 이유)
   devctx remember "<규칙>"        hook이 없는 환경에서 직접 기록 (같은 추출·정리 과정을 거침)
   devctx worker [--no-llm]       대기 중인 이벤트 처리 (보통 hook이 자동 실행)
 
@@ -105,7 +132,7 @@ async function main(argv: string[]): Promise<number> {
     case 'git-hook': {
       const name = args.positional[0] ?? '';
       const root = gitToplevel(process.cwd());
-      if (root) runGitHook(name, root);
+      if (root) for (const notice of runGitHook(name, root)) process.stderr.write(`${notice}\n`);
       return 0;
     }
 
@@ -122,16 +149,75 @@ async function main(argv: string[]): Promise<number> {
         language: flag(args, 'lang') === 'en' ? 'en' : 'ko',
         gitHooks: !has(args, 'no-git-hooks'),
         force: has(args, 'force'),
+        codeIndex: !has(args, 'no-code-index'),
       });
       console.log(`devctx init: ${report.root}`);
       for (const h of report.hookFiles) console.log(`  hook  ${h.action.padEnd(9)} ${h.file}`);
+      for (const a of report.accessFiles) if (a.action !== 'unchanged') console.log(`  skill ${a.action.padEnd(9)} ${a.file}`);
       if (report.gitHooks) {
         console.log(`  git   installed: ${report.gitHooks.installed.join(', ') || '-'}; present: ${report.gitHooks.present.join(', ') || '-'}`);
       }
       for (const f of report.compile.changed) console.log(`  gen   ${f}`);
       for (const n of report.notes) console.log(`  note  ${n}`);
       for (const w of report.compile.warnings) console.log(`  warn  ${w}`);
-      console.log('\n커밋하면 팀원도 clone만으로 같은 규칙과 hook을 쓴다: .devctx/ AGENTS.md와 도구별 hook 파일');
+      console.log('\n커밋하면 팀원도 clone만으로 같은 규칙, hook, 스킬을 쓴다: .devctx/ AGENTS.md와 도구별 hook·스킬·권한 파일');
+      return 0;
+    }
+
+    case 'code-mcp':
+      // Registered by earlier versions; the session hook removes those MCP entries.
+      process.stderr.write('devctx: the code index MCP server was replaced by the devctx-code skill (run "devctx init" to update the tool configs)\n');
+      return 1;
+
+    case 'code': {
+      const sub = args.positional[0] ?? 'status';
+      const root = resolveRoot(args);
+      const paths = projectPaths(root);
+      const cfg = loadConfig(paths);
+      if (sub !== 'status' && !cfg.code_index.enabled) throw new Error('the code index is off (code_index.enabled: false)');
+      if (sub === 'index' && has(args, 'pass')) {
+        // Internal: one memory-capped pass; the parent starts another while this exits 3.
+        const res = await indexPass(root, cfg);
+        process.exit(res.error ? 1 : res.memoryCapped ? EXIT_MEMORY_CAPPED : 0);
+      }
+      if (sub === 'index') {
+        const started = Date.now();
+        const res = await refreshIndex(root, cfg);
+        if (!res) return 0;
+        if (res.error) {
+          console.log(`FAIL ${res.error}`);
+          return 1;
+        }
+        console.log(`ok  ${res.files} source files, ${res.parsed} parsed${res.removed ? `, ${res.removed} removed` : ''}, ${res.failed} failed  ${Math.round((Date.now() - started) / 100) / 10}s`);
+        return 0;
+      }
+      const tool = codeTool(sub);
+      if (tool) {
+        if (has(args, 'help')) {
+          console.log(`${usageLine(tool)}\n${tool.summary[cfg.language]}`);
+          return 0;
+        }
+        // Loaded only here: hooks share this entry point and must not load the parser stack.
+        const { runCodeTool } = await import('./codeindex/tools.ts');
+        writeAndExit(`${await runCodeTool(root, tool.name, parseToolArgs(tool, args.positional.slice(1), args.flags))}\n`);
+        return 0;
+      }
+      if (sub !== 'status') throw new Error(`usage: devctx code [status|index|${CODE_TOOLS.map((t) => t.name).join('|')}]`);
+      const st = codeStatus(root, cfg);
+      if (!st.enabled) {
+        console.log('code index: off (code_index.enabled: false)');
+        return 0;
+      }
+      const m = st.meta;
+      console.log(
+        `index     ${m.exists ? `${m.parsed} of ${m.files} source files parsed${m.failed ? `, ${m.failed} failed` : ''}; synced ${m.syncedAt ? m.syncedAt.slice(0, 16).replace('T', ' ') : '-'}` : 'not built yet (built in the background at the next session, or run "devctx code index")'}${st.indexing ? '  (indexing now)' : st.stale ? '  -> refresh pending' : ''}`,
+      );
+      console.log(`store     .devctx/local/code.sqlite ${Math.round(st.dbBytes / 1024)} KB`);
+      const access = agentAccessStatus(root, cfg.targets, { enabled: true, preapprove: cfg.code_index.preapprove, language: cfg.language });
+      console.log(`skill     ${access.map((x) => `${x.file}${x.ok ? '' : ' (missing or outdated)'}`).join(', ') || '-'}`);
+      console.log('languages');
+      if (st.languages.length === 0) console.log('  (no source files detected)');
+      for (const l of st.languages) console.log(`  ${(l.grammar ? 'indexed' : 'text only').padEnd(9)} ${l.label.padEnd(16)} ${String(l.files).padStart(6)} files`);
       return 0;
     }
 
@@ -240,27 +326,64 @@ async function main(argv: string[]): Promise<number> {
 
     case 'status': {
       const paths = projectPaths(resolveRoot(args));
-      const { items, errors } = loadItems(paths);
-      const order = ['active', 'conflict', 'proposed', 'superseded', 'retired'];
-      for (const status of order) {
-        const list = items.filter((i) => i.status === status);
-        if (list.length === 0) continue;
-        console.log(`[${status}] ${list.length}`);
-        for (const i of list) {
-          const scope = i.scope.paths.length > 0 ? `  (${i.scope.paths.join(', ')})` : '';
-          const extra = [i.reinforced > 0 ? `x${i.reinforced + 1}` : '', i.violations > 0 ? `violations ${i.violations}` : '', i.needs_review ? 'review' : '']
-            .filter(Boolean)
-            .join(' ');
-          console.log(`  ${i.id.slice(-6)} ${i.enforcement.padEnd(6)} ${i.summary}${scope}${extra ? `  [${extra}]` : ''}`);
+      const cfg = loadConfig(paths);
+      const db = StateDb.open(paths.stateDb);
+      try {
+        const opts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
+        const { items, errors } = loadTeam(paths, db, opts);
+        applyCachedStale(db, items);
+        const groups: [string, (i: KnowledgeItem) => boolean][] = [
+          ['active', (i) => i.status === 'active'],
+          ['conflict', (i) => i.status === 'conflict'],
+          ['proposed (this PC only, until confirmed)', (i) => i.status === 'proposed'],
+          ['archived (restating makes them active)', (i) => Boolean(i.archived)],
+          ['superseded', (i) => i.status === 'superseded'],
+          ['retired', (i) => i.status === 'retired' && !i.archived],
+        ];
+        for (const [label, test] of groups) {
+          const list = items.filter(test);
+          if (list.length === 0) continue;
+          console.log(`[${label}] ${list.length}`);
+          for (const i of list) {
+            const scope = i.scope.paths.length > 0 ? `  (${i.scope.paths.join(', ')})` : '';
+            const extra = [
+              i.reinforced > 0 ? `x${i.reinforced + 1}` : '',
+              i.violations > 0 ? `violations ${i.violations}` : '',
+              i.needs_review ? 'review' : '',
+              i.stale ?? '',
+              i.status === 'superseded' && i.superseded_by ? `by ${i.superseded_by.slice(-6)}` : '',
+              i.valid_until && i.status !== 'superseded' ? `until ${i.valid_until}` : '',
+            ]
+              .filter(Boolean)
+              .join(' ');
+            console.log(`  ${i.id.slice(-6)} ${i.enforcement.padEnd(6)} ${i.summary}${scope}${extra ? `  [${extra}]` : ''}`);
+          }
         }
+        const personal = loadPersonal(db, opts).items.filter((i) => i.status === 'active');
+        if (personal.length > 0) {
+          console.log(`[personal] ${personal.length}`);
+          for (const i of personal) console.log(`  ${i.id.slice(-6)} ${i.summary}`);
+        }
+        for (const e of errors) console.log(`unreadable: ${e.file}: ${e.error}`);
+        if (items.length === 0 && personal.length === 0) console.log('아직 기록된 결정이 없다.');
+      } finally {
+        db.close();
       }
-      const personal = loadPersonalItems().items.filter((i) => i.status === 'active');
-      if (personal.length > 0) {
-        console.log(`[personal] ${personal.length}`);
-        for (const i of personal) console.log(`  ${i.id.slice(-6)} ${i.summary}`);
-      }
-      for (const e of errors) console.log(`unreadable: ${e.file}: ${e.error}`);
-      if (items.length === 0 && personal.length === 0) console.log('아직 기록된 결정이 없다.');
+      return 0;
+    }
+
+    case 'why': {
+      const prompt = args.positional.join(' ').trim();
+      if (!prompt) throw new Error('usage: devctx why "<prompt>"');
+      const root = resolveRoot(args);
+      console.log(explainPrompt(root, prompt, has(args, 'all')));
+      return 0;
+    }
+
+    case 'log': {
+      const root = resolveRoot(args);
+      const limit = Math.max(1, Math.min(500, Number(flag(args, 'limit') ?? 20) || 20));
+      console.log(memoryLog(root, limit));
       return 0;
     }
 

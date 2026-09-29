@@ -35,7 +35,25 @@ const T: Record<
   },
 };
 
-export function renderAgentsMd(plan: TierPlan, cfg: DevctxConfig, preamble: string): string {
+/** Short, static guidance so agents query the code index before grepping and reading files. */
+function codeIndexSection(lang: Language): string[] {
+  if (lang === 'ko') {
+    return [
+      '## 코드 탐색',
+      '- 이 저장소에는 코드 인덱스가 있다 (스킬 `devctx-code`). 파일을 grep·read로 훑기 전에 저장소 루트에서 `.devctx/bin/devctx code <도구> <인자>`를 먼저 실행한다. 명령은 하나씩, 파이프 없이 실행한다.',
+      '- 심볼 찾기 `search_symbols`, 정의·사용처·코드 `get_symbol`, 호출 관계 `trace_calls`, 파일 구조 `file_outline`, 전체 구조 `repo_overview`, 변경 영향 `change_impact`, 텍스트 검색 `search_text`.',
+      '- `(by name)`으로 표시된 연결은 이름만 보고 이은 것이다. 중요한 수정 전에는 코드를 직접 확인한다. 명령을 쓸 수 없으면 평소처럼 파일을 읽는다.',
+    ];
+  }
+  return [
+    '## Code navigation',
+    '- This repository has a code index (skill `devctx-code`). Before grepping or reading files, run `.devctx/bin/devctx code <tool> <args>` from the repository root, one command at a time and without pipes.',
+    '- Find symbols `search_symbols`, definition/usages/code `get_symbol`, call graph `trace_calls`, file structure `file_outline`, architecture `repo_overview`, impact of the diff `change_impact`, text search `search_text`.',
+    '- Links marked `(by name)` were matched by name only; check the code before relying on them. If the command is unavailable, read files as usual.',
+  ];
+}
+
+export function renderAgentsMd(plan: TierPlan, cfg: DevctxConfig, preamble: string, codeIndex = false): string {
   const t = T[cfg.language];
   const lang = cfg.language;
   const lines: string[] = [t.marker];
@@ -48,6 +66,7 @@ export function renderAgentsMd(plan: TierPlan, cfg: DevctxConfig, preamble: stri
   if (plan.scopedInAgents && plan.scoped.length > 0) {
     lines.push('', t.scoped, ...plan.scoped.map((i) => itemLine(i, lang, true)));
   }
+  if (codeIndex) lines.push('', ...codeIndexSection(lang));
   lines.push('', t.records, t.recordsDir, t.latest);
   if (!plan.scopedInAgents && plan.scoped.length > 0) lines.push(t.pathRules);
   return `${lines.join('\n')}\n`;

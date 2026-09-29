@@ -1,0 +1,282 @@
+[
+  {
+    "id": "java",
+    "source": "npm:tree-sitter-java@0.23.5",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "4fdeac4ca6ca089f06c6f7e562abcac1733cd465728cc7031ebb73c2019122c4",
+    "bytes": 414641
+  },
+  {
+    "id": "kotlin",
+    "source": "npm:@tree-sitter-grammars/tree-sitter-kotlin@1.1.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "7009d69453bc8735e438b2818a633efb21c88f99782769abba60dffedfab73f7",
+    "bytes": 3441042
+  },
+  {
+    "id": "go",
+    "source": "npm:tree-sitter-go@0.25.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "9504573f352b20be7f2f1911754d710622aedc15afff16d5ed8fb5645681aee7",
+    "bytes": 217182
+  },
+  {
+    "id": "python",
+    "source": "npm:tree-sitter-python@0.25.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "16108b50df4ee9a30168794252ab55e7c93bfc5765d7fa0aa3e335752c515f47",
+    "bytes": 457883
+  },
+  {
+    "id": "javascript",
+    "source": "npm:tree-sitter-javascript@0.25.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "5fb488d0cabb4775a594bab85682de5ad6ce83c0d6ac997a9f82dd084d571240",
+    "bytes": 411770
+  },
+  {
+    "id": "typescript",
+    "source": "npm:tree-sitter-typescript@0.23.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "778025db5a8be0e70f8ccc3671e486dfeddd048c25d9e8a70c26de2e1bf6f97d",
+    "bytes": 1413849
+  },
+  {
+    "id": "tsx",
+    "source": "npm:tree-sitter-typescript@0.23.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "79e5da75ea62855a0cd67177685f0164eac87d5f630b3cbe1e0a099751ad30f8",
+    "bytes": 1445638
+  },
+  {
+    "id": "rust",
+    "source": "npm:tree-sitter-rust@0.24.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "f65f354215611fd94ad34134b3427eb3d58cbb745df7b6509ba722184db73d57",
+    "bytes": 1102547
+  },
+  {
+    "id": "c",
+    "source": "npm:tree-sitter-c@0.24.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "c852c2a85ebf2beb636aa3b0ef7f7e70458684d74f6741b20dcb296885bed9f9",
+    "bytes": 625918
+  },
+  {
+    "id": "cpp",
+    "source": "npm:tree-sitter-cpp@0.23.4",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "174eb0deb75b2ec7881bcacda9f995648d8e683956e5c2267e69ab6dc503fcbf",
+    "bytes": 3434931
+  },
+  {
+    "id": "csharp",
+    "source": "npm:tree-sitter-c-sharp@0.23.5",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "6f69e1cae44e1c32c1eccc170dc5a9778fb94ff716f71113fe1f8c4299aa2f40",
+    "bytes": 5350581
+  },
+  {
+    "id": "ruby",
+    "source": "npm:tree-sitter-ruby@0.23.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "09a96427d7c72f0613ed470cd9812223fc4a91d6a9c025c0235cc6bd59ff96f4",
+    "bytes": 2106352
+  },
+  {
+    "id": "php",
+    "source": "npm:tree-sitter-php@0.24.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "d4df6a6ff08c87c3ec4f9cbb785fe09998a0cb570e03f57d7b19b3acfb146aa7",
+    "bytes": 1058041
+  },
+  {
+    "id": "scala",
+    "source": "npm:tree-sitter-scala@0.24.0",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "b7ec2bb29c19827abcefd18ed5cb5a43596009f96a5d53c5b9d1f9676d7521c3",
+    "bytes": 3786700
+  },
+  {
+    "id": "bash",
+    "source": "npm:tree-sitter-bash@0.25.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "8292919c88a0f7d3fb31d0cd0253ca5a9531bc1ede82b0537f2c63dd8abe6a7a",
+    "bytes": 1358224
+  },
+  {
+    "id": "lua",
+    "source": "npm:@tree-sitter-grammars/tree-sitter-lua@0.4.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "6d95607fc7d78964cfdf065ccb1ba76be5ed217c5ec0d0a3cace13c59fa1ae43",
+    "bytes": 49488
+  },
+  {
+    "id": "haskell",
+    "source": "npm:tree-sitter-haskell@0.23.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "37a6b07b1a838d02ffb4f4c2a06863637a8efe48432d60a275f50f1d08f1092c",
+    "bytes": 3805902
+  },
+  {
+    "id": "ocaml",
+    "source": "npm:tree-sitter-ocaml@0.24.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "761a78a804931cfac1fa0c6238989b4b0e86cc70db461b1315d743de923f8246",
+    "bytes": 5553934
+  },
+  {
+    "id": "julia",
+    "source": "npm:tree-sitter-julia@0.23.1",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "e0f52c36eadf0299e46fccd6715c760d35eaa3f09721bec38633da551ac9e781",
+    "bytes": 6223352
+  },
+  {
+    "id": "zig",
+    "source": "npm:@tree-sitter-grammars/tree-sitter-zig@1.1.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "54b3b83dd9c62da5815f06132bc3fc914d9dcc780370b32416446a0b7969e8c6",
+    "bytes": 691726
+  },
+  {
+    "id": "elixir",
+    "source": "npm:tree-sitter-elixir@0.3.5",
+    "wasm": "shipped by the package",
+    "license": "Apache-2.0",
+    "sha256": "ed99093c548c12d43f7e337fd3440e9e2daa2ec671a5e29aadb6c6dcb2232a62",
+    "bytes": 1412267
+  },
+  {
+    "id": "objc",
+    "source": "npm:tree-sitter-objc@3.0.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "155bf61fc94941fa9d07c86cd46895f14dfb2549fb7f646faeb83765af05c970",
+    "bytes": 5317155
+  },
+  {
+    "id": "solidity",
+    "source": "npm:tree-sitter-solidity@1.2.13",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "07420813d7668445152a5d5d2017e0fb84cb27342257e1add3cc7462eec7f811",
+    "bytes": 508582
+  },
+  {
+    "id": "hcl",
+    "source": "npm:@tree-sitter-grammars/tree-sitter-hcl@1.2.0",
+    "wasm": "shipped by the package",
+    "license": "Apache-2.0",
+    "sha256": "86bb80cd151bd3ab1e44ed431a9c1874978db31519c62055efb50f028a1d0118",
+    "bytes": 92478
+  },
+  {
+    "id": "groovy",
+    "source": "npm:tree-sitter-groovy@0.1.2",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "0e68bb48ac166de25c381e05bbfbc90769f25d4709c14e180dd593696a73c197",
+    "bytes": 997114
+  },
+  {
+    "id": "powershell",
+    "source": "npm:tree-sitter-powershell@0.26.4",
+    "wasm": "shipped by the package",
+    "license": "MIT",
+    "sha256": "796124137f0500e59713fd9dccda6812ff73d25f22e33430b1c5af6e132efa5e",
+    "bytes": 1088467
+  },
+  {
+    "id": "swift",
+    "source": "npm:tree-sitter-swift@0.7.1",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "24a6afb13db61ffd7d53dd848bbf684ec1c3aacea685a0857dcd1db673d28c7e",
+    "bytes": 3328366
+  },
+  {
+    "id": "dart",
+    "source": "npm:tree-sitter-dart@1.0.0",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "ISC",
+    "sha256": "f76fcfaefea7df29237da8301e43bec73eb2232d1ef070e04482261791f2da7d",
+    "bytes": 760788
+  },
+  {
+    "id": "perl",
+    "source": "npm:tree-sitter-perl@2.0.0",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "af4e99e2379e9ae0228357a15f0d3b6037846b8a328deafb70dfa7a13b58b140",
+    "bytes": 4739417
+  },
+  {
+    "id": "clojure",
+    "source": "git:https://github.com/sogaiu/tree-sitter-clojure#e43eff80d17cf34852dcd92ca5e6986d23a7040f",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "CC0-1.0",
+    "sha256": "8d8a9f387e96df17cbace9d6c8b604570fb52ee6e8b8e071358a3588283a5fde",
+    "bytes": 89487
+  },
+  {
+    "id": "elm",
+    "source": "npm:@elm-tooling/tree-sitter-elm@5.9.4",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "30e2708c30704223fa0351428d4e81aef32acd9121a7ea35606ddc9fa45bc319",
+    "bytes": 182551
+  },
+  {
+    "id": "sql",
+    "source": "npm:@derekstride/tree-sitter-sql@0.3.11",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "e03fb5079e88cfe0807056c284fd2b0589cee35df9bbb3d07e72f2f4178de8de",
+    "bytes": 2437595
+  },
+  {
+    "id": "fsharp",
+    "source": "npm:tree-sitter-fsharp@0.3.12",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "ff1a927387fec25e184d120d9e18ec7cd5271b30f6380f02d494d3548a99f7b7",
+    "bytes": 11430318
+  },
+  {
+    "id": "r",
+    "source": "git:https://github.com/r-lib/tree-sitter-r#58a22794466c0fc15b0d3b40531db751593721e8",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "MIT",
+    "sha256": "8443d229942c1719c40fac5729e8d9252e48950aa2e0dbcf86c52bd38e875209",
+    "bytes": 485005
+  },
+  {
+    "id": "erlang",
+    "source": "git:https://github.com/WhatsApp/tree-sitter-erlang#6ba4c762eb3065495e3db85697ffeecdf364ce35",
+    "wasm": "built with tree-sitter-cli 0.27.0 (wasi-sdk)",
+    "license": "Apache-2.0",
+    "sha256": "e8f3800e8c744ff63bebd22656533db26ce05756e586f56ec6116bc32541ed69",
+    "bytes": 433910
+  }
+]

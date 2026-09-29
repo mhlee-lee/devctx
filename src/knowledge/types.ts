@@ -59,7 +59,35 @@ export interface KnowledgeItem {
   needs_review: boolean;
   revision: number;
   last_verified: string;
+  /**
+   * Last day (YYYY-MM-DD, inclusive) the rule applies, when the developer gave an end date
+   * ("until the 2.0 release on 2026-10-10"). After it the item is no longer delivered and the
+   * worker retires it. On a superseded item: the day a newer rule replaced it.
+   */
+  valid_until: string | null;
+  /** Rules that relied on what this rule replaced and should be checked again (cascade). */
+  review: string[];
+  /**
+   * What in the repository this rule depends on, recorded when the file is created: dependency or
+   * tool names found in manifests and path globs that matched files. When they disappear the rule
+   * is marked "check needed" instead of being delivered as settled.
+   */
+  anchors: Anchors | null;
   sections: Sections;
   /** Absolute path of the backing file (runtime only, not serialized). */
   file: string;
+  // ---- runtime only (never serialized) ----
+  /** Lives in this PC's state database (an unconfirmed proposal), not in a file. */
+  local?: boolean;
+  /** An old proposal nobody confirmed: kept so a later restatement revives it. */
+  archived?: boolean;
+  /** Why the rule may be outdated (its anchors are gone from the repository). */
+  stale?: string | null;
+  /** When `needs_review` was raised (the reviewing rule's time). */
+  reviewSince?: string;
+}
+
+export interface Anchors {
+  terms: string[];
+  paths: string[];
 }

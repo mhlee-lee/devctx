@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DevctxConfig } from '../config.ts';
-import { loadItems } from '../knowledge/store.ts';
+import { repoContext, staleReason } from '../knowledge/anchors.ts';
+import type { KnowledgeItem } from '../knowledge/types.ts';
+import { loadTeam, saveStale } from '../knowledge/view.ts';
 import type { StateDb } from '../state/db.ts';
 import { assertSafeTarget, readText, writeFileAtomic } from '../util/fsx.ts';
 import type { ProjectPaths } from '../util/paths.ts';
 import { detectForeignEdits, forgetGenerated, recordGenerated } from './foreign.ts';
 import { GENERATED_MARKER, PATH_RULE_DIRS, renderAgentsMd, renderPathRules } from './render.ts';
-import { planTiers, type TierPlan } from './tiers.ts';
+import { isDeliverable, planTiers, type TierPlan } from './tiers.ts';
 
 export interface CompileResult {
   changed: string[];
@@ -42,17 +44,47 @@ function existingGenerated(root: string): string[] {
   return out;
 }
 
-export function renderOutputs(paths: ProjectPaths, cfg: DevctxConfig): { outputs: Map<string, string>; plan: TierPlan; warnings: string[] } {
-  const { items, errors } = loadItems(paths);
-  const warnings = errors.map((e) => `${path.relative(paths.root, e.file)}: ${e.error}`);
+export interface RenderResult {
+  outputs: Map<string, string>;
+  plan: TierPlan;
+  warnings: string[];
+  items: KnowledgeItem[];
+}
+
+/**
+ * What the compiled files contain, from committed files only: the knowledge files (statuses
+ * derived from their links) and the repository (code evidence). No local counters, so every clone
+ * at the same commit renders the same bytes and regenerating after a merge changes nothing.
+ */
+export function renderOutputs(
+  paths: ProjectPaths,
+  cfg: DevctxConfig,
+  db: StateDb | null = null,
+  opts: { items?: KnowledgeItem[] } = {},
+): RenderResult {
+  let items: KnowledgeItem[];
+  let warnings: string[] = [];
+  if (opts.items) {
+    // Already loaded, with the last compile's code-evidence results (no git calls here).
+    items = opts.items;
+  } else {
+    const loaded = loadTeam(paths, db, { proposedTtlDays: cfg.memory.proposed_ttl_days });
+    items = loaded.items;
+    warnings = loaded.errors.map((e) => `${path.relative(paths.root, e.file)}: ${e.error}`);
+    if (items.some((i) => i.anchors)) {
+      const repo = repoContext(paths.root);
+      for (const i of items) if (isDeliverable(i)) i.stale = staleReason(i, repo, cfg.language);
+    }
+    if (db) saveStale(db, items);
+  }
   const plan = planTiers(items, cfg);
   if (plan.overflow.length > 0) {
     warnings.push(`core budget exceeded: ${plan.overflow.length} rule(s) moved to on-demand (inject.core_budget_tokens=${cfg.inject.core_budget_tokens})`);
   }
   const outputs = new Map<string, string>();
-  outputs.set('AGENTS.md', renderAgentsMd(plan, cfg, readText(paths.preamble) ?? ''));
+  outputs.set('AGENTS.md', renderAgentsMd(plan, cfg, readText(paths.preamble) ?? '', cfg.code_index.enabled));
   for (const [rel, content] of renderPathRules(plan, cfg, cfg.targets)) outputs.set(rel, content);
-  return { outputs, plan, warnings };
+  return { outputs, plan, warnings, items };
 }
 
 /**
@@ -61,7 +93,7 @@ export function renderOutputs(paths: ProjectPaths, cfg: DevctxConfig): { outputs
  * prompt caches warm and git diffs quiet. Direct edits are captured before overwriting.
  */
 export function compile(paths: ProjectPaths, cfg: DevctxConfig, db: StateDb | null, opts: { check?: boolean; tool?: string } = {}): CompileResult {
-  const { outputs, plan, warnings } = renderOutputs(paths, cfg);
+  const { outputs, plan, warnings, items } = renderOutputs(paths, cfg, db);
   const result: CompileResult = { changed: [], removed: [], unchanged: [], drift: [], warnings, plan, foreignEdits: 0 };
   const agentsCurrent = readText(paths.agentsMd);
   if (!isManagedAgentsMd(agentsCurrent)) {
@@ -78,7 +110,7 @@ export function compile(paths: ProjectPaths, cfg: DevctxConfig, db: StateDb | nu
     return result;
   }
 
-  if (db) result.foreignEdits = detectForeignEdits(paths, db, opts.tool ?? 'cli');
+  if (db) result.foreignEdits = detectForeignEdits(paths, db, opts.tool ?? 'cli', { rendered: outputs, summaries: items.map((i) => i.summary) });
   for (const [rel, content] of outputs) {
     const file = path.join(paths.root, rel);
     if (readText(file) === content) {

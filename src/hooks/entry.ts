@@ -1,15 +1,22 @@
+import { codeLookup } from '../codeindex/hints.ts';
+import { indexNeedsRefresh } from '../codeindex/service.ts';
+import { renderOutputs } from '../compile/compile.ts';
 import { detectForeignEdits } from '../compile/foreign.ts';
+import { isExpired } from '../compile/tiers.ts';
 import { loadConfig } from '../config.ts';
 import { ensureGitHooks } from '../init/githooks.ts';
-import { loadItems, loadPersonalItems } from '../knowledge/store.ts';
+import type { KnowledgeItem } from '../knowledge/types.ts';
+import { applyCachedStale, loadPersonal, loadTeam } from '../knowledge/view.ts';
 import { StateDb } from '../state/db.ts';
+import { dailyUpkeep, healthNotices } from '../upkeep.ts';
 import type { HookKind, ToolId } from '../types.ts';
 import { sha256 } from '../util/fsx.ts';
 import { errorMessage, logLine } from '../util/log.ts';
 import { findProjectRoot, projectPaths, type ProjectPaths } from '../util/paths.ts';
-import { normalizeForMatch, today } from '../util/text.ts';
+import { approxTokens, normalizeForMatch, today } from '../util/text.ts';
 import { spawnWorker } from '../worker-spawn.ts';
-import { promptContext, sessionContext } from './context.ts';
+import { promptContext, promptKind, sessionContext } from './context.ts';
+import { continuesSession, renderHandoff } from './handoff.ts';
 import { normalizeHook } from './normalize.ts';
 import { renderHookOutput } from './output.ts';
 import { detectSignals } from './signals.ts';
@@ -20,7 +27,15 @@ interface SessionState {
   started: string;
   updated: string;
   injected: string[];
+  /** Prompts seen in this session (handoff is only offered on the first few). */
+  prompts?: number;
+  /** The previous session's handoff was already given. */
+  handoff?: boolean;
 }
+
+/** Handoff is considered on the first prompts of a session, for sessions that ended within a week. */
+const HANDOFF_PROMPTS = 3;
+const HANDOFF_MAX_AGE_MS = 7 * 86_400_000;
 
 async function readStdin(maxBytes: number, timeoutMs: number): Promise<string> {
   if (process.stdin.isTTY) return '';
@@ -120,37 +135,79 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
       }
 
       let output = fallback;
+      // A rule past its end date is no longer injected; the worker recompiles AGENTS.md and the
+      // path rule files without it and logs the expiry.
+      let expiredLive = false;
+      const viewOpts = { proposedTtlDays: cfg.memory.proposed_ttl_days };
+      let team: KnowledgeItem[] | null = null;
+      const teamItems = (): KnowledgeItem[] => {
+        if (!team) {
+          team = loadTeam(paths as ProjectPaths, db, viewOpts).items;
+          applyCachedStale(db, team);
+        }
+        return team;
+      };
       if (kind === 'session_start') {
         const previous = readSession(db, tool, event.session, now);
         const keepStart = previous && (event.source === 'compact' || event.source === 'resume');
-        const ctx = sessionContext(loadItems(paths).items, cfg.memory.personal ? loadPersonalItems().items : [], cfg);
+        const seen = new Set<string>(JSON.parse(db.kvGet('expired_seen') ?? '[]') as string[]);
+        expiredLive = teamItems().some((i) => i.valid_until !== null && isExpired(i) && !seen.has(i.id));
+        const notices = fresh ? healthNotices(db, cfg.language, { capture: false, everyDays: 1 }) : [];
+        const ctx = sessionContext(teamItems(), cfg.memory.personal ? loadPersonal(db, viewOpts).items : [], cfg, notices);
         writeSession(db, tool, event.session, {
           started: keepStart ? previous.started : now.toISOString(),
           updated: now.toISOString(),
           injected: ctx.ids, // context was rebuilt (new, resumed or compacted): re-inject from scratch
+          // A compacted or resumed conversation still has its own history: no handoff for it.
+          prompts: keepStart ? (previous.prompts ?? HANDOFF_PROMPTS) : 0,
+          handoff: Boolean(keepStart),
         });
+        if (fresh && ctx.text) db.recordInjection({ tool, session: event.session, kind, ids: ctx.ids, tokens: approxTokens(ctx.text), handoff: false });
         output = renderHookOutput(tool, kind, ctx.text) ?? fallback;
       } else if (kind === 'prompt') {
+        const prompt = event.prompt ?? '';
         const state = readSession(db, tool, event.session, now) ?? { started: now.toISOString(), updated: now.toISOString(), injected: [] };
-        const ctx = promptContext(loadItems(paths).items, event.prompt ?? '', cfg, {
+        state.prompts = (state.prompts ?? 0) + 1;
+        let handoff: string | null = null;
+        if (cfg.inject.handoff_budget_tokens > 0 && !state.handoff && state.prompts <= HANDOFF_PROMPTS && promptKind(prompt) !== 'command') {
+          const before = state.started < event.ts ? state.started : event.ts;
+          const prev = db.previousSession(before, new Date(now.getTime() - HANDOFF_MAX_AGE_MS).toISOString(), event.session);
+          if (prev && continuesSession(prompt, prev)) handoff = renderHandoff(prev, cfg.language, cfg.inject.handoff_budget_tokens, now);
+          if (handoff) state.handoff = true;
+        }
+        const code = cfg.code_index.enabled
+          ? codeLookup(root, prompt, cfg.language, Math.min(200, Math.floor(cfg.inject.prompt_budget_tokens / 3)))
+          : { text: null, paths: [] };
+        const boosts = new Map<string, number>();
+        for (const [id, s] of db.itemStats()) if (s.violations > 0) boosts.set(id, s.violations);
+        const ctx = promptContext(teamItems(), prompt, cfg, {
           sessionStartedAt: state.started,
           alreadyInjected: new Set(state.injected),
+          codePaths: code.paths,
+          violations: boosts,
         });
         state.injected.push(...ctx.ids);
         state.updated = now.toISOString();
         writeSession(db, tool, event.session, state);
-        output = renderHookOutput(tool, kind, ctx.text) ?? fallback;
+        const text = [handoff, ctx.text, code.text].filter(Boolean).join('\n\n') || null;
+        if (fresh) db.recordInjection({ tool, session: event.session, kind, ids: ctx.ids, tokens: text ? approxTokens(text) : 0, handoff: Boolean(handoff) });
+        output = renderHookOutput(tool, kind, text) ?? fallback;
       }
 
+      let codeRefresh = false;
       if (fresh && kind === 'session_start') {
-        detectForeignEdits(paths, db, tool);
+        const { outputs } = renderOutputs(paths, cfg, db, { items: teamItems() });
+        detectForeignEdits(paths, db, tool, { rendered: outputs, summaries: teamItems().map((i) => i.summary) });
         if (cfg.git.auto_install_hooks && db.kvGet('githooks_checked') !== today()) {
           const res = ensureGitHooks(root);
           if (res.installed.length > 0) logLine(paths.log, 'info', 'installed git hooks', { hooks: res.installed });
           db.kvSet('githooks_checked', today());
         }
+        const upkept = dailyUpkeep(root, cfg, db);
+        if (upkept.length > 0) logLine(paths.log, 'info', 'daily upkeep', { files: upkept });
+        codeRefresh = cfg.code_index.enabled && indexNeedsRefresh(root, cfg);
       }
-      if (fresh && kind !== 'prompt' && db.hasPendingCandidates()) spawnWorker(root, kind, event.host);
+      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || db.hasPendingCandidates())) spawnWorker(root, kind, event.host);
       return output;
     } finally {
       db.close();

@@ -86,6 +86,15 @@ function dateOnly(v: unknown, fallback: string): string {
   return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : fallback;
 }
 
+/** A real calendar date (YAML may already have turned it into a Date), else null. */
+export function dateOrNull(v: unknown): string | null {
+  const s = v instanceof Date ? v.toISOString() : str(v).trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m) return null;
+  const d = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s.slice(0, 10) ? null : s.slice(0, 10);
+}
+
 function parseEvidence(v: unknown): Evidence[] {
   if (!Array.isArray(v)) return [];
   const out: Evidence[] = [];
@@ -192,6 +201,11 @@ export function parseItem(text: string, file: string, fallbackDate?: string): Pa
   const scope = obj(m.scope);
   const source = obj(m.source);
   const id = str(m.id).trim() || `F${sha256(baseName).slice(0, 12).toUpperCase()}`;
+  // The time a rule was recorded orders "which replaces which". It must be the same on every
+  // clone, so a file without one uses its ULID's time, never the checkout's file mtime.
+  const capturedAt = str(source.captured_at) || ulidTime(id) || EPOCH;
+  const anchorsRaw = obj(m.anchors);
+  const anchors = { terms: strList(anchorsRaw.terms).map((t) => t.toLowerCase()), paths: strList(anchorsRaw.paths) };
   const item: KnowledgeItem = {
     id,
     title: normalizeText(str(m.title)) || truncate(summary, 40),
@@ -205,7 +219,7 @@ export function parseItem(text: string, file: string, fallbackDate?: string): Pa
       kind: oneOf(source.kind, SOURCE_KINDS, 'human-edit'),
       actor: strOrNull(source.actor),
       tool: strOrNull(source.tool),
-      captured_at: str(source.captured_at) || mtime,
+      captured_at: capturedAt,
     },
     evidence: parseEvidence(m.evidence),
     reinforced: int(m.reinforced, 0),
@@ -218,13 +232,36 @@ export function parseItem(text: string, file: string, fallbackDate?: string): Pa
     needs_review: m.needs_review === true,
     revision: Math.max(1, int(m.revision, 1)),
     last_verified: dateOnly(m.last_verified, mtime.slice(0, 10)),
+    valid_until: dateOrNull(m.valid_until),
+    review: strList(m.review),
+    anchors: anchors.terms.length > 0 || anchors.paths.length > 0 ? anchors : null,
     sections: { ...sections, rule: sections.rule || summary },
     file,
   };
   return { item, error: null };
 }
 
+const EPOCH = '1970-01-01T00:00:00.000Z';
+const ULID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** Creation time encoded in a ULID id (null for other ids). */
+export function ulidTime(id: string): string | null {
+  if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) return null;
+  let t = 0;
+  for (const ch of id.slice(0, 10)) t = t * 32 + ULID_ALPHABET.indexOf(ch);
+  const d = new Date(t);
+  return Number.isNaN(d.getTime()) || t > 8_000_000_000_000 ? null : d.toISOString();
+}
+
+/**
+ * The file of a new item. Only what stays true is written: devctx never rewrites the file, so
+ * counters, "last seen" and statuses derived from other files (superseded, conflict) are not
+ * stored here. Links to other rules (`supersedes`, `conflict_with`, `review`) are written only
+ * when present.
+ */
 export function serializeItem(item: KnowledgeItem, language: Language): string {
+  const list = <K extends string>(key: K, values: readonly string[]): Partial<Record<K, readonly string[]>> =>
+    values.length > 0 ? ({ [key]: values } as Record<K, readonly string[]>) : {};
   const meta = {
     id: item.id,
     title: item.title,
@@ -241,16 +278,13 @@ export function serializeItem(item: KnowledgeItem, language: Language): string {
       captured_at: item.source.captured_at,
     },
     evidence: item.evidence,
-    reinforced: item.reinforced,
-    violations: item.violations,
-    tier: item.tier,
-    relates: item.relates,
-    supersedes: item.supersedes,
-    superseded_by: item.superseded_by,
-    conflict_with: item.conflict_with,
-    needs_review: item.needs_review,
-    revision: item.revision,
-    last_verified: item.last_verified,
+    ...(item.tier !== 'auto' ? { tier: item.tier } : {}),
+    ...list('supersedes', item.supersedes),
+    ...list('conflict_with', item.conflict_with),
+    ...list('review', item.review),
+    ...list('relates', item.relates),
+    ...(item.valid_until ? { valid_until: item.valid_until } : {}),
+    ...(item.anchors ? { anchors: { terms: item.anchors.terms, paths: item.anchors.paths } } : {}),
   };
   const h = HEADINGS[language];
   const s = item.sections;

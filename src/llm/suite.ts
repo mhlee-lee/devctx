@@ -21,7 +21,10 @@ import type { Language } from '../types.ts';
  * Bump SUITE_VERSION whenever a case, a pass rule or a production prompt changes: every cached
  * verdict is then re-evaluated.
  */
-export const SUITE_VERSION = 2;
+export const SUITE_VERSION = 3;
+
+/** Message date the suite's cases are written against (relative end dates resolve from it). */
+const SUITE_DATE = '2026-09-28';
 
 export type SuiteTask = 'extract' | 'judge';
 export const SUITE_TASKS: readonly SuiteTask[] = ['extract', 'judge'];
@@ -90,6 +93,7 @@ const EXTRACT_BATCHES: ExtractCase[][] = [
         ['english rule becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /pnpm/i))],
         ['"never" is marked must', (own) => own.some((i) => i.enforcement === 'must')],
         ['no reason is invented', (own) => own.every((i) => i.reason === null)],
+        ['no end date is invented', (own) => own.every((i) => i.valid_until === null)],
       ],
     },
     {
@@ -199,12 +203,40 @@ const EXTRACT_BATCHES: ExtractCase[][] = [
       ],
     },
   ],
+  [
+    {
+      tool: 'claude',
+      previousAssistant: null,
+      message: '2026-10-10 릴리스 전까지는 의존성 버전을 올리지 마.',
+      requires: [
+        [
+          'rule with an end date keeps the date',
+          (own) => kept(own).some((i) => i.audience === 'team' && (i.valid_until === '2026-10-10' || i.valid_until === '2026-10-09')),
+        ],
+      ],
+    },
+    {
+      tool: 'codex',
+      previousAssistant: 'Jest로 단위 테스트를 추가했습니다.',
+      message: '앞으로 테스트는 Jest 말고 Vitest로 작성해.',
+      requires: [['replacement names the old and the new option', (own) => own.some((i) => activeTeamRule(i) && says(i, /vitest/i) && says(i, /jest/i))]],
+    },
+    {
+      tool: 'copilot',
+      previousAssistant: null,
+      message: 'Until the end of this month, do not push directly to main. Open a PR instead.',
+      requires: [
+        ['relative end date is resolved from the message date', (own) => kept(own).some((i) => i.audience === 'team' && i.valid_until === '2026-09-30')],
+      ],
+    },
+  ],
 ];
 
 function extractCall(batch: readonly ExtractCase[], index: number, lang: Language): SuiteCall {
   const messages: ExtractMessage[] = batch.map((c, i) => ({
     index: i + 1,
     tool: c.tool,
+    date: SUITE_DATE,
     message: c.message,
     previousAssistant: c.previousAssistant,
   }));
@@ -351,16 +383,39 @@ const JUDGE_CASES: JudgeCase[] = [
     },
     requires: [['opposite rule is not a duplicate', contradicts('S1')]],
   },
+  {
+    name: 'changed version',
+    input: {
+      statement: 'Node.js 22를 사용한다.',
+      paths: [],
+      topics: ['node', 'runtime'],
+      neighbors: [{ id: 'V1', status: 'active', statement: 'Node.js 20을 사용한다.', paths: [], topics: ['node', 'runtime'] }, C1],
+    },
+    requires: [['a different version is not a duplicate', contradicts('V1')]],
+  },
+  {
+    name: 'other path',
+    input: {
+      statement: 'packages/web의 폼 검증에는 yup을 사용한다.',
+      paths: ['packages/web/**'],
+      topics: ['검증', 'validation', 'yup'],
+      neighbors: [
+        { id: 'Z1', status: 'active', statement: 'packages/api의 입력 검증에는 zod를 사용한다.', paths: ['packages/api/**'], topics: ['검증', 'validation', 'zod'] },
+        P2,
+      ],
+    },
+    requires: [['a rule for another path is new', (r) => r.relation === 'new']],
+  },
 ];
 
 function judgeCall(c: JudgeCase, lang: Language): SuiteCall {
-  const allowed = new Set(c.input.neighbors.map((n) => n.id));
+  const ids = c.input.neighbors.map((n) => n.id);
   return {
     name: `judge ${c.name}`,
     prompt: buildJudgePrompt(c.input, lang),
     schema: JUDGE_SCHEMA,
     check(data) {
-      const r = parseJudgeResult(data, allowed);
+      const r = parseJudgeResult(data, ids);
       if (!r) return null;
       const passed: string[] = [];
       const failed: string[] = [];

@@ -13,7 +13,7 @@ export interface LoadResult {
   errors: { file: string; error: string }[];
 }
 
-function isKnowledgeFile(name: string): boolean {
+export function isKnowledgeFile(name: string): boolean {
   return name.endsWith('.md') && !name.startsWith('_') && name !== 'README.md' && name !== 'preamble.md';
 }
 
@@ -86,18 +86,28 @@ export function newItem(fields: Partial<KnowledgeItem> & Pick<KnowledgeItem, 'su
     needs_review: fields.needs_review ?? false,
     revision: fields.revision ?? 1,
     last_verified: fields.last_verified ?? today(),
+    valid_until: fields.valid_until ?? null,
+    review: fields.review ?? [],
+    anchors: fields.anchors ?? null,
     sections: fields.sections ?? { rule: fields.summary, reason: '', exceptions: '', notes: '' },
     file: fields.file ?? '',
   };
 }
 
-/** Writes an item to its file (creating `<id>-<slug>.md` for new items). Returns the file path. */
+/**
+ * Creates the file of a new item (`<id>-<slug>.md`) and returns its path. devctx never rewrites a
+ * knowledge file once it exists: a change is a new file that points at the old one (`supersedes`,
+ * `conflict_with`). Two people's changes are then always different files, so git merges them
+ * without conflicts; only edits people make by hand can collide.
+ */
 export function writeItem(paths: ProjectPaths, item: KnowledgeItem, language: Language): string {
+  if (item.file) throw new Error(`knowledge files are never rewritten: ${item.file}`);
   const root = item.audience === 'personal' ? personalDir() : paths.knowledge;
   const dir = item.audience === 'personal' ? personalDir() : typeDir(paths, item.type);
-  const file = item.file || path.join(dir, `${item.id}-${slugify(`${item.title} ${item.scope.topics.join(' ')}`, 40, item.type)}.md`);
-  fs.mkdirSync(root, { recursive: true });
+  const file = path.join(dir, `${item.id}-${slugify(`${item.title} ${item.scope.topics.join(' ')}`, 40, item.type)}.md`);
+  fs.mkdirSync(dir, { recursive: true });
   assertSafeTarget(file, root);
+  if (fs.existsSync(file)) throw new Error(`knowledge file already exists: ${file}`);
   writeFileAtomic(file, serializeItem(item, language));
   item.file = file;
   return file;

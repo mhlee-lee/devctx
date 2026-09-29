@@ -1,3 +1,4 @@
+import { dateOrNull } from '../knowledge/format.ts';
 import type { Language } from '../types.ts';
 import { truncate } from '../util/text.ts';
 
@@ -8,6 +9,8 @@ import { truncate } from '../util/text.ts';
 export interface ExtractMessage {
   index: number;
   tool: string;
+  /** Day the developer wrote the message (YYYY-MM-DD): relative end dates are resolved from it. */
+  date: string;
   message: string;
   previousAssistant: string | null;
 }
@@ -23,6 +26,8 @@ export interface ExtractedItem {
   scope: { paths: string[]; topics: string[] };
   evidence_quote: string;
   reason: string | null;
+  /** Last day the rule applies when the developer gave an end date, else null. */
+  valid_until: string | null;
   confidence: number;
 }
 
@@ -49,6 +54,7 @@ export const EXTRACT_SCHEMA: Record<string, unknown> = {
           'scope',
           'evidence_quote',
           'reason',
+          'valid_until',
           'confidence',
         ],
         properties: {
@@ -67,6 +73,7 @@ export const EXTRACT_SCHEMA: Record<string, unknown> = {
           },
           evidence_quote: { type: 'string' },
           reason: { type: ['string', 'null'] },
+          valid_until: { type: ['string', 'null'] },
           confidence: { type: 'number' },
         },
       },
@@ -84,7 +91,7 @@ export function buildExtractPrompt(messages: readonly ExtractMessage[], lang: La
       const prev = m.previousAssistant
         ? `PREVIOUS_ASSISTANT (context only, may be truncated):\n"""\n${truncate(m.previousAssistant, 1500)}\n"""\n`
         : '';
-      return `### MESSAGE ${m.index} (tool: ${m.tool})\n${prev}MESSAGE:\n"""\n${truncate(m.message, 4000)}\n"""`;
+      return `### MESSAGE ${m.index} (tool: ${m.tool}, date: ${m.date})\n${prev}MESSAGE:\n"""\n${truncate(m.message, 4000)}\n"""`;
     })
     .join('\n\n');
   return `You extract durable project rules for a project-memory system. Developers sent the MESSAGES below to an AI coding assistant. Return ONLY one JSON object that matches the schema. No prose, no code fences, and do not use any tools.
@@ -98,15 +105,16 @@ Hard rules:
 4. One item per independent rule: split a message that states several rules into separate items.
 5. evidence_quote must be copied verbatim from MESSAGE (an exact substring), at most 200 characters.
 6. reason: only when the developer stated a reason (because/since/~거든/~때문에/~라서); otherwise null. Never invent a reason.
-7. durability: "durable" when meant beyond the current task (앞으로/항상/절대/반드시/무조건/이 프로젝트에서/always/never/from now on, a correction of a general convention, or a fact about the project); "one_off" when limited to this task (이번만/일단/for now/this time); otherwise "unclear".
-8. audience: "personal" when it is about how the assistant talks to this person (reply language, tone, length, format); otherwise "team".
-9. statement: one self-contained sentence in ${languageName(lang)} that names its subject explicitly (imperative for rules).
-10. title: at most 6 words in ${languageName(lang)}.
-11. scope.paths: glob patterns only when the developer referred to specific files, directories, modules or file types (for example "src/billing/**", "**/*.kt"); otherwise [].
-12. scope.topics: 1-5 short keywords; include Korean and English variants when natural.
-13. type: rule | decision | fact | procedure ("fact" for plain information about the project, such as where it is deployed). enforcement: "must" for must/never/반드시/절대/무조건/금지, "info" for facts, otherwise "should".
-14. confidence: 0 to 1, how sure you are this is a durable project rule the developer wants kept.
-15. Return {"items": []} when nothing qualifies.
+7. durability: "durable" when meant beyond the current task (앞으로/항상/절대/반드시/무조건/이 프로젝트에서/always/never/from now on, a correction of a general convention, or a fact about the project), including a rule that holds until a stated end date; "one_off" when limited to this task (이번만/일단/for now/this time) without an end date; otherwise "unclear".
+8. valid_until: the last day the rule applies as YYYY-MM-DD, only when the developer gave an end date or deadline ("until the 2.0 release on 2026-10-10", "이번 달 말까지"). Resolve relative dates from the message date. Otherwise null; never guess a date.
+9. audience: "personal" when it is about how the assistant talks to this person (reply language, tone, length, format); otherwise "team".
+10. statement: one self-contained sentence in ${languageName(lang)} that names its subject explicitly (imperative for rules). When the developer replaces one option with another, name both (for example "Use Vitest instead of Jest"). Keep it general: no line numbers, error messages or values that only mattered for the current task.
+11. title: at most 6 words in ${languageName(lang)}.
+12. scope.paths: glob patterns only when the developer referred to specific files, directories, modules or file types (for example "src/billing/**", "**/*.kt"); otherwise [].
+13. scope.topics: 1-5 short keywords; include Korean and English variants when natural.
+14. type: rule | decision | fact | procedure ("fact" for plain information about the project, such as where it is deployed). enforcement: "must" for must/never/반드시/절대/무조건/금지, "info" for facts, otherwise "should".
+15. confidence: 0 to 1, how sure you are this is a durable project rule the developer wants kept.
+16. Return {"items": []} when nothing qualifies.
 
 Schema:
 ${JSON.stringify(EXTRACT_SCHEMA)}
@@ -154,6 +162,7 @@ export function parseExtractResult(data: unknown): ExtractedItem[] | null {
       scope: { paths: strings(scope.paths), topics: strings(scope.topics).slice(0, 5) },
       evidence_quote: quote,
       reason: typeof it.reason === 'string' && it.reason.trim() ? it.reason.trim() : null,
+      valid_until: dateOrNull(it.valid_until),
       confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0.5,
     });
   }
@@ -205,11 +214,16 @@ export const JUDGE_SCHEMA: Record<string, unknown> = {
   },
 };
 
+/**
+ * EXISTING items are shown as numbers ("1", "2", …), not their 26-character ids: small models copy
+ * a short number reliably, and a mistyped id would lose the verdict (Mem0 maps ids the same way).
+ * parseJudgeResult maps the numbers back.
+ */
 export function buildJudgePrompt(input: JudgeInput, lang: Language): string {
   const existing = input.neighbors
     .map(
-      (n) =>
-        `- id: ${n.id}\n  status: ${n.status}\n  statement: ${n.statement}\n  paths: ${JSON.stringify(n.paths)}\n  topics: ${JSON.stringify(n.topics)}`,
+      (n, i) =>
+        `- id: "${i + 1}"\n  status: ${n.status}\n  statement: ${n.statement}\n  paths: ${JSON.stringify(n.paths)}\n  topics: ${JSON.stringify(n.topics)}`,
     )
     .join('\n');
   return `You maintain a project's rule memory. Compare NEW with the EXISTING items and classify the relation. Return ONLY one JSON object that matches the schema. No prose, no code fences, and do not use any tools.
@@ -220,8 +234,11 @@ Relations:
 - "supersede": NEW changes the policy on the same subject as one EXISTING item (another tool or value, or the old way is no longer used), so that item should stop applying.
 - "conflict": NEW contradicts an EXISTING item but does not say it replaces it.
 - "new": no EXISTING item covers the same subject.
-An opposite rule on the same subject is never "duplicate". target_id is the one EXISTING item about exactly the same subject; an item on another aspect of a similar topic (for example storage vs display) is not the target.
-target_id: the EXISTING id for every relation except "new" (null for "new"). cascade_ids: for "supersede" or "refine", other EXISTING ids whose rule relies on the target's old policy and should be reviewed (for example a CI step that uses a replaced tool); otherwise []. merged_statement: null unless relation is "refine". why: one short sentence. confidence: 0 to 1.
+Rules:
+- An opposite rule on the same subject is never "duplicate". Never "duplicate" when a number, version, date, limit or named tool differs: a changed value on the same subject is "supersede" (NEW says it replaces the old one) or "conflict".
+- target_id is the one EXISTING item about exactly the same subject; an item on another aspect of a similar topic (for example storage vs display) is not the target. Rules for different paths, modules or file types are different subjects unless NEW says it replaces the other.
+- When an EXISTING item is about the same subject, choose it (duplicate, refine, supersede or conflict) instead of "new": one item per subject.
+target_id: the EXISTING id (the number in quotes) for every relation except "new" (null for "new"). cascade_ids: for "supersede" or "refine", other EXISTING ids whose rule relies on the target's old policy and should be reviewed (for example a CI step that uses a replaced tool); otherwise []. merged_statement: null unless relation is "refine". why: one short sentence. confidence: 0 to 1.
 
 Schema:
 ${JSON.stringify(JUDGE_SCHEMA)}
@@ -236,18 +253,29 @@ ${existing}
 `;
 }
 
-export function parseJudgeResult(data: unknown, allowedIds: ReadonlySet<string>): JudgeResult | null {
+/** "2", 2, "[2]" or "#2" → the second neighbour's real id; a real id is accepted as is. */
+function neighbourId(v: unknown, ids: readonly string[]): string | null {
+  if (typeof v !== 'string' && typeof v !== 'number') return null;
+  const s = String(v).trim();
+  const n = /^[[#]?(\d+)\]?$/.exec(s);
+  if (n) return ids[Number(n[1]) - 1] ?? null;
+  return ids.includes(s) ? s : null;
+}
+
+/** `ids` are the neighbours' real ids in the order the prompt listed them. */
+export function parseJudgeResult(data: unknown, ids: readonly string[]): JudgeResult | null {
   const root = asObj(data);
   if (!root || typeof root.relation !== 'string' || !(RELATIONS as readonly string[]).includes(root.relation)) return null;
   const relation = root.relation as Relation;
-  const target = typeof root.target_id === 'string' && allowedIds.has(root.target_id) ? root.target_id : null;
+  const target = neighbourId(root.target_id, ids);
   if (relation !== 'new' && !target) return null;
   const confidence = typeof root.confidence === 'number' ? root.confidence : Number(root.confidence);
+  const cascade = Array.isArray(root.cascade_ids) ? root.cascade_ids.map((v) => neighbourId(v, ids)) : [];
   return {
     relation,
     target_id: relation === 'new' ? null : target,
     merged_statement: typeof root.merged_statement === 'string' && root.merged_statement.trim() ? root.merged_statement.trim() : null,
-    cascade_ids: strings(root.cascade_ids).filter((id) => allowedIds.has(id) && id !== target),
+    cascade_ids: [...new Set(cascade.filter((id): id is string => id !== null && id !== target))],
     why: typeof root.why === 'string' ? root.why.trim() : '',
     confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0.5,
   };

@@ -6,7 +6,9 @@ import { StateDb } from '../state/db.ts';
 import type { Language, ToolId } from '../types.ts';
 import { readText, writeFileAtomic } from '../util/fsx.ts';
 import { projectPaths } from '../util/paths.ts';
+import { ensureGitAttributes } from './attributes.ts';
 import { ensureGitHooks, type GitHookResult } from './githooks.ts';
+import { installAgentAccess, removeLegacyMcp, type AccessResult } from './access.ts';
 import { installToolHooks, type HookFileResult } from './hookconfigs.ts';
 import { defaultSource, packageInfo, renderShim, renderToolsLock } from './shim.ts';
 
@@ -17,6 +19,8 @@ export interface InitOptions {
   language: Language;
   gitHooks: boolean;
   force: boolean;
+  /** Built-in code index for a new config (default on). */
+  codeIndex?: boolean;
 }
 
 export interface InitReport {
@@ -24,37 +28,16 @@ export interface InitReport {
   written: string[];
   notes: string[];
   hookFiles: HookFileResult[];
+  /** Skill files, permission settings and removed legacy MCP entries. */
+  accessFiles: AccessResult[];
   gitHooks: GitHookResult | null;
   compile: CompileResult;
 }
-
-const ATTR_BEGIN = '# >>> devctx >>>';
-const ATTR_END = '# <<< devctx <<<';
-const ATTR_BLOCK = [
-  ATTR_BEGIN,
-  '.github/instructions/devctx-*.instructions.md linguist-generated=true',
-  '.cursor/rules/devctx-*.mdc linguist-generated=true',
-  '.claude/rules/devctx-*.md linguist-generated=true',
-  '.kiro/steering/devctx-*.md linguist-generated=true',
-  ATTR_END,
-].join('\n');
 
 function writeIfMissing(file: string, content: string, written: string[], root: string, force = false, mode?: number): boolean {
   if (!force && fs.existsSync(file)) return false;
   writeFileAtomic(file, content, mode);
   written.push(path.relative(root, file));
-  return true;
-}
-
-function upsertBlock(file: string, block: string): boolean {
-  const current = readText(file) ?? '';
-  const start = current.indexOf(ATTR_BEGIN);
-  const end = current.indexOf(ATTR_END);
-  let next: string;
-  if (start >= 0 && end > start) next = `${current.slice(0, start)}${block}${current.slice(end + ATTR_END.length)}`;
-  else next = `${current.replace(/\s*$/, '')}${current.trim() ? '\n\n' : ''}${block}\n`;
-  if (next === current) return false;
-  writeFileAtomic(file, next);
   return true;
 }
 
@@ -73,7 +56,7 @@ export function runInit(opts: InitOptions): InitReport {
   for (const dir of [paths.decisions, paths.context, paths.runbooks, paths.lessons]) {
     writeIfMissing(path.join(dir, '.gitkeep'), '', written, opts.root);
   }
-  if (!writeIfMissing(paths.config, renderConfigYaml(opts.tools, opts.language), written, opts.root, opts.force)) {
+  if (!writeIfMissing(paths.config, renderConfigYaml(opts.tools, opts.language, opts.codeIndex ?? true), written, opts.root, opts.force)) {
     notes.push('.devctx/config.yaml already exists (kept). Use --force to regenerate it.');
   }
   writeIfMissing(path.join(paths.devctx, '.gitignore'), '/local/\n', written, opts.root);
@@ -114,10 +97,22 @@ export function runInit(opts: InitOptions): InitReport {
 
   const hookFiles = opts.tools.map((tool) => installToolHooks(opts.root, tool));
   for (const h of hookFiles) if (h.note) notes.push(`${h.file}: ${h.note}`);
+
+  const codeCfg = loadConfig(paths);
+  const codeIndex = codeCfg.code_index.enabled;
+  const accessFiles = [
+    ...removeLegacyMcp(opts.root),
+    ...installAgentAccess(opts.root, opts.tools, { enabled: codeIndex, preapprove: codeCfg.code_index.preapprove, language: codeCfg.language }),
+  ];
+  for (const a of accessFiles) if (a.note) notes.push(`${a.file}: ${a.note}`);
+  if (codeIndex) {
+    notes.push('code index: agents use it through the "devctx-code" skill (.devctx/bin/devctx code …); each clone indexes in the background at its first session.');
+    if (codeCfg.code_index.preapprove) notes.push('code index: the skill command is pre-approved per tool (turn off with code_index.preapprove: false).');
+  }
   if (opts.tools.includes('codex')) notes.push('Codex: approve the project hooks once with /hooks (Codex asks to trust new hooks).');
   if (opts.tools.includes('cursor')) notes.push('Cursor: hooks run only in a trusted workspace.');
 
-  if (upsertBlock(path.join(opts.root, '.gitattributes'), ATTR_BLOCK)) written.push('.gitattributes');
+  if (ensureGitAttributes(opts.root)) written.push('.gitattributes');
 
   const gitHooks = opts.gitHooks ? ensureGitHooks(opts.root, { allowTrackedDir: true }) : null;
   if (gitHooks?.reason) notes.push(`git hooks: ${gitHooks.reason}`);
@@ -126,7 +121,7 @@ export function runInit(opts: InitOptions): InitReport {
   const db = StateDb.open(paths.stateDb);
   try {
     const result = compile(paths, cfg, db, { tool: 'cli' });
-    return { root: opts.root, written, notes, hookFiles, gitHooks, compile: result };
+    return { root: opts.root, written, notes, hookFiles, accessFiles, gitHooks, compile: result };
   } finally {
     db.close();
   }

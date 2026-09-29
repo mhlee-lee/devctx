@@ -13,6 +13,7 @@ export function git(args: string[], cwd: string, timeoutMs = 10_000): GitResult 
     cwd,
     encoding: 'utf8',
     timeout: timeoutMs,
+    maxBuffer: 64 * 1024 * 1024, // `ls-files` of a large monorepo is several MB
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
   });

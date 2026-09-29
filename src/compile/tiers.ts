@@ -1,7 +1,7 @@
 import type { DevctxConfig } from '../config.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import type { Language } from '../types.ts';
-import { approxTokens } from '../util/text.ts';
+import { approxTokens, today } from '../util/text.ts';
 
 /**
  * Decides how each active team item reaches the tools:
@@ -21,8 +21,14 @@ export interface TierPlan {
   scopedTokens: number;
 }
 
-export function isDeliverable(item: KnowledgeItem): boolean {
-  return item.status === 'active' && item.audience === 'team';
+/** The rule's end date has passed (the day itself still counts). */
+export function isExpired(item: KnowledgeItem, day: string = today()): boolean {
+  return item.valid_until !== null && item.valid_until < day;
+}
+
+/** Live for delivery: active, team-wide and not past its end date (even before the worker retires it). */
+export function isDeliverable(item: KnowledgeItem, day: string = today()): boolean {
+  return item.status === 'active' && item.audience === 'team' && !isExpired(item, day);
 }
 
 /** A rule the user had to repeat is one the assistant kept missing: give it more weight. */
@@ -30,9 +36,9 @@ export function isEscalated(item: KnowledgeItem): boolean {
   return item.violations >= 1 || item.reinforced >= 3;
 }
 
-const LABELS: Record<Language, { must: string; applies: string }> = {
-  ko: { must: '(필수) ', applies: '적용' },
-  en: { must: '(must) ', applies: 'applies to' },
+const LABELS: Record<Language, { must: string; applies: string; until: (d: string) => string }> = {
+  ko: { must: '(필수) ', applies: '적용', until: (d) => ` (${d}까지)` },
+  en: { must: '(must) ', applies: 'applies to', until: (d) => ` (until ${d})` },
 };
 
 export function itemLine(item: KnowledgeItem, lang: Language, withScope: boolean): string {
@@ -40,7 +46,16 @@ export function itemLine(item: KnowledgeItem, lang: Language, withScope: boolean
   const mark = item.enforcement === 'must' ? l.must : '';
   const scope =
     withScope && item.scope.paths.length > 0 ? ` (${l.applies}: ${item.scope.paths.map((p) => `\`${p}\``).join(', ')})` : '';
-  return `- ${mark}${item.summary}${scope}`;
+  // A temporary rule says so: the agent should not generalize it beyond its end date.
+  const until = item.valid_until && !item.summary.includes(item.valid_until) ? l.until(item.valid_until) : '';
+  // What it depended on is gone from the repository: the agent should confirm before relying on it.
+  const stale = item.stale ? ` (${item.stale})` : '';
+  return `- ${mark}${item.summary}${until}${scope}${stale}`;
+}
+
+/** Possibly outdated (code evidence gone) and not pinned by a person: delivered only on demand. */
+function demoted(item: KnowledgeItem): boolean {
+  return Boolean(item.stale) && item.tier !== 'core';
 }
 
 function byId(a: KnowledgeItem, b: KnowledgeItem): number {
@@ -72,7 +87,7 @@ export function planTiers(items: readonly KnowledgeItem[], cfg: DevctxConfig): T
   const onDemand: KnowledgeItem[] = [];
   for (const item of items) {
     if (!isDeliverable(item)) continue;
-    if (item.tier === 'on-demand') onDemand.push(item);
+    if (item.tier === 'on-demand' || demoted(item)) onDemand.push(item);
     else if (item.tier === 'core') candidates.push(item);
     else if (item.scope.paths.length > 0) scoped.push(item);
     else if (item.tier === 'scoped') onDemand.push(item);

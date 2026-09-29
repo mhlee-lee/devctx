@@ -2,8 +2,8 @@ import { detectSignals } from '../hooks/signals.ts';
 import type { Audience, Enforcement, ItemType, SourceKind } from '../knowledge/types.ts';
 import { RATE_LIMIT_ERROR, reportAnswerQuality, routeCall, type RouteOptions } from '../llm/router.ts';
 import type { StateDb, StoredEvent } from '../state/db.ts';
-import { splitSentences, stripPasted, tokenize, truncate } from '../util/text.ts';
-import { isQuoteValid, redactSecrets, stripInvisible } from './evidence.ts';
+import { splitSentences, stripPasted, today, tokenize, truncate } from '../util/text.ts';
+import { isQuoteValid, redactSecrets, stripInvisible, unsupportedTerms } from './evidence.ts';
 import { buildExtractPrompt, EXTRACT_SCHEMA, parseExtractResult, type ExtractMessage } from './prompts.ts';
 
 export interface Candidate {
@@ -18,6 +18,8 @@ export interface Candidate {
   scope: { paths: string[]; topics: string[] };
   evidenceQuote: string;
   reason: string | null;
+  /** Last day the rule applies (YYYY-MM-DD) when the developer gave an end date. */
+  validUntil: string | null;
   confidence: number;
   sourceKind: SourceKind;
 }
@@ -72,6 +74,7 @@ export function heuristicCandidates(ev: StoredEvent): Candidate[] {
       scope: { paths: [], topics: topicsFrom(sentence) },
       evidenceQuote: sentence,
       reason: null,
+      validUntil: null,
       confidence: 0.4,
       sourceKind: sourceKindOf(ev),
     });
@@ -90,6 +93,7 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
     const messages: ExtractMessage[] = batch.map((ev, i) => ({
       index: i + 1,
       tool: ev.tool,
+      date: ev.ts.slice(0, 10),
       message: messageText(ev),
       previousAssistant:
         ev.kind === 'prompt' ? (redactSecrets(db.lastAssistantBefore(ev.session, ev.ts) ?? '') || null) : null,
@@ -138,6 +142,15 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
         continue;
       }
       if (item.durability === 'one_off') continue;
+      // An end date before the message was written is a misread, not a rule that never applied.
+      const validUntil = item.valid_until && item.valid_until >= msg.date ? item.valid_until : null;
+      if (validUntil && validUntil < today()) continue; // already over (backlog processed late)
+      let confidence = item.confidence;
+      const unsupported = unsupportedTerms(item.statement, [msg.message, msg.previousAssistant]);
+      if (unsupported.length > 0) {
+        confidence = Math.min(confidence, 0.5); // stays a proposal until the developer says it again
+        outcome.errors.push(`kept as proposed, names not in the message (${unsupported.slice(0, 3).join(', ')}): ${truncate(item.statement, 60)}`);
+      }
       outcome.candidates.push({
         eventId: ev.id,
         tool: ev.tool,
@@ -150,7 +163,8 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
         scope: item.scope,
         evidenceQuote: truncate(item.evidence_quote, 200),
         reason: item.reason,
-        confidence: item.confidence,
+        validUntil,
+        confidence,
         sourceKind: sourceKindOf(ev),
       });
     }
