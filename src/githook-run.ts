@@ -3,6 +3,7 @@ import path from 'node:path';
 import { indexNeedsRefresh } from './codeindex/service.ts';
 import { compile } from './compile/compile.ts';
 import { loadConfig } from './config.ts';
+import { HISTORY_DIR } from './history/writer.ts';
 import { StateDb } from './state/db.ts';
 import { dailyUpkeep, healthNotices, noteCommit } from './upkeep.ts';
 import { gitStage } from './util/git.ts';
@@ -31,7 +32,7 @@ export function runGitHook(name: string, root: string): string[] {
       if (name === 'pre-commit') {
         noteCommit(db);
         if (cfg.git.commit_mode !== 'manual') {
-          const stage = ['.devctx/knowledge', ...res.changed, ...res.unchanged, ...res.removed].filter(
+          const stage = ['.devctx/knowledge', HISTORY_DIR, ...res.changed, ...res.unchanged, ...res.removed].filter(
             (rel, i, all) => all.indexOf(rel) === i && (fs.existsSync(path.join(root, rel)) || res.removed.includes(rel)),
           );
           const r = gitStage(root, stage);

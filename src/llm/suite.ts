@@ -1,5 +1,13 @@
 import { isQuoteValid } from '../memory/evidence.ts';
 import {
+  buildSummaryPrompt,
+  inventedPaths,
+  parseSummaryResult,
+  SUMMARY_SCHEMA,
+  type SummaryFacts,
+  type TurnSummary,
+} from '../history/summarize.ts';
+import {
   buildExtractPrompt,
   buildJudgePrompt,
   EXTRACT_SCHEMA,
@@ -21,13 +29,13 @@ import type { Language } from '../types.ts';
  * Bump SUITE_VERSION whenever a case, a pass rule or a production prompt changes: every cached
  * verdict is then re-evaluated.
  */
-export const SUITE_VERSION = 3;
+export const SUITE_VERSION = 4;
 
 /** Message date the suite's cases are written against (relative end dates resolve from it). */
 const SUITE_DATE = '2026-09-28';
 
-export type SuiteTask = 'extract' | 'judge';
-export const SUITE_TASKS: readonly SuiteTask[] = ['extract', 'judge'];
+export type SuiteTask = 'extract' | 'judge' | 'summarize';
+export const SUITE_TASKS: readonly SuiteTask[] = ['extract', 'judge', 'summarize'];
 
 export interface CheckOutcome {
   passed: string[];
@@ -230,6 +238,66 @@ const EXTRACT_BATCHES: ExtractCase[][] = [
       ],
     },
   ],
+  // Instructions without explicit markers ("앞으로", "always"): hooks send them too, in batches.
+  [
+    {
+      tool: 'claude',
+      previousAssistant: 'OrderMapper 인터페이스와 AbstractMapper 기반 클래스를 추가해 나중에 확장할 수 있게 만들었습니다.',
+      message: '쓰는 곳이 하나뿐인데 인터페이스랑 추상 클래스까지 만들 필요 없어. 필요해지기 전에는 추상화 계층 추가하지 마.',
+      requires: [['unmarked general principle becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /추상|abstract/i))]],
+    },
+    {
+      tool: 'codex',
+      previousAssistant: null,
+      message: 'LoginForm에 비밀번호 보기 토글 버튼 추가해줘.',
+      requires: [['imperative task request is not stored', nothingKept]],
+    },
+    {
+      tool: 'copilot',
+      previousAssistant: null,
+      message: '엔티티 ID는 UUID v7으로 생성해.',
+      requires: [['unmarked convention for a kind of thing becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /uuid/i))]],
+    },
+    {
+      tool: 'cursor',
+      previousAssistant: null,
+      message: 'Fix the failing test in cart.spec.ts and run the suite again.',
+      requires: [['english task request is not stored', nothingKept]],
+    },
+    {
+      tool: 'kiro',
+      previousAssistant: '결제 금액 표시 로직을 확인했습니다.',
+      message: '결제 페이지에서 할인 금액이 0원으로 나와. 고쳐줘.',
+      requires: [['bug report with a fix request is not stored', nothingKept]],
+    },
+  ],
+  // Terse notes and bare acceptances: hooks send every statement and an "응" after a proposal.
+  [
+    {
+      tool: 'claude',
+      previousAssistant: null,
+      message: 'DB 컬럼명은 snake_case.',
+      requires: [['terse note becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /snake/i))]],
+    },
+    {
+      tool: 'codex',
+      previousAssistant: 'UserDto에 Lombok @Data를 붙여서 getter/setter를 생성했습니다.',
+      message: 'Lombok은 안 씀',
+      requires: [['terse negative note is kept as a team rule', (own) => kept(own).some((i) => i.audience === 'team' && says(i, /lombok/i))]],
+    },
+    {
+      tool: 'copilot',
+      previousAssistant: '에러 응답이 엔드포인트마다 다릅니다. 전부 RFC 7807 Problem Details 형식으로 통일할까요?',
+      message: '응',
+      requires: [['bare acceptance of a proposed convention names its subject', (own) => kept(own).some((i) => i.audience === 'team' && says(i, /7807|problem ?details/i))]],
+    },
+    {
+      tool: 'cursor',
+      previousAssistant: '테스트 3개가 실패했습니다. 다시 실행할까요?',
+      message: '응',
+      requires: [['accepting a one-time step is not stored', nothingKept]],
+    },
+  ],
 ];
 
 function extractCall(batch: readonly ExtractCase[], index: number, lang: Language): SuiteCall {
@@ -426,13 +494,88 @@ function judgeCall(c: JudgeCase, lang: Language): SuiteCall {
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Summarize: one history entry per call, exactly like the worker asks
+// ---------------------------------------------------------------------------------------------
+
+interface SummarizeCase {
+  name: string;
+  facts: SummaryFacts;
+  requires: Requirement<TurnSummary>[];
+}
+
+function inLanguage(text: string, lang: Language): boolean {
+  const hangul = (text.match(/[가-힣]/g) ?? []).length;
+  return lang === 'ko' ? hangul > 0 : hangul < text.length * 0.1;
+}
+
+const SUMMARIZE_CASES: SummarizeCase[] = [
+  {
+    name: 'code change',
+    facts: {
+      tool: 'claude',
+      prompt: '로그인 실패할 때 나오는 에러 메시지를 한국어로 바꿔줘',
+      lastAssistant: '로그인 실패 메시지 5개를 한국어로 바꾸고 messages.test.ts에 메시지별 테스트를 추가했습니다. `npm test -- auth`가 통과했습니다.',
+      files: [
+        { path: 'src/auth/messages.ts', status: 'M', added: 5, removed: 5 },
+        { path: 'src/auth/messages.test.ts', status: 'M', added: 14, removed: 0 },
+      ],
+      commands: ['npm test -- auth'],
+      patch: "--- a/src/auth/messages.ts\n+++ b/src/auth/messages.ts\n@@\n-  invalidPassword: 'Invalid password',\n+  invalidPassword: '비밀번호가 올바르지 않습니다',\n",
+      changesUnknown: false,
+    },
+    requires: [
+      ['a code change is marked "change"', (s) => s.kind === 'change'],
+      ['the summary names what changed', (s) => /messages|메시지|message/i.test(s.summary)],
+      ['the test result is reported', (s) => /통과|pass/i.test(`${s.outcome ?? ''} ${s.summary}`)],
+    ],
+  },
+  {
+    name: 'answer only',
+    facts: {
+      tool: 'codex',
+      prompt: '이 프로젝트에서 인증은 어디서 처리해?',
+      lastAssistant: '인증은 src/auth/middleware.ts의 requireAuth 미들웨어에서 처리합니다. /api 아래 모든 라우트가 이 미들웨어를 거칩니다.',
+      files: [],
+      commands: [],
+      patch: '',
+      changesUnknown: false,
+    },
+    requires: [
+      ['an explanation is not a change', (s) => s.kind === 'answer' || s.kind === 'investigation'],
+      ['no change is claimed', (s) => !/(수정했|변경했|추가했|바꿨|고쳤|\bchanged\b|\bmodified\b|\badded\b|\bfixed\b)/i.test(s.summary)],
+      ['the answer is carried over', (s) => /requireAuth|middleware|미들웨어/i.test(s.summary)],
+    ],
+  },
+];
+
+function summarizeCall(c: SummarizeCase, lang: Language): SuiteCall {
+  return {
+    name: `summarize ${c.name}`,
+    prompt: buildSummaryPrompt(c.facts, lang),
+    schema: SUMMARY_SCHEMA,
+    check(data) {
+      const s = parseSummaryResult(data);
+      if (!s) return null;
+      const passed: string[] = [];
+      const failed: string[] = [];
+      for (const [name, test] of c.requires) (test(s) ? passed : failed).push(name);
+      (inLanguage(s.summary, lang) ? passed : failed).push('written in the configured language');
+      (inventedPaths(s, c.facts).length === 0 ? passed : failed).push('no invented files');
+      return { passed, failed, got: `${s.kind}: ${s.summary.slice(0, 80)}` };
+    },
+  };
+}
+
 /** The calls of one suite run for a task, in a fixed order. */
 export function suiteCalls(task: SuiteTask, lang: Language): SuiteCall[] {
+  if (task === 'summarize') return SUMMARIZE_CASES.map((c) => summarizeCall(c, lang));
   return task === 'extract' ? EXTRACT_BATCHES.map((batch, i) => extractCall(batch, i, lang)) : JUDGE_CASES.map((c) => judgeCall(c, lang));
 }
 
 /** Number of requirements checked in one run of a task's suite. */
 export function suiteSize(task: SuiteTask): number {
   if (task === 'judge') return JUDGE_CASES.reduce((n, c) => n + c.requires.length, 0);
+  if (task === 'summarize') return SUMMARIZE_CASES.reduce((n, c) => n + c.requires.length + 2, 0);
   return EXTRACT_BATCHES.reduce((n, batch) => n + batch.reduce((m, c) => m + c.requires.length, 0) + 2, 0);
 }

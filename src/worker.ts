@@ -5,6 +5,9 @@ import type { SyncResult } from './codeindex/sync.ts';
 import { compile, type CompileResult } from './compile/compile.ts';
 import { isExpired } from './compile/tiers.ts';
 import { loadConfig, type DevctxConfig } from './config.ts';
+import { processHistory, type HistoryReport } from './history/process.ts';
+import { HISTORY_DIR } from './history/writer.ts';
+import { extractionDue } from './hooks/signals.ts';
 import { repoContext, type RepoContext } from './knowledge/anchors.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { deriveStatus, knowledgeDirs, loadPersonal, loadTeam, readKnowledgeFiles } from './knowledge/view.ts';
@@ -40,6 +43,7 @@ export interface WorkerReport {
   compiled: CompileResult | null;
   committed: boolean;
   codeIndex?: SyncResult;
+  history?: HistoryReport;
   errors: string[];
 }
 
@@ -117,6 +121,7 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
   }
   if (changed) db.kvSet('expired_seen', JSON.stringify([...seen].slice(-2000)));
   db.pruneEvents(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
+  db.pruneHistoryTurns(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
   const weekAgo = Date.now() - 7 * 86_400_000;
   for (const { key, value } of db.kvList('sess:')) {
     try {
@@ -164,8 +169,12 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       let attempted = 0;
       let succeeded = 0;
       let lastError: string | null = null;
+      // Implicit candidates wait for a full batch at a plain turn end, even when the worker runs for
+      // something else (a history entry, the code index), so they keep costing one call per five.
+      const flushImplicit = opts.reason !== 'turn_end' || extractionDue(db.pendingCandidates(), false);
       for (let round = 0; round < MAX_ROUNDS; round++) {
-        const events = db.pendingEvents(50);
+        const pending = db.pendingEvents(50);
+        const events = flushImplicit ? pending : pending.filter((e) => !(e.candidate && e.flags.includes('implicit')));
         if (events.length === 0) break;
         const candidates = events.filter((e) => e.candidate && e.prompt);
         const outcome = await extractCandidates(candidates, db, route);
@@ -192,6 +201,12 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       if (attempted > 0) recordExtractionHealth(db, succeeded > 0, lastError);
       report.retired = maintain(paths, db, cfg);
       report.compiled = compile(paths, cfg, db, { tool: opts.host ?? 'worker' });
+      try {
+        report.history = await processHistory(paths, cfg, db, route);
+        report.errors.push(...report.history.errors);
+      } catch (error) {
+        report.errors.push(`history: ${errorMessage(error)}`);
+      }
       // Code index last: a first full index of a large repository takes a while.
       if ((CODE_INDEX_REASONS.has(opts.reason) || opts.reason.startsWith('git-post-')) && (opts.reason === 'manual' || indexNeedsRefresh(paths.root, cfg))) {
         try {
@@ -205,9 +220,11 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
           report.errors.push(`code index: ${errorMessage(error)}`);
         }
       }
-      const touched = report.applied.some((a) => a.files.length > 0) || report.retired > 0 || report.compiled.changed.length > 0;
+      const historyWritten = (report.history?.written.length ?? 0) > 0;
+      const touched = report.applied.some((a) => a.files.length > 0) || report.retired > 0 || report.compiled.changed.length > 0 || historyWritten;
       if (touched && cfg.git.commit_mode === 'auto-commit' && opts.reason === 'session_end') {
-        const res = gitCommitPaths(paths.root, ['.devctx/knowledge', ...report.compiled.changed, ...report.compiled.removed], 'chore(devctx): update project decisions');
+        const extra = historyWritten ? [HISTORY_DIR] : [];
+        const res = gitCommitPaths(paths.root, ['.devctx/knowledge', ...extra, ...report.compiled.changed, ...report.compiled.removed], 'chore(devctx): update project decisions');
         report.committed = Boolean(res?.ok);
         if (res && !res.ok) report.errors.push(`auto-commit failed: ${res.stderr}`);
       }
@@ -217,6 +234,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         candidates: report.candidates,
         applied: report.applied.map((a) => `${a.relation}:${a.itemId ?? '-'}`),
         changed: report.compiled.changed,
+        history: report.history?.written.length ?? 0,
         errors: report.errors.slice(0, 5),
       });
       return report;

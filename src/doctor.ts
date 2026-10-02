@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { compile } from './compile/compile.ts';
 import { loadConfig } from './config.ts';
+import { historyState } from './history/toggle.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
 import { readExtractionHealth } from './state/health.ts';
 import { hookInstalled, HOOK_FILES } from './init/hookconfigs.ts';
@@ -83,6 +84,15 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
       if (health.streak > 0) add(health.streak >= 3 ? 'warn' : 'ok', 'extraction', `failed ${health.streak} worker run(s) in a row since ${health.since?.slice(0, 16) ?? '-'}: ${health.lastError ?? ''}`);
       const last = kdb.lastHookEventTs();
       add(last ? 'ok' : 'warn', 'capture', last ? `last AI hook event ${last.slice(0, 16).replace('T', ' ')}` : 'no AI hook event recorded yet (approve the project hooks in each tool)');
+      const hist = historyState(paths.root);
+      const hc = kdb.historyCounts();
+      add(
+        hc.ready > 20 ? 'warn' : 'ok',
+        'history',
+        hist.enabled
+          ? `on (this PC): ${hc.done} entries in ${hc.sessions} session file(s) under .devctx/history/, ${hc.ready} waiting to be written`
+          : `off (devctx history on records prompts and work summaries in .devctx/history/)${hc.ready > 0 ? `; ${hc.ready} earlier turn(s) still to be written` : ''}`,
+      );
     } finally {
       kdb.close();
     }

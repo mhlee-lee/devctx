@@ -4,7 +4,7 @@ AI 코딩 도구와 대화하며 정한 프로젝트 결정을 자동으로 기�
 
 지원 도구: Claude Code, Codex (앱·CLI), GitHub Copilot (VS Code·CLI), Cursor, Kiro
 
-동작 방식은 [docs/how-it-works.md](docs/how-it-works.md)에 그림과 함께 정리했다.
+처음 쓴다면 [처음 사용하는 사람을 위한 안내](docs/getting-started.md)부터 읽는다. 무엇이 기록되는지, 어디에 저장되는지, 토큰과 비용이 얼마나 드는지 정리했다. 동작 방식은 [docs/how-it-works.md](docs/how-it-works.md)에 그림과 함께 정리했다.
 
 ## 하는 일
 
@@ -14,6 +14,7 @@ AI 코딩 도구와 대화하며 정한 프로젝트 결정을 자동으로 기�
 - 프롬프트마다 관련 결정만 골라 붙여 토큰을 아낀다. 무엇이 왜 붙는지는 `devctx why`로 본다.
 - 도구를 바꿔 새 세션에서 "아까 하던 거 이어서 해줘"라고 하면 직전 세션이 어디까지 했는지 붙여준다.
 - 내장 코드 인덱스로 39개 언어의 심볼·호출 관계·타입 계층을 만들고, 모든 도구에 스킬 `devctx-code`로 제공한다. AI가 파일을 통째로 읽지 않고 필요한 코드만 찾는다.
+- 원하면(`devctx history on`) 내가 입력한 프롬프트 원문과 AI가 그 프롬프트로 한 작업의 요약을 시간순으로 Git에 남긴다.
 - 한 번 `devctx init`하면 이후는 자동이다.
 
 ## 요구 사항
@@ -84,8 +85,11 @@ devctx init --source github:<owner>/dev-context#v0.1.0   # 또는 npm 스펙: @s
 | "앞으로 ...", "항상 ...", "이 프로젝트에서는 무조건 ..." | "이번만 ...", "일단 ..." |
 | AI 작업을 고치는 말: "Double 말고 BigDecimal 써" | 질문, 감사 인사 |
 | AI 제안 수락: "응 그렇게 하자. 앞으로 그 형식으로 맞춰" | 붙여넣은 로그·코드 속 문장 |
-| 기한 있는 규칙: "10월 10일 릴리스 전까지 의존성 올리지 마" (그날이 지나면 자동 만료) | |
+| 기한 있는 규칙: "10월 10일 릴리스 전까지 의존성 올리지 마" (그날이 지나면 자동 만료) | 특정 코드에 대한 작업 요청: "LoginForm에 토글 버튼 추가해줘" |
+| 표시 없이 말한 일반 규칙: "DTO는 record로 작성해", "불필요한 일반화는 하지 마", "DB 컬럼명은 snake_case" | |
+| AI 제안에 "응"으로만 답한 수락 (AI: "RFC 7807로 통일할까요?" → "응") | |
 
+- 프롬프트는 두 단계로 고른다. 먼저 hook이 LLM 없이 "앞으로", "항상", "~하지 마", "X 말고 Y" 같은 표현을 찾고, 이런 프롬프트는 그 턴이 끝날 때 바로 추출한다. 표현이 없는 프롬프트도 질문, "응"·"고마워" 같은 짧은 대답, 슬래시 명령, "이번만"·"일단"이 붙은 문장, 붙여넣은 코드·로그만 빼고 모두 5개씩 모아(또는 세션 시작·종료 때, 1시간이 지나면 다음 턴이 끝날 때) LLM이 지속 규칙인지 일회성 작업인지 판단한다. AI가 제안을 묻고 끝낸 직후의 "응"은 수락으로 보고 함께 보낸다(도구가 AI 응답이나 대화 기록 파일을 넘겨줄 때). 명시 표현만 보내려면 `memory.implicit_rules: false`. 자세한 기준은 [처음 사용하는 사람을 위한 안내](docs/getting-started.md#3-무엇이-기록되나)에 있다.
 - 결정은 `.devctx/knowledge/decisions/`에 1건 1파일로 쌓인다. 직접 고치거나 새로 써도 되고, 사람이 쓴 내용이 가장 우선한다. 기한은 `valid_until: 2026-10-10`처럼 적는다.
 - devctx는 한 번 만든 결정 파일을 다시 고치지 않는다. 규칙이 바뀌면 새 파일을 만들고 거기에 "무엇을 대체하는지"(`supersedes`)를 적는다. 이전 파일의 상태(대체됨, 충돌, 만료)는 파일들을 읽을 때 계산한다.
 - 계속 지킬 규칙인지 애매한 말은 확인 대기로 이 PC에만 둔다. 다시 말하면 그때 결정 파일이 된다. 30일 동안 다시 나오지 않으면 보관으로 옮기고, 몇 달 뒤에라도 다시 말하면 바로 적용된다.
@@ -110,6 +114,24 @@ devctx init --source github:<owner>/dev-context#v0.1.0   # 또는 npm 스펙: @s
 ### 세션 이어가기
 
 Claude Code에서 하던 작업을 Codex나 Cursor에서 이어갈 때, 새 세션의 첫 요청이 "이어서", "아까 하던 거", "continue" 같은 말이거나 직전 세션과 같은 코드 이름을 담고 있으면 직전 세션의 마지막 요청과 마지막 응답 앞부분(도구가 턴 종료 hook에 응답을 넘겨줄 때)을 한 번 붙인다. hook이 이미 기록한 내용을 쓰므로 LLM을 부르지 않고, 이 PC의 `.devctx/local/`에만 있고 Git에는 올라가지 않는다. 비밀값 형태는 가린다. 관계없는 새 작업에는 붙이지 않는다.
+
+## 프롬프트 히스토리
+
+내가 입력한 프롬프트와 AI가 그 프롬프트로 한 작업을 시간순으로 Git에 남긴다. 사람마다 따로 켜고 끄며, 기본은 꺼짐이다.
+
+```sh
+devctx history on    # 이 PC에서 이 저장소의 기록 켜기 (모든 worktree에 적용)
+devctx history       # 켜짐/꺼짐, 기록한 세션·항목 수, 최근 기록
+devctx history off   # 끄기 (이미 쓴 기록은 그대로)
+```
+
+켜져 있으면 세션을 시작할 때 AI가 "기록 중"이라고 한 번 알리고, `devctx status`와 `devctx doctor`에도 상태가 나온다. 켜고 끄는 설정은 이 PC(`~/.local/share/devctx/history.json`)에 있어서 팀원에게 퍼지지 않는다.
+
+- **파일:** `.devctx/history/2026-10/2026-10-01T133950Z-claude-1491cd.md`처럼 세션마다 파일 하나다. 파일 이름이 첫 항목의 시각(UTC)으로 시작해 이름순이 곧 시간순이고, 파일 안의 항목은 프롬프트 순서다. 끝의 `1491cd`는 세션 id다. 한 번 커밋된 파일은 다시 고치지 않는다. 커밋 뒤에 같은 세션에서 이어진 프롬프트는 같은 세션 id를 단 새 파일에 쓰고, 그 파일 머리에 앞부분 파일을 적는다. 그래서 `git checkout`이 막히거나 병합 충돌이 나지 않는다. 두 사람이 같은 파일을 쓰는 일도 없다.
+- **항목:** 시각·걸린 시간·브랜치·모델, **프롬프트 원문**, **작업 내용**(처음 보는 사람도 알 수 있는 2~5문장 요약과 결과), 바뀐 파일과 줄 수, 실행한 명령.
+- **작업 내용을 만드는 방법:** 프롬프트를 받을 때와 턴이 끝날 때 작업 트리를 git으로 스냅샷해 비교하므로 어느 도구든 그 턴에 바뀐 파일이 정확히 나온다(실제 index와 스테이징은 건드리지 않는다). 여기에 AI의 마지막 응답과 대화 기록(도구가 넘겨줄 때: 실행한 명령)을 더해 저비용 LLM이 요약한다. 요약 모델도 요구사항 평가(`summarize`)를 통과한 가장 싼 모델이고, 호출 상한은 결정 추출과 따로 센다(`history.max_calls_per_hour`). LLM을 쓸 수 없으면 AI 응답 앞부분을 그대로 넣는다.
+- **Git:** 결정 파일처럼 내가 커밋할 때 함께 커밋된다(`ride-along`). `manual`이면 직접 `git add .devctx/history`.
+- **가리는 것:** 키·토큰처럼 보이는 값(`password=...`, `token = ...`, `sk-...` 등)은 코드 속이어도 `[REDACTED]`로 바꾼다. 프롬프트가 20,000자를 넘으면 뒷부분을 생략 표시와 함께 자른다. `/compact` 같은 슬래시 명령은 기록하지 않는다.
 
 ## 코드 인덱스
 
@@ -161,8 +183,9 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 | `devctx code index` | 지금 색인 (바뀐 파일만 다시 파싱) |
 | `devctx code <도구> <인자>` | 코드 인덱스 조회. 예: `devctx code trace_calls CartService.checkout --direction both` |
 | `devctx doctor` | 연결 상태 점검 (LLM 호출 없음) |
-| `devctx models` | 작업(추출·판정)별로 쓰는 모델, 후보 비용과 평가 결과 |
-| `devctx models --qualify <tool> [--task extract\|judge]` | 싼 후보부터 요구사항 평가를 지금 돌린다 |
+| `devctx models` | 작업(추출·판정·요약)별로 쓰는 모델, 후보 비용과 평가 결과 |
+| `devctx models --qualify <tool> [--task extract\|judge\|summarize]` | 싼 후보부터 요구사항 평가를 지금 돌린다 |
+| `devctx history [on\|off]` | 프롬프트 히스토리 켜기·끄기(이 PC), 상태와 최근 기록 |
 | `devctx why "프롬프트" [--all]` | 그 프롬프트에 hook이 붙일 결정과 점수, 빠진 이유, 직전 세션 연결 여부 |
 | `devctx log [--limit N]` | 자동으로 바뀐 결정(추가·보강·대체·충돌·만료)과 판정 이유 |
 | `devctx remember "규칙"` | hook이 없는 환경에서 직접 기록 |
@@ -174,8 +197,8 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 무조건 싼 모델이 아니라, 요구사항을 전부 통과한 모델 중 가장 싼 모델을 쓴다.
 
 1. 작업 중인 도구의 CLI에서 모델 목록을 가져온다. 모델 × reasoning effort가 각각 후보다.
-2. 호출당 예상 비용이 싼 후보부터 요구사항 평가를 돌린다. 추출 31개, 판정 12개 항목을 2회 연속 하나도 틀리지 않아야 통과다.
-3. 처음 통과한 후보를 쓴다. 추출과 판정은 따로 고른다.
+2. 호출당 예상 비용이 싼 후보부터 요구사항 평가를 돌린다. 추출 44개, 판정 12개, 요약 10개 항목을 2회 연속 하나도 틀리지 않아야 통과다.
+3. 처음 통과한 후보를 쓴다. 추출·판정·요약은 따로 고른다.
 4. 실제로 쓰다가 요구사항을 두 번 연속 어기면 강등하고 다음 후보로 넘어간다.
 
 새 모델이 나오면 자동으로 후보가 된다. 자세한 기준과 실측 결과는 [동작 방식 4장](docs/how-it-works.md#4-추출-모델-고르기)에 있다.
@@ -200,11 +223,14 @@ llm:
   pin: {}                     # 모델 고정 (평가 생략). 예: { codex: gpt-6-luna }
 memory:
   personal: true              # 개인 선호는 저장소 밖에 저장
+  implicit_rules: true        # "앞으로" 같은 표현이 없는 프롬프트도 5개씩 묶어 LLM이 판단 (false면 명시 표현만)
 code_index:
   enabled: true               # 내장 코드 인덱스를 스킬 devctx-code로 제공
   exclude: []                 # 색인에서 뺄 경로 glob. 예: ["**/generated/**"]
   max_file_kb: 512            # 이보다 큰 소스 파일은 파싱하지 않는다
   preapprove: true            # 도구별 권한 설정에 스킬 명령을 미리 허용
+history:
+  max_calls_per_hour: 30      # 프롬프트 히스토리 요약 호출 상한 (켜고 끄기는 사람마다: devctx history on|off)
 ```
 
 ## 문제 해결
@@ -227,7 +253,7 @@ code_index:
 1. `config.yaml`에서 `code_index.enabled: false`로 바꾸고 `devctx init`을 다시 실행하면 스킬 파일과 미리 허용 항목(사용자 폴더의 Copilot CLI·Kiro 항목 포함)이 지워진다.
 2. 도구별 hook 파일에서 `.devctx/bin/devctx`를 부르는 항목을 지운다.
 3. `.git/hooks/*`와 `.gitattributes`에서 `# >>> devctx >>>` ~ `# <<< devctx <<<` 블록을 지운다. CLAUDE.md 맨 위의 `@AGENTS.md`도 지운다.
-4. AGENTS.md를 `.devctx/knowledge/preamble.md` 내용으로 되돌리고 `.devctx/`를 지운다.
+4. AGENTS.md를 `.devctx/knowledge/preamble.md` 내용으로 되돌리고 `.devctx/`를 지운다. 프롬프트 히스토리(`.devctx/history/`)도 함께 지워지니 남기려면 먼저 옮긴다.
 5. 이 PC의 데이터는 `~/.local/share/devctx/`에 있다. 코드 인덱스는 저장소의 `.devctx/local/`에만 있다.
 
 ## 개발
@@ -236,7 +262,7 @@ code_index:
 npm run typecheck
 npm run build
 npm run dev -- status   # 빌드 없이 소스로 실행
-npm run bench:memory    # 메모리 벤치마크 (LLM 없이: 관련 결정 고르기, 만료·대체, 중복 판정, 세션 이어가기, 두 브랜치 병합, 코드 근거)
+npm run bench:memory    # 메모리 벤치마크 (LLM 없이: 추출 대상 고르기, 관련 결정 고르기, 만료·대체, 중복 판정, 세션 이어가기, 두 브랜치 병합, 코드 근거, 프롬프트 히스토리)
 node scripts/vendor-grammars.mjs --build   # vendor/grammars/ 다시 만들기 (tree-sitter CLI 필요, 관리자용)
 ```
 

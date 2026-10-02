@@ -124,7 +124,7 @@ function qKey(key: string, task: SuiteTask): string {
 }
 
 export function taskOf(req: Pick<LlmRequest, 'task'>): SuiteTask {
-  return req.task === 'judge' ? 'judge' : 'extract';
+  return req.task === 'judge' || req.task === 'summarize' ? req.task : 'extract';
 }
 
 function activeBlock(cache: RouterCache, pid: ProviderId): ProviderBlock | null {
@@ -291,7 +291,10 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const attempts: string[] = [];
   if (db) {
     const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
-    if (db.llmCallsSince(hourAgo) >= cfg.llm.max_calls_per_hour) {
+    // History summaries have their own hourly budget so they never starve decision extraction.
+    const history = req.task === 'summarize';
+    const used = db.llmCallsSince(hourAgo, history ? { task: 'summarize' } : { excludeTask: 'summarize' });
+    if (used >= (history ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour)) {
       return { ok: false, error: RATE_LIMIT_ERROR, attempts };
     }
   }

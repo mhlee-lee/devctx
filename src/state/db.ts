@@ -118,8 +118,51 @@ create table if not exists kfiles(
   item text,
   error text
 );
+create table if not exists history_turns(
+  id text primary key,
+  tool text not null,
+  session text,
+  skey text not null,
+  model text,
+  branch text,
+  prompt_ts text not null,
+  prompt text not null,
+  before_tree text,
+  end_ts text,
+  after_tree text,
+  last_assistant text,
+  transcript_path text,
+  state text not null,
+  file text,
+  error text
+);
+create index if not exists history_state on history_turns(state, prompt_ts);
+create index if not exists history_session on history_turns(skey, prompt_ts);
 `;
 
+/**
+ * One prompt and what followed it, for the prompt history (`.devctx/history/`). `open` until the
+ * turn ends, `ready` until the worker writes its entry, then `done`.
+ */
+export interface HistoryTurn {
+  id: string;
+  tool: string;
+  session: string | null;
+  /** Session id, or tool and day when the tool gives none: one history file per key. */
+  skey: string;
+  model: string | null;
+  branch: string | null;
+  promptTs: string;
+  prompt: string;
+  beforeTree: string | null;
+  endTs: string | null;
+  afterTree: string | null;
+  lastAssistant: string | null;
+  transcriptPath: string | null;
+  state: 'open' | 'ready' | 'done';
+  file: string | null;
+  error: string | null;
+}
 /** How often this PC saw a committed rule again (kept out of git so files never change). */
 export interface ItemStats {
   reinforced: number;
@@ -250,6 +293,20 @@ export class StateDb {
     return this.db.prepare('select 1 as x from events where processed = 0 and candidate = 1 limit 1').get() !== undefined;
   }
 
+  /** Unprocessed candidates split by how they were picked (see hooks/signals.ts `extractionDue`). */
+  pendingCandidates(): { explicit: number; implicit: number; oldestImplicit: string | null } {
+    const row = this.db
+      .prepare(
+        `select
+           coalesce(sum(case when flags like '%"implicit"%' then 0 else 1 end), 0) as explicit,
+           coalesce(sum(case when flags like '%"implicit"%' then 1 else 0 end), 0) as implicit,
+           min(case when flags like '%"implicit"%' then ts end) as oldest
+         from events where processed = 0 and candidate = 1`,
+      )
+      .get() as Row | undefined;
+    return { explicit: Number(row?.explicit ?? 0), implicit: Number(row?.implicit ?? 0), oldestImplicit: asString(row?.oldest) };
+  }
+
   countPending(): number {
     const row = this.db.prepare('select count(*) as n from events where processed = 0').get() as Row | undefined;
     return Number(row?.n ?? 0);
@@ -258,6 +315,12 @@ export class StateDb {
   markProcessed(ids: readonly string[], error?: string): void {
     const stmt = this.db.prepare('update events set processed = ?, error = ? where id = ?');
     for (const id of ids) stmt.run(error ? 2 : 1, error ?? null, id);
+  }
+
+  /** When the session's latest turn ended (any tool's hook config). */
+  lastTurnEndTs(session: string): string | null {
+    const row = this.db.prepare("select max(ts) as ts from events where session = ? and kind = 'turn_end'").get(session) as Row | undefined;
+    return row ? asString(row.ts) : null;
   }
 
   /** The assistant's last message before `ts` in the same session (context for a correction). */
@@ -370,9 +433,127 @@ export class StateDb {
       );
   }
 
-  llmCallsSince(isoTs: string): number {
-    const row = this.db.prepare('select count(*) as n from llm_calls where ts >= ?').get(isoTs) as Row | undefined;
+  llmCallsSince(isoTs: string, opts: { task?: string; excludeTask?: string } = {}): number {
+    const where = opts.task ? ' and task = ?' : opts.excludeTask ? ' and task != ?' : '';
+    const args = opts.task ? [isoTs, opts.task] : opts.excludeTask ? [isoTs, opts.excludeTask] : [isoTs];
+    const row = this.db.prepare(`select count(*) as n from llm_calls where ts >= ?${where}`).get(...args) as Row | undefined;
     return Number(row?.n ?? 0);
+  }
+
+  // ---- prompt history ----
+
+  private toTurn(r: Row): HistoryTurn {
+    return {
+      id: String(r.id),
+      tool: String(r.tool),
+      session: asString(r.session),
+      skey: String(r.skey),
+      model: asString(r.model),
+      branch: asString(r.branch),
+      promptTs: String(r.prompt_ts),
+      prompt: String(r.prompt ?? ''),
+      beforeTree: asString(r.before_tree),
+      endTs: asString(r.end_ts),
+      afterTree: asString(r.after_tree),
+      lastAssistant: asString(r.last_assistant),
+      transcriptPath: asString(r.transcript_path),
+      state: String(r.state) as HistoryTurn['state'],
+      file: asString(r.file),
+      error: asString(r.error),
+    };
+  }
+
+  openHistoryTurn(t: Pick<HistoryTurn, 'tool' | 'session' | 'skey' | 'model' | 'branch' | 'promptTs' | 'prompt' | 'beforeTree' | 'transcriptPath'>): string {
+    const id = ulid();
+    this.db
+      .prepare(
+        `insert into history_turns(id, tool, session, skey, model, branch, prompt_ts, prompt, before_tree, transcript_path, state)
+         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+      )
+      .run(id, t.tool, t.session, t.skey, t.model, t.branch, t.promptTs, t.prompt, t.beforeTree, t.transcriptPath);
+    return id;
+  }
+
+  /** The turn of this session still waiting for its end. */
+  openHistoryTurnOf(skey: string): HistoryTurn | null {
+    const row = this.db.prepare("select * from history_turns where skey = ? and state = 'open' order by prompt_ts desc, id desc limit 1").get(skey) as Row | undefined;
+    return row ? this.toTurn(row) : null;
+  }
+
+  closeHistoryTurn(id: string, end: { endTs: string; afterTree: string | null; lastAssistant: string | null; transcriptPath: string | null }): void {
+    this.db
+      .prepare(
+        `update history_turns set state = 'ready', end_ts = ?, after_tree = ?,
+           last_assistant = coalesce(?, last_assistant), transcript_path = coalesce(?, transcript_path)
+         where id = ? and state = 'open'`,
+      )
+      .run(end.endTs, end.afterTree, end.lastAssistant, end.transcriptPath, id);
+  }
+
+  readyHistoryTurns(limit: number): HistoryTurn[] {
+    const rows = this.db.prepare("select * from history_turns where state = 'ready' order by prompt_ts, id limit ?").all(limit) as Row[];
+    return rows.map((r) => this.toTurn(r));
+  }
+
+  hasReadyHistory(): boolean {
+    return this.db.prepare("select 1 as x from history_turns where state = 'ready' limit 1").get() !== undefined;
+  }
+
+  finishHistoryTurn(id: string, file: string, error: string | null = null): void {
+    this.db.prepare("update history_turns set state = 'done', file = ?, error = ? where id = ?").run(file, error, id);
+  }
+
+  /** File the latest written turn of this session went to. */
+  latestHistoryFile(skey: string): string | null {
+    const row = this.db
+      .prepare("select file from history_turns where skey = ? and state = 'done' and file is not null order by prompt_ts desc, id desc limit 1")
+      .get(skey) as Row | undefined;
+    return row ? asString(row.file) : null;
+  }
+
+  /** When the session's first recorded prompt arrived. */
+  historySessionStart(skey: string): string | null {
+    const row = this.db.prepare('select min(prompt_ts) as ts from history_turns where skey = ?').get(skey) as Row | undefined;
+    return row ? asString(row.ts) : null;
+  }
+
+  /**
+   * Turns that never saw an end (the tool crashed, or a session without an id crossed midnight):
+   * written without their changes instead of waiting forever.
+   */
+  expireOpenHistoryTurns(beforeIso: string): number {
+    const res = this.db.prepare("update history_turns set state = 'ready' where state = 'open' and prompt_ts < ?").run(beforeIso);
+    return Number(res.changes ?? 0);
+  }
+
+  /** Position of a turn in its session (1-based, by prompt time). */
+  historyTurnNumber(skey: string, promptTs: string, id: string): number {
+    const row = this.db
+      .prepare('select count(*) as n from history_turns where skey = ? and (prompt_ts < ? or (prompt_ts = ? and id <= ?))')
+      .get(skey, promptTs, promptTs, id) as Row | undefined;
+    return Number(row?.n ?? 1);
+  }
+
+  historyCounts(): { open: number; ready: number; done: number; sessions: number } {
+    const row = this.db
+      .prepare(
+        `select coalesce(sum(state = 'open'), 0) as open, coalesce(sum(state = 'ready'), 0) as ready,
+                coalesce(sum(state = 'done'), 0) as done, count(distinct case when state = 'done' then file end) as sessions
+         from history_turns`,
+      )
+      .get() as Row | undefined;
+    return { open: Number(row?.open ?? 0), ready: Number(row?.ready ?? 0), done: Number(row?.done ?? 0), sessions: Number(row?.sessions ?? 0) };
+  }
+
+  recentHistoryTurns(limit: number): HistoryTurn[] {
+    const rows = this.db.prepare('select * from history_turns order by prompt_ts desc, id desc limit ?').all(limit) as Row[];
+    return rows.map((r) => this.toTurn(r));
+  }
+
+  /** Written entries live in `.devctx/history/`; their rows are only bookkeeping. */
+  pruneHistoryTurns(beforeIso: string): number {
+    const res = this.db.prepare("delete from history_turns where state = 'done' and prompt_ts < ?").run(beforeIso);
+    return Number(res.changes ?? 0);
   }
 
   llmUsageSummary(sinceIso: string): Row[] {

@@ -1,4 +1,4 @@
-import { detectSignals } from '../hooks/signals.ts';
+import { detectSignals, isQuestion } from '../hooks/signals.ts';
 import type { Audience, Enforcement, ItemType, SourceKind } from '../knowledge/types.ts';
 import { RATE_LIMIT_ERROR, reportAnswerQuality, routeCall, type RouteOptions } from '../llm/router.ts';
 import type { StateDb, StoredEvent } from '../state/db.ts';
@@ -59,8 +59,8 @@ function topicsFrom(text: string): string[] {
 export function heuristicCandidates(ev: StoredEvent): Candidate[] {
   const out: Candidate[] = [];
   for (const sentence of splitSentences(stripPasted(messageText(ev)))) {
-    const sig = detectSignals(sentence);
-    if (!(sig.durable || sig.remember) || sig.oneOff) continue;
+    const sig = detectSignals(sentence, { implicit: false });
+    if (!(sig.durable || sig.remember) || sig.oneOff || isQuestion(sentence)) continue;
     if (sentence.length < 6 || sentence.length > 300) continue;
     out.push({
       eventId: ev.id,
@@ -95,8 +95,9 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
       tool: ev.tool,
       date: ev.ts.slice(0, 10),
       message: messageText(ev),
+      // An accepted proposal read from the transcript is kept on the prompt row itself.
       previousAssistant:
-        ev.kind === 'prompt' ? (redactSecrets(db.lastAssistantBefore(ev.session, ev.ts) ?? '') || null) : null,
+        ev.kind === 'prompt' ? (redactSecrets(ev.lastAssistant ?? db.lastAssistantBefore(ev.session, ev.ts) ?? '') || null) : null,
     }));
     let items = null;
     if (route) {

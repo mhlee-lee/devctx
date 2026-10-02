@@ -7,8 +7,10 @@ import { normalizeForMatch, stripPasted } from '../util/text.ts';
  */
 export function isQuoteValid(message: string, quote: string): boolean {
   const q = normalizeForMatch(quote).replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, '');
-  if (q.length < 4) return false;
-  return normalizeForMatch(stripPasted(message)).includes(q);
+  const whole = normalizeForMatch(stripPasted(message));
+  // A short quote is only evidence when it is the whole message: a bare "응" accepting a proposal.
+  if (q.length < 4) return q.length > 0 && q === whole.replace(/[\s.!~]+$/u, '');
+  return whole.includes(q);
 }
 
 /** Generic words a Korean statement may add in Latin letters without naming anything new. */

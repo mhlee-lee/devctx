@@ -20,6 +20,8 @@ import { gitToplevel } from './util/git.ts';
 import { findProjectRoot, projectPaths } from './util/paths.ts';
 import { runWorker } from './worker.ts';
 import { explainPrompt, memoryLog } from './explain.ts';
+import { historyState, setHistoryEnabled } from './history/toggle.ts';
+import { HISTORY_DIR, localTime } from './history/writer.ts';
 
 interface Args {
   positional: string[];
@@ -101,9 +103,11 @@ const HELP = `devctx — project decision memory for AI coding tools
   devctx doctor                  연결 상태 점검 (LLM 호출 없음)
   devctx compile [--check]       AGENTS.md와 도구별 규칙 파일 재생성 (--check: 변경 여부만 확인)
   devctx models [--refresh] [--host <tool>]
-                                 작업(추출/판정)별로 쓰는 모델, 후보 비용 순위와 평가 결과
-  devctx models --qualify <provider> [--task extract|judge|all] [--limit N]
+                                 작업(추출/판정/요약)별로 쓰는 모델, 후보 비용 순위와 평가 결과
+  devctx models --qualify <provider> [--task extract|judge|summarize|all] [--limit N]
                                  싼 후보부터 요구사항 평가를 돌려 통과하는 첫 모델을 찾는다
+  devctx history [on|off]        프롬프트 히스토리 (프롬프트 원문 + 작업 요약을 .devctx/history/에 기록)
+                                 켜짐/꺼짐 상태와 최근 기록. 켜고 끄는 것은 이 PC에서 이 저장소에만 적용
   devctx why "<프롬프트>" [--all]  그 프롬프트에 hook이 어떤 결정을 왜 붙이는지 (점수, 제외 이유, 직전 세션 연결)
   devctx log [--limit N]         자동으로 바뀐 결정 기록 (추가·보강·대체·충돌·만료와 판정 이유)
   devctx remember "<규칙>"        hook이 없는 환경에서 직접 기록 (같은 추출·정리 과정을 거침)
@@ -278,7 +282,7 @@ async function main(argv: string[]): Promise<number> {
       if (target) {
         if (!isToolId(target)) throw new Error(`unknown provider: ${target}`);
         const taskFlag = flag(args, 'task') ?? 'all';
-        if (taskFlag !== 'all' && !(SUITE_TASKS as readonly string[]).includes(taskFlag)) throw new Error(`unknown task: ${taskFlag} (extract | judge | all)`);
+        if (taskFlag !== 'all' && !(SUITE_TASKS as readonly string[]).includes(taskFlag)) throw new Error(`unknown task: ${taskFlag} (${SUITE_TASKS.join(' | ')} | all)`);
         const tasks = taskFlag === 'all' ? SUITE_TASKS : [taskFlag as SuiteTask];
         const limit = Math.max(1, Math.min(40, Number(flag(args, 'limit') ?? 3) || 3));
         const db = root ? StateDb.open(projectPaths(root).stateDb) : null;
@@ -304,15 +308,15 @@ async function main(argv: string[]): Promise<number> {
         const blocked = r.blocked ? `  [skipped until ${r.blocked.until.slice(0, 16)}Z: ${r.blocked.kind}]` : '';
         console.log(`${r.provider}: ${r.bin ? `${r.bin} (${r.version ?? '?'})` : 'not installed'}${blocked}`);
         if (!r.bin) continue;
-        for (const task of SUITE_TASKS) console.log(`  ${task.padEnd(7)} -> ${r.selected[task] ?? 'no qualified model yet (the background worker evaluates candidates)'}`);
-        console.log(`  ${'est/call'.padStart(9)}  ${'measured'.padStart(9)}  tier    ${'extract'.padEnd(12)} ${'judge'.padEnd(12)} candidate`);
+        for (const task of SUITE_TASKS) console.log(`  ${task.padEnd(9)} -> ${r.selected[task] ?? 'no qualified model yet (the background worker evaluates candidates)'}`);
+        console.log(`  ${'est/call'.padStart(9)}  ${'measured'.padStart(9)}  tier    ${SUITE_TASKS.map((t) => t.padEnd(12)).join(' ')} candidate`);
         const allowed = r.models.filter((m) => m.auto);
         const shown = allowed.slice(0, 12);
         for (const m of shown) {
           const est = m.estimate.unit === 'usd' ? `$${m.estimate.cost.toFixed(4)}` : `x${m.estimate.cost.toFixed(4)}`;
           const real = m.measuredUsd === null ? '-' : `$${m.measuredUsd.toFixed(4)}`;
           console.log(
-            `  ${`${est}${m.estimate.known ? '' : '~'}`.padStart(9)}  ${real.padStart(9)}  ${m.estimate.tier.padEnd(6)}  ${verdict(m.qualification.extract).padEnd(12)} ${verdict(m.qualification.judge).padEnd(12)} ${m.key}`,
+            `  ${`${est}${m.estimate.known ? '' : '~'}`.padStart(9)}  ${real.padStart(9)}  ${m.estimate.tier.padEnd(6)}  ${SUITE_TASKS.map((t) => verdict(m.qualification[t]).padEnd(12)).join(' ')} ${m.key}`,
           );
         }
         if (allowed.length > shown.length) console.log(`  ... ${allowed.length - shown.length} more candidates (pricier)`);
@@ -324,11 +328,57 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
 
+    case 'history': {
+      const root = resolveRoot(args);
+      const cfg = loadConfig(projectPaths(root));
+      const ko = cfg.language === 'ko';
+      const sub = args.positional[0] ?? 'status';
+      if (sub === 'on' || sub === 'off') {
+        const st = setHistoryEnabled(root, sub === 'on');
+        if (st.enabled) {
+          console.log(ko ? '히스토리 기록: 켜짐 (이 PC에서 이 저장소)' : 'Prompt history: on (this repository on this PC)');
+          console.log(
+            ko
+              ? `- 프롬프트 원문과 작업 요약이 ${HISTORY_DIR}/에 세션마다 파일 하나로 저장되고, 커밋할 때 함께 올라간다.\n- 키·토큰 같은 비밀값 형태는 가린다. 요약은 턴마다 저비용 LLM 한 번(history.max_calls_per_hour 이내).\n- 끄기: devctx history off`
+              : `- Prompts (verbatim) and a summary of each turn go to ${HISTORY_DIR}/, one file per session, and ride along with your commits.\n- Secret-like values are masked. One low-cost LLM call per turn summarizes the work (within history.max_calls_per_hour).\n- Turn off: devctx history off`,
+          );
+        } else {
+          console.log(ko ? '히스토리 기록: 꺼짐. 이미 쓴 기록은 그대로 둔다.' : 'Prompt history: off. Entries already written stay.');
+        }
+        return 0;
+      }
+      if (sub !== 'status') throw new Error('usage: devctx history [on|off]');
+      const st = historyState(root);
+      const since = st.since ? ` (${localTime(st.since).slice(0, 16)}${ko ? '부터' : ' since'})` : '';
+      console.log(`${ko ? '히스토리 기록' : 'Prompt history'}: ${st.enabled ? (ko ? '켜짐' : 'on') : ko ? '꺼짐' : 'off'}${since}  ${ko ? '(이 PC 설정, 바꾸기: devctx history on|off)' : '(this PC; change with devctx history on|off)'}`);
+      const db = StateDb.open(projectPaths(root).stateDb);
+      try {
+        const c = db.historyCounts();
+        console.log(
+          ko
+            ? `저장 위치: ${HISTORY_DIR}/  기록한 세션 ${c.sessions}개, 항목 ${c.done}개, 정리 대기 ${c.ready}개, 진행 중 ${c.open}개`
+            : `Location: ${HISTORY_DIR}/  sessions ${c.sessions}, entries ${c.done}, waiting to be written ${c.ready}, in progress ${c.open}`,
+        );
+        const recent = db.recentHistoryTurns(Math.max(1, Math.min(50, Number(flag(args, 'limit') ?? 5) || 5)));
+        if (recent.length > 0) console.log(ko ? '최근:' : 'Recent:');
+        for (const t of recent) {
+          const first = t.prompt.replace(/\s+/g, ' ').trim();
+          const where = t.file ?? (t.state === 'open' ? (ko ? '(진행 중)' : '(in progress)') : ko ? '(정리 대기)' : '(waiting)');
+          console.log(`  ${localTime(t.promptTs).slice(0, 16)}  ${t.tool.padEnd(7)} "${first.length > 40 ? `${first.slice(0, 39)}…` : first}"  ${where}`);
+        }
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
     case 'status': {
       const paths = projectPaths(resolveRoot(args));
       const cfg = loadConfig(paths);
       const db = StateDb.open(paths.stateDb);
       try {
+        const hist = historyState(paths.root);
+        console.log(`[history] ${hist.enabled ? 'on' : 'off'}  (${cfg.language === 'ko' ? '프롬프트 히스토리, 이 PC 설정: devctx history' : 'prompt history, this PC: devctx history'})`);
         const opts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
         const { items, errors } = loadTeam(paths, db, opts);
         applyCachedStale(db, items);

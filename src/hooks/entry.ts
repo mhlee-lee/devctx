@@ -4,6 +4,9 @@ import { renderOutputs } from '../compile/compile.ts';
 import { detectForeignEdits } from '../compile/foreign.ts';
 import { isExpired } from '../compile/tiers.ts';
 import { loadConfig } from '../config.ts';
+import { captureHistory, historyNotice } from '../history/capture.ts';
+import { historyEnabled } from '../history/toggle.ts';
+import { readLastAssistant } from '../history/transcript.ts';
 import { ensureGitHooks } from '../init/githooks.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from '../knowledge/view.ts';
@@ -13,13 +16,13 @@ import type { HookKind, ToolId } from '../types.ts';
 import { sha256 } from '../util/fsx.ts';
 import { errorMessage, logLine } from '../util/log.ts';
 import { findProjectRoot, projectPaths, type ProjectPaths } from '../util/paths.ts';
-import { approxTokens, normalizeForMatch, today } from '../util/text.ts';
+import { approxTokens, normalizeForMatch, today, truncate } from '../util/text.ts';
 import { spawnWorker } from '../worker-spawn.ts';
 import { promptContext, promptKind, sessionContext } from './context.ts';
 import { continuesSession, renderHandoff } from './handoff.ts';
 import { normalizeHook } from './normalize.ts';
 import { renderHookOutput } from './output.ts';
-import { detectSignals } from './signals.ts';
+import { detectSignals, extractionDue } from './signals.ts';
 
 const NO_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
@@ -111,10 +114,15 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
     const db = StateDb.open(paths.stateDb);
     try {
       const now = new Date();
-      const signals = event.prompt ? detectSignals(event.prompt) : null;
+      const isAck = Boolean(event.prompt) && promptKind(event.prompt ?? '') === 'ack';
+      const prevAssistant = isAck ? (db.lastAssistantBefore(event.session, event.ts) ?? readLastAssistant(event.transcriptPath)) : null;
+      const signals = event.prompt ? detectSignals(event.prompt, { implicit: cfg.memory.implicit_rules, previousAssistant: prevAssistant }) : null;
+      // The same prompt fired by two tools' hook configs is one event. Within a session the key also
+      // carries the last turn end, so saying the same thing again ("응") in a later turn still counts.
+      const turnMark = kind === 'prompt' && event.session ? (db.lastTurnEndTs(event.session) ?? '-') : '';
       const dedupeKey =
         kind === 'prompt' && event.prompt
-          ? `prompt|${sha256(normalizeForMatch(event.prompt)).slice(0, 24)}`
+          ? `prompt|${event.session ?? '-'}|${turnMark}|${sha256(normalizeForMatch(event.prompt)).slice(0, 24)}`
           : `${kind}|${tool}|${event.session ?? '-'}`;
       const fresh = db.dedupeOnce(dedupeKey, kind === 'prompt' ? 30_000 : 3_000);
       if (fresh) {
@@ -126,12 +134,20 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
           session: event.session,
           cwd: root,
           prompt: event.prompt,
-          lastAssistant: event.lastAssistant,
+          lastAssistant: event.lastAssistant ?? (signals?.flags.includes('accept') && prevAssistant ? truncate(prevAssistant, 4000) : null),
           transcriptPath: event.transcriptPath,
           model: event.model,
           flags: signals?.flags ?? [],
           candidate: signals?.candidate ?? false,
         });
+      }
+      let historyReady = false;
+      if (fresh) {
+        try {
+          historyReady = captureHistory(root, db, kind, event);
+        } catch (error) {
+          logLine(paths.log, 'warn', 'history capture failed', { tool, kind, error: errorMessage(error) });
+        }
       }
 
       let output = fallback;
@@ -153,6 +169,7 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
         const seen = new Set<string>(JSON.parse(db.kvGet('expired_seen') ?? '[]') as string[]);
         expiredLive = teamItems().some((i) => i.valid_until !== null && isExpired(i) && !seen.has(i.id));
         const notices = fresh ? healthNotices(db, cfg.language, { capture: false, everyDays: 1 }) : [];
+        if (fresh && historyEnabled(root)) notices.push(historyNotice(cfg.language));
         const ctx = sessionContext(teamItems(), cfg.memory.personal ? loadPersonal(db, viewOpts).items : [], cfg, notices);
         writeSession(db, tool, event.session, {
           started: keepStart ? previous.started : now.toISOString(),
@@ -207,7 +224,9 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
         if (upkept.length > 0) logLine(paths.log, 'info', 'daily upkeep', { files: upkept });
         codeRefresh = cfg.code_index.enabled && indexNeedsRefresh(root, cfg);
       }
-      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || db.hasPendingCandidates())) spawnWorker(root, kind, event.host);
+      const extractNow = fresh && kind !== 'prompt' && extractionDue(db.pendingCandidates(), kind !== 'turn_end');
+      const historyNow = fresh && kind !== 'prompt' && (historyReady || db.hasReadyHistory());
+      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || extractNow || historyNow)) spawnWorker(root, kind, event.host);
       return output;
     } finally {
       db.close();

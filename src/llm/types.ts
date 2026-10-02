@@ -3,7 +3,7 @@ import type { ToolId } from '../types.ts';
 export type ProviderId = ToolId | 'fake';
 export type Tier = 'small' | 'medium' | 'large';
 export const TIERS: readonly Tier[] = ['small', 'medium', 'large'];
-export type LlmTask = 'extract' | 'judge' | 'qualify';
+export type LlmTask = 'extract' | 'judge' | 'summarize' | 'qualify';
 
 /** Token counts a CLI reported for one call (reasoning is part of output). */
 export interface TokenUsage {

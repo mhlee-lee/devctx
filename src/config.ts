@@ -32,7 +32,16 @@ export interface DevctxConfig {
     pricing_refresh_days: number;
     pin: Partial<Record<ToolId, string>>;
   };
-  memory: { store_evidence_quote: boolean; proposed_ttl_days: number; personal: boolean };
+  memory: {
+    store_evidence_quote: boolean;
+    proposed_ttl_days: number;
+    personal: boolean;
+    /**
+     * Also send instructions without explicit markers ("앞으로", "항상", "말고") to the extractor,
+     * in batches. Off: only explicitly marked prompts are considered.
+     */
+    implicit_rules: boolean;
+  };
   code_index: {
     /** Built-in code index (symbols, call graph, text search), used by agents through the `devctx-code` skill. */
     enabled: boolean;
@@ -46,6 +55,14 @@ export interface DevctxConfig {
      * Copilot CLI and Kiro, which do not read permissions from a repository).
      */
     preapprove: boolean;
+  };
+  history: {
+    /**
+     * Hourly cap of summary calls for the prompt history, counted apart from `llm.max_calls_per_hour`
+     * so a busy session never starves decision extraction. Whether history is recorded at all is
+     * each developer's own switch (`devctx history on|off`), not a team setting.
+     */
+    max_calls_per_hour: number;
   };
 }
 
@@ -66,8 +83,9 @@ export const DEFAULT_CONFIG: DevctxConfig = {
     pricing_refresh_days: 7,
     pin: {},
   },
-  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true },
+  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true, implicit_rules: true },
   code_index: { enabled: true, exclude: [], max_file_kb: 512, preapprove: true },
+  history: { max_calls_per_hour: 30 },
 };
 
 function globs(value: unknown): string[] {
@@ -140,12 +158,16 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       store_evidence_quote: bool(mem.store_evidence_quote, d.memory.store_evidence_quote),
       proposed_ttl_days: num(mem.proposed_ttl_days, d.memory.proposed_ttl_days, 1, 3_650),
       personal: bool(mem.personal, d.memory.personal),
+      implicit_rules: bool(mem.implicit_rules, d.memory.implicit_rules),
     },
     code_index: {
       enabled,
       exclude: globs(code.exclude),
       max_file_kb: num(code.max_file_kb, d.code_index.max_file_kb, 16, 16_384),
       preapprove: bool(code.preapprove, d.code_index.preapprove),
+    },
+    history: {
+      max_calls_per_hour: num(obj(r.history).max_calls_per_hour, d.history.max_calls_per_hour, 1, 1_000),
     },
   };
 }
@@ -196,11 +218,16 @@ memory:
   store_evidence_quote: true  # 사용자 발화 일부(200자 이하)를 근거로 저장
   proposed_ttl_days: 30       # 재확인 없는 제안 항목의 보존 기간
   personal: true              # 개인 선호는 저장소 밖(~/.local/share/devctx)에 저장
+  implicit_rules: true        # "앞으로" 같은 표현이 없는 지시도 LLM이 판단 (5개씩 묶어서). false면 명시 표현만
 
 code_index:
   enabled: ${String(codeIndex).padEnd(19)}# 내장 코드 인덱스(심볼·호출 관계·텍스트 검색)를 스킬 devctx-code로 제공
   exclude: []                 # 색인에서 뺄 경로 glob. 예: ["**/generated/**", "fixtures/**"]
   max_file_kb: 512            # 이보다 큰 소스 파일은 파싱하지 않는다 (번들·생성 코드)
   preapprove: true            # 도구별 권한 설정에 ".devctx/bin/devctx code" 실행을 미리 허용 (승인 창 없이 실행)
+
+# 프롬프트 히스토리 (.devctx/history/). 켜고 끄는 것은 사람마다 따로: devctx history on|off
+history:
+  max_calls_per_hour: 30      # 작업 내용 요약 호출 상한 (결정 추출의 llm.max_calls_per_hour와 따로 센다)
 `;
 }
