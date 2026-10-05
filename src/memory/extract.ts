@@ -88,6 +88,7 @@ export function heuristicCandidates(ev: StoredEvent): Candidate[] {
  */
 export async function extractCandidates(events: readonly StoredEvent[], db: StateDb, route: RouteOptions | null): Promise<ExtractOutcome> {
   const outcome: ExtractOutcome = { candidates: [], usedLlm: false, provider: null, errors: [], deferredEventIds: [] };
+  const unsupportedNames = new Set<Candidate>();
   for (let start = 0; start < events.length; start += BATCH_SIZE) {
     const batch = events.slice(start, start + BATCH_SIZE);
     const messages: ExtractMessage[] = batch.map((ev, i) => ({
@@ -152,7 +153,7 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
         confidence = Math.min(confidence, 0.5); // stays a proposal until the developer says it again
         outcome.errors.push(`kept as proposed, names not in the message (${unsupported.slice(0, 3).join(', ')}): ${truncate(item.statement, 60)}`);
       }
-      outcome.candidates.push({
+      const candidate: Candidate = {
         eventId: ev.id,
         tool: ev.tool,
         title: item.title,
@@ -167,8 +168,48 @@ export async function extractCandidates(events: readonly StoredEvent[], db: Stat
         validUntil,
         confidence,
         sourceKind: sourceKindOf(ev),
-      });
+      };
+      if (unsupported.length > 0) unsupportedNames.add(candidate);
+      outcome.candidates.push(candidate);
     }
   }
+  explicitRemember(events, outcome, unsupportedNames);
   return outcome;
+}
+
+/**
+ * `devctx remember "<text>"` is the developer deciding on purpose: its rules are durable (active
+ * right away), and when extraction finds nothing the text itself is the rule. Statements naming
+ * things the text doesn't (kept low by the check above) still wait for confirmation.
+ */
+function explicitRemember(events: readonly StoredEvent[], outcome: ExtractOutcome, unsupportedNames: ReadonlySet<Candidate>): void {
+  const deferred = new Set(outcome.deferredEventIds);
+  for (const ev of events) {
+    if (!ev.flags.includes('remember-cmd') || deferred.has(ev.id)) continue;
+    const own = outcome.candidates.filter((c) => c.eventId === ev.id);
+    for (const c of own) {
+      c.durability = 'durable';
+      if (!unsupportedNames.has(c)) c.confidence = Math.max(c.confidence, 0.9);
+    }
+    if (own.length > 0) continue;
+    const text = stripPasted(messageText(ev)).replace(/\s+/g, ' ').trim();
+    if (text.length < 4) continue;
+    const statement = truncate(text, 300);
+    outcome.candidates.push({
+      eventId: ev.id,
+      tool: ev.tool,
+      title: truncate(text, 40),
+      statement,
+      type: 'rule',
+      enforcement: /절대|반드시|\bnever\b|\bmust\b/i.test(text) ? 'must' : 'should',
+      durability: 'durable',
+      audience: /(나한테|저한테|나에게|저에게|\bto me\b|\bwith me\b)/i.test(text) ? 'personal' : 'team',
+      scope: { paths: [], topics: topicsFrom(text) },
+      evidenceQuote: truncate(text, 200),
+      reason: null,
+      validUntil: null,
+      confidence: 0.9,
+      sourceKind: 'user-instruction',
+    });
+  }
 }

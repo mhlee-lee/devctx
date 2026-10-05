@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeliverable } from '../compile/tiers.ts';
+import { CodeToolError } from './tools-meta.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import { git } from '../util/git.ts';
 import { matchAny, matchGlob } from '../util/glob.ts';
-import { CLASS_LIKE, qualifiedName, type Edge, type Graph, type Sym } from './graph.ts';
-import { detectLanguages, languageById } from './languages.ts';
+import { CLASS_LIKE, isCommonName, qualifiedName, type Edge, type Graph, type Sym } from './graph.ts';
+import { detectLanguages, familyOf, languageById, languageOf } from './languages.ts';
 
 /**
  * Read-side of the code index. Every function returns compact text meant for an agent's context:
@@ -352,14 +353,25 @@ interface Hunk {
   to: number;
 }
 
-function diffHunks(root: string, base: string): { hunks: Hunk[]; files: string[]; error: string | null } {
+function diffHunks(root: string, base: string): { hunks: Hunk[]; files: string[]; deleted: string[]; error: string | null } {
   const args = base === 'staged' ? ['diff', '--cached', '--unified=0', '--no-color', '--no-ext-diff'] : ['diff', base, '--unified=0', '--no-color', '--no-ext-diff'];
   const r = git(args, root, 20_000);
-  if (!r.ok) return { hunks: [], files: [], error: r.stderr || 'git diff failed' };
+  if (!r.ok) return { hunks: [], files: [], deleted: [], error: r.stderr || 'git diff failed' };
   const hunks: Hunk[] = [];
   const files = new Set<string>();
+  const deleted: string[] = [];
   let current = '';
+  let previous = '';
   for (const line of r.stdout.split('\n')) {
+    const a = /^--- a\/(.+)$/.exec(line);
+    if (a?.[1]) {
+      previous = a[1];
+      continue;
+    }
+    if (line.startsWith('--- /dev/null')) {
+      previous = '';
+      continue;
+    }
     const f = /^\+\+\+ b\/(.+)$/.exec(line);
     if (f?.[1]) {
       current = f[1];
@@ -367,7 +379,13 @@ function diffHunks(root: string, base: string): { hunks: Hunk[]; files: string[]
       continue;
     }
     if (line.startsWith('+++ /dev/null')) {
+      // A deleted file: all of it changed (a stale index still has its symbols and callers).
       current = '';
+      if (previous) {
+        files.add(previous);
+        deleted.push(previous);
+        hunks.push({ file: previous, from: 1, to: Number.MAX_SAFE_INTEGER });
+      }
       continue;
     }
     const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
@@ -384,15 +402,65 @@ function diffHunks(root: string, base: string): { hunks: Hunk[]; files: string[]
       hunks.push({ file: f, from: 1, to: Number.MAX_SAFE_INTEGER });
     }
   }
-  return { hunks, files: [...files], error: null };
+  return { hunks, files: [...files], deleted, error: null };
 }
 
-export function changeImpact(g: Graph, root: string, opts: { base?: string; depth?: number; decisions?: readonly KnowledgeItem[] } = {}): string {
+/** Symbols a deleted file declared (from its previous version), so their leftover uses can be found. */
+export interface RemovedFile {
+  path: string;
+  family: string;
+  names: string[];
+}
+
+/** Files reported as deleted against `base`. */
+export function deletedFiles(root: string, base: string): string[] {
+  const args = base === 'staged' ? ['diff', '--cached', '--name-only', '--diff-filter=D'] : ['diff', '--name-only', '--diff-filter=D', base];
+  const r = git(args, root, 20_000);
+  return r.ok ? r.stdout.split('\n').filter(Boolean) : [];
+}
+
+/**
+ * Code that still names what only the deleted files declared (text match on whole words in files
+ * of the same language family): likely broken references. The graph no longer has those symbols,
+ * so this is a name match, labelled as such.
+ */
+function leftoverUses(g: Graph, root: string, removed: readonly RemovedFile[], deleted: ReadonlySet<string>): string[] {
+  const byFamily = new Map<string, Set<string>>();
+  for (const r of removed) {
+    const set = byFamily.get(r.family) ?? new Set<string>();
+    for (const n of r.names) if (n.length > 2 && /^[\w$]+$/.test(n) && !isCommonName(n) && !g.declares(r.family, n)) set.add(n);
+    byFamily.set(r.family, set);
+  }
+  const names = [...new Set([...byFamily.values()].flatMap((s) => [...s]))].slice(0, 100);
+  if (names.length === 0) return [];
+  const r = git(['grep', '-n', '-I', '-w', '-F', '--untracked', '--exclude-standard', ...names.flatMap((n) => ['-e', n]), '--', '.', ':!.devctx'], root, 20_000);
+  if (!r.ok) return [];
+  const out: string[] = [];
+  for (const line of r.stdout.split('\n')) {
+    const m = /^([^:]+):(\d+):(.*)$/.exec(line);
+    if (!m?.[1] || deleted.has(m[1])) continue;
+    const spec = languageOf(m[1]);
+    const family = spec ? familyOf(spec.id) : null;
+    const wanted = family ? byFamily.get(family) : undefined;
+    const hit = wanted ? [...wanted].find((n) => new RegExp(`(^|[^\\w$])${n.replace(/\$/g, '\\$')}([^\\w$]|$)`).test(m[3] ?? '')) : undefined;
+    if (!hit) continue;
+    out.push(`  - ${m[1]}:${m[2]}  ${hit}  (by name)`);
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+export function changeImpact(
+  g: Graph,
+  root: string,
+  opts: { base?: string; depth?: number; decisions?: readonly KnowledgeItem[]; removed?: readonly RemovedFile[] } = {},
+): string {
   const base = opts.base?.trim() || 'HEAD';
-  if (!/^[\w./~^@{}-]+$/.test(base)) return 'base must be a git revision (HEAD, main, origin/main, HEAD~3) or "staged".';
-  const { hunks, files, error } = diffHunks(root, base);
-  if (error) return `git diff ${base} failed: ${error}`;
+  if (!/^[\w./~^@{}-]+$/.test(base)) throw new CodeToolError('--base must be a git revision (HEAD, main, origin/main, HEAD~3) or "staged"');
+  const { hunks, files, deleted, error } = diffHunks(root, base);
+  if (error) throw new CodeToolError(`git diff ${base} failed: ${error}`);
   if (files.length === 0) return `No changes against ${base}.`;
+  const deletedSet = new Set(deleted);
   const changed = new Map<number, Sym>();
   for (const h of hunks) {
     const f = g.files.get(h.file);
@@ -422,10 +490,12 @@ export function changeImpact(g: Graph, root: string, opts: { base?: string; dept
     }
     frontier = next;
   }
-  const out: string[] = [`changes against ${base}: ${files.length} file(s), ${changed.size} symbol(s) touched`];
-  out.push('changed files:', ...files.slice(0, 40).map((f) => `  - ${f}`));
+  const out: string[] = [`changes against ${base}: ${files.length} file(s)${deleted.length > 0 ? ` (${deleted.length} deleted)` : ''}, ${changed.size} symbol(s) touched`];
+  out.push('changed files:', ...files.slice(0, 40).map((f) => `  - ${f}${deletedSet.has(f) ? '  (deleted)' : ''}`));
   if (files.length > 40) out.push(`  … ${files.length - 40} more`);
   if (changed.size > 0) out.push('changed symbols:', ...[...changed.values()].slice(0, 40).map((s) => `  - ${label(s)}  ${loc(s)}  [${s.in.length} refs]`));
+  const leftover = opts.removed && opts.removed.length > 0 ? leftoverUses(g, root, opts.removed, deletedSet) : [];
+  if (leftover.length > 0) out.push('still used after deletion (names only deleted files declared):', ...leftover);
   if (affected.size > 0) {
     const list = [...affected.values()].sort((a, b) => a.level - b.level);
     out.push(`possibly affected callers (${affected.size}, up to ${depth} hop(s)):`, ...list.slice(0, 50).map((a) => `  - ${'·'.repeat(a.level)} ${label(a.sym)}  ${loc(a.sym)}`));
@@ -449,7 +519,7 @@ export function searchText(root: string, pattern: string, opts: { path?: string;
   args.push('--', ...(opts.path ? [opts.path] : ['.']), ':!.devctx/local');
   const r = git(args, root, 20_000);
   if (r.code === 1) return `No matches for "${p}".`;
-  if (!r.ok) return `search failed: ${r.stderr}`;
+  if (!r.ok) throw new CodeToolError(`search failed: ${r.stderr}`);
   const lines = r.stdout.split('\n').filter(Boolean);
   const shown = lines.slice(0, limit).map((l) => (l.length > 240 ? `${l.slice(0, 239)}…` : l));
   return [`${lines.length} line(s) match "${p}"${lines.length > limit ? ` (showing ${limit})` : ''}`, ...shown].join('\n');

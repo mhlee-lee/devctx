@@ -9,7 +9,26 @@ export interface ToolArg {
   hint: string;
   type: 'string' | 'number' | 'boolean';
   required?: boolean;
+  /** Allowed values (anything else is an error, not a silent default). */
+  values?: readonly string[];
 }
+
+/** A request the tool cannot answer as asked (bad option, failed git command): exit status 1. */
+export class CodeToolError extends Error {}
+
+export const SYMBOL_KINDS = ['class', 'interface', 'enum', 'record', 'object', 'struct', 'type', 'module', 'function', 'method', 'constructor', 'component', 'hook', 'macro'] as const;
+
+const DIRECTION_ALIASES: Record<string, string> = {
+  callers: 'callers',
+  in: 'callers',
+  incoming: 'callers',
+  up: 'callers',
+  callees: 'callees',
+  out: 'callees',
+  outgoing: 'callees',
+  down: 'callees',
+  both: 'both',
+};
 
 export interface CodeTool {
   name: string;
@@ -28,7 +47,7 @@ export const CODE_TOOLS: readonly CodeTool[] = [
     },
     args: [
       { name: 'query', hint: '<name | Class.method | words>', type: 'string', required: true },
-      { name: 'kind', hint: 'class|interface|function|method|component|struct|enum|module|type', type: 'string' },
+      { name: 'kind', hint: 'class|interface|function|method|component|struct|enum|module|type', type: 'string', values: SYMBOL_KINDS },
       { name: 'path', hint: '<dir | file | glob>', type: 'string' },
       { name: 'limit', hint: '20', type: 'number' },
     ],
@@ -42,7 +61,7 @@ export const CODE_TOOLS: readonly CodeTool[] = [
     },
     args: [
       { name: 'target', hint: '<Name | Class.method | path:line | path#Name>', type: 'string', required: true },
-      { name: 'include_code', hint: 'true|false', type: 'string' },
+      { name: 'include_code', hint: 'true|false', type: 'string', values: ['true', 'false'] },
     ],
     example: 'get_symbol OrderService.place',
   },
@@ -54,7 +73,7 @@ export const CODE_TOOLS: readonly CodeTool[] = [
     },
     args: [
       { name: 'target', hint: '<Name | Class.method | path:line>', type: 'string', required: true },
-      { name: 'direction', hint: 'callers|callees|both', type: 'string' },
+      { name: 'direction', hint: 'callers|callees|both', type: 'string', values: Object.keys(DIRECTION_ALIASES) },
       { name: 'depth', hint: '1-5', type: 'number' },
     ],
     example: 'trace_calls OrderService.place --direction both',
@@ -141,5 +160,32 @@ export function parseToolArgs(t: CodeTool, positional: readonly string[], flags:
   }
   const first = t.args[0];
   if (first && words.length > 0 && out[first.name] === undefined) out[first.name] = words.join(' ');
+  return out;
+}
+
+/**
+ * Checks parsed arguments against the tool's definition: unknown options, values outside a list
+ * and non-numbers for numeric options are errors (an agent must not get the opposite of what it
+ * asked for, e.g. callers for `--direction outgoing`). Returns them normalized.
+ */
+export function validateToolArgs(t: CodeTool, args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...args };
+  const options = t.args.map((a) => `--${a.name.replace(/_/g, '-')}`).join(', ');
+  for (const [name, value] of Object.entries(args)) {
+    const spec = t.args.find((a) => a.name === name);
+    if (!spec) throw new CodeToolError(`unknown option --${name.replace(/_/g, '-')} for ${t.name} (options: ${options})`);
+    if (spec.type === 'number' && typeof value !== 'number') {
+      throw new CodeToolError(`--${name.replace(/_/g, '-')} needs a number (got ${JSON.stringify(value)})`);
+    }
+    if (spec.values && typeof value === 'string') {
+      const parts = name === 'kind' ? value.split(/[,\s|]+/).filter(Boolean) : [value];
+      const bad = parts.filter((v) => !spec.values?.includes(v.toLowerCase()));
+      if (bad.length > 0 || parts.length === 0) {
+        throw new CodeToolError(`--${name.replace(/_/g, '-')} must be ${spec.hint} (got ${JSON.stringify(value)})`);
+      }
+      if (name === 'direction') out[name] = DIRECTION_ALIASES[value.toLowerCase()];
+      if (name === 'include_code') out[name] = value.toLowerCase() === 'true';
+    }
+  }
   return out;
 }

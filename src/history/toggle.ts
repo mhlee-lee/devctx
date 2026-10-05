@@ -5,10 +5,20 @@ import { commonGitDir } from '../util/git.ts';
 import { machineDir } from '../util/paths.ts';
 
 /**
- * Whether this developer records the prompt history of a repository. A personal switch kept on
- * this PC (never in git): prompts are written verbatim into commits, so each person opts in for
- * themselves. Keyed by the repository's shared git directory so every worktree follows it.
+ * Personal switches kept on this PC (never in git), per repository. Keyed by the repository's
+ * shared git directory so every worktree follows it.
+ * - history: record the prompt history (off by default; prompts go verbatim into commits, so each
+ *   person opts in for themselves).
+ * - capture: analyze this person's prompts for project rules (on by default; off means no LLM
+ *   call is made on their prompts, at their quota's expense or otherwise). Rules still arrive.
+ *   `devctx capture off --global` turns it off for every repository on this PC (replacing
+ *   per-repository settings; a later per-repository `on`/`off` overrides it there).
  */
+
+export type Switch = 'history' | 'capture';
+
+const DEFAULTS: Record<Switch, boolean> = { history: false, capture: true };
+const GLOBAL = '*';
 
 interface ToggleFile {
   version: 1;
@@ -19,10 +29,12 @@ export interface HistoryState {
   enabled: boolean;
   /** When it was last turned on or off. */
   since: string | null;
+  /** Set by `--global` (applies to every repository without its own setting). */
+  global?: boolean;
 }
 
-function toggleFile(): string {
-  return path.join(machineDir(), 'history.json');
+function toggleFile(name: Switch): string {
+  return path.join(machineDir(), `${name}.json`);
 }
 
 function repoKey(root: string): string {
@@ -35,14 +47,35 @@ function repoKey(root: string): string {
   }
 }
 
-function load(): ToggleFile {
-  const data = readJson<ToggleFile>(toggleFile(), { version: 1, repos: {} });
+function load(name: Switch): ToggleFile {
+  const data = readJson<ToggleFile>(toggleFile(name), { version: 1, repos: {} });
   return data && typeof data === 'object' && data.repos && typeof data.repos === 'object' ? data : { version: 1, repos: {} };
 }
 
+export function switchState(root: string, name: Switch): HistoryState {
+  const repos = load(name).repos;
+  const entry = repos[repoKey(root)];
+  if (entry) return { enabled: entry.enabled === true, since: entry.since ?? null };
+  const all = repos[GLOBAL];
+  if (all) return { enabled: all.enabled === true, since: all.since ?? null, global: true };
+  return { enabled: DEFAULTS[name], since: null };
+}
+
+export function setSwitch(root: string, name: Switch, enabled: boolean, opts: { global?: boolean } = {}): HistoryState {
+  const data = load(name);
+  const since = new Date().toISOString();
+  if (opts.global) {
+    // The global setting is the one that applies now, also where a repository had its own.
+    data.repos = { [GLOBAL]: { enabled, since, root: '*' } };
+  } else {
+    data.repos[repoKey(root)] = { enabled, since, root: path.resolve(root) };
+  }
+  writeJsonAtomic(toggleFile(name), data);
+  return { enabled, since, global: opts.global };
+}
+
 export function historyState(root: string): HistoryState {
-  const entry = load().repos[repoKey(root)];
-  return entry ? { enabled: entry.enabled === true, since: entry.since ?? null } : { enabled: false, since: null };
+  return switchState(root, 'history');
 }
 
 export function historyEnabled(root: string): boolean {
@@ -50,10 +83,9 @@ export function historyEnabled(root: string): boolean {
 }
 
 export function setHistoryEnabled(root: string, enabled: boolean): HistoryState {
-  const data = load();
-  const key = repoKey(root);
-  const since = new Date().toISOString();
-  data.repos[key] = { enabled, since, root: path.resolve(root) };
-  writeJsonAtomic(toggleFile(), data);
-  return { enabled, since };
+  return setSwitch(root, 'history', enabled);
+}
+
+export function captureEnabled(root: string): boolean {
+  return switchState(root, 'capture').enabled;
 }

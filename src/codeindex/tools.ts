@@ -5,13 +5,39 @@ import type { KnowledgeItem } from '../knowledge/types.ts';
 import { applyCachedStale, loadTeam } from '../knowledge/view.ts';
 import { StateDb } from '../state/db.ts';
 import { errorMessage, logLine } from '../util/log.ts';
-import { projectPaths } from '../util/paths.ts';
+import { git } from '../util/git.ts';
+import { cliEntry, projectPaths } from '../util/paths.ts';
 import { codeDbPath, indexingInProgress, listRepoFiles } from './files.ts';
 import { loadGraph } from './load.ts';
-import { changeImpact, fileOutline, getSymbol, overview, searchSymbols, searchText, traceCalls } from './queries.ts';
+import { familyOf, languageOf } from './languages.ts';
+import { changeImpact, deletedFiles, fileOutline, getSymbol, overview, searchSymbols, searchText, traceCalls, type RemovedFile } from './queries.ts';
 import { indexPass } from './service.ts';
 import { pendingChanges } from './sync.ts';
-import { codeTool, usageLine } from './tools-meta.ts';
+import { codeTool, CodeToolError, usageLine, validateToolArgs } from './tools-meta.ts';
+
+/**
+ * Names declared by files deleted against `base`, parsed from their previous version (the index no
+ * longer has them), so change_impact can show code that still uses them.
+ */
+async function removedSymbols(root: string, base: string): Promise<RemovedFile[]> {
+  if (!/^[\w./~^@{}][\w./~^@{}-]*$/.test(base)) return [];
+  const rev = base === 'staged' ? 'HEAD' : base;
+  const out: RemovedFile[] = [];
+  for (const rel of deletedFiles(root, base).slice(0, 30)) {
+    const spec = languageOf(rel);
+    if (!spec) continue;
+    const old = git(['show', `${rev}:${rel}`], root, 10_000);
+    if (!old.ok || old.stdout.length > 512 * 1024) continue;
+    try {
+      const { extractFacts } = await import('./extract/index.ts');
+      const facts = await extractFacts(spec.id, old.stdout, rel);
+      out.push({ path: rel, family: familyOf(spec.id), names: [...new Set(facts.syms.map((s) => s.name))] });
+    } catch {
+      // Unparseable old version: the file is still listed as deleted.
+    }
+  }
+  return out;
+}
 
 /**
  * `devctx code <tool>`: the code index as plain commands. Agents run them through their shell
@@ -64,7 +90,7 @@ async function waitWhileIndexing(root: string, ms: number): Promise<boolean> {
  * Parsing thousands of files is left to that process and its memory-capped passes.
  */
 function backgroundIndex(root: string, ms: number): Promise<boolean> {
-  const entry = process.argv[1];
+  const entry = cliEntry();
   if (!entry) return Promise.resolve(false);
   return new Promise((resolve) => {
     let done = false;
@@ -156,7 +182,8 @@ export async function runCodeTool(root: string, name: string, args: Args): Promi
   const tool = codeTool(name);
   if (!tool) throw new Error(`unknown tool: ${name}`);
   const missing = tool.args.find((a) => a.required && args[a.name] === undefined);
-  if (missing) return `usage: ${usageLine(tool, '.devctx/bin/devctx code')}`;
+  if (missing) throw new CodeToolError(`missing <${missing.name}>. usage: ${usageLine(tool, '.devctx/bin/devctx code')}`);
+  args = validateToolArgs(tool, args);
   if (tool.name === 'search_text') {
     return searchText(root, str(args, 'pattern') ?? '', {
       regex: bool(args, 'regex') ?? false,
@@ -191,9 +218,11 @@ export async function runCodeTool(root: string, name: string, args: Args): Promi
     case 'repo_overview':
       text = overview(g, listRepoFiles(root), { ...optional('path', str(args, 'path')) });
       break;
-    case 'change_impact':
-      text = changeImpact(g, root, { ...optional('base', str(args, 'base')), ...optional('depth', num(args, 'depth')), decisions: decisions(root, cfg) });
+    case 'change_impact': {
+      const base = str(args, 'base')?.trim() || 'HEAD';
+      text = changeImpact(g, root, { base, ...optional('depth', num(args, 'depth')), decisions: decisions(root, cfg), removed: await removedSymbols(root, base) });
       break;
+    }
     default:
       throw new Error(`unknown tool: ${tool.name}`);
   }

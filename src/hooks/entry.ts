@@ -1,11 +1,10 @@
 import { codeLookup } from '../codeindex/hints.ts';
 import { indexNeedsRefresh } from '../codeindex/service.ts';
-import { renderOutputs } from '../compile/compile.ts';
-import { detectForeignEdits } from '../compile/foreign.ts';
+import { compile } from '../compile/compile.ts';
 import { isExpired } from '../compile/tiers.ts';
 import { loadConfig } from '../config.ts';
 import { captureHistory, historyNotice } from '../history/capture.ts';
-import { historyEnabled } from '../history/toggle.ts';
+import { captureEnabled, historyEnabled } from '../history/toggle.ts';
 import { readLastAssistant } from '../history/transcript.ts';
 import { ensureGitHooks } from '../init/githooks.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
@@ -21,7 +20,7 @@ import { spawnWorker } from '../worker-spawn.ts';
 import { promptContext, promptKind, sessionContext } from './context.ts';
 import { continuesSession, renderHandoff } from './handoff.ts';
 import { normalizeHook } from './normalize.ts';
-import { renderHookOutput } from './output.ts';
+import { promptInjectable, renderHookOutput } from './output.ts';
 import { detectSignals, extractionDue } from './signals.ts';
 
 const NO_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
@@ -116,7 +115,11 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
       const now = new Date();
       const isAck = Boolean(event.prompt) && promptKind(event.prompt ?? '') === 'ack';
       const prevAssistant = isAck ? (db.lastAssistantBefore(event.session, event.ts) ?? readLastAssistant(event.transcriptPath)) : null;
-      const signals = event.prompt ? detectSignals(event.prompt, { implicit: cfg.memory.implicit_rules, previousAssistant: prevAssistant }) : null;
+      // A developer who turned capture off (devctx capture off) gets the rules but their prompts are
+      // never analyzed: no candidate, so no LLM call on their quota.
+      const capture = kind !== 'prompt' || captureEnabled(root);
+      const signals =
+        event.prompt && capture ? detectSignals(event.prompt, { implicit: cfg.memory.implicit_rules, previousAssistant: prevAssistant }) : null;
       // The same prompt fired by two tools' hook configs is one event. Within a session the key also
       // carries the last turn end, so saying the same thing again ("응") in a later turn still counts.
       const turnMark = kind === 'prompt' && event.session ? (db.lastTurnEndTs(event.session) ?? '-') : '';
@@ -151,8 +154,8 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
       }
 
       let output = fallback;
-      // A rule past its end date is no longer injected; the worker recompiles AGENTS.md and the
-      // path rule files without it and logs the expiry.
+      // A rule past its end date is no longer injected; the worker rebuilds the local rule files
+      // without it and logs the expiry.
       let expiredLive = false;
       const viewOpts = { proposedTtlDays: cfg.memory.proposed_ttl_days };
       let team: KnowledgeItem[] | null = null;
@@ -164,6 +167,15 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
         return team;
       };
       if (kind === 'session_start') {
+        // A new session is when the local rule files may change (between sessions, tools that send
+        // them with every request lose no cache). The session gets the same rules in its context.
+        if (fresh) {
+          try {
+            compile(paths, cfg, db, { tool });
+          } catch (error) {
+            logLine(paths.log, 'warn', 'compile at session start failed', { error: errorMessage(error) });
+          }
+        }
         const previous = readSession(db, tool, event.session, now);
         const keepStart = previous && (event.source === 'compact' || event.source === 'resume');
         const seen = new Set<string>(JSON.parse(db.kvGet('expired_seen') ?? '[]') as string[]);
@@ -181,6 +193,14 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
         });
         if (fresh && ctx.text) db.recordInjection({ tool, session: event.session, kind, ids: ctx.ids, tokens: approxTokens(ctx.text), handoff: false });
         output = renderHookOutput(tool, kind, ctx.text) ?? fallback;
+      } else if (kind === 'prompt' && !promptInjectable(tool)) {
+        // Nothing can be added to this tool's prompt: record no injection, so a rule is never
+        // counted as delivered when it was not (Cursor reads on-demand rules from its rule file).
+        const state = readSession(db, tool, event.session, now) ?? { started: now.toISOString(), updated: now.toISOString(), injected: [] };
+        state.prompts = (state.prompts ?? 0) + 1;
+        state.updated = now.toISOString();
+        writeSession(db, tool, event.session, state);
+        output = renderHookOutput(tool, kind, null) ?? fallback;
       } else if (kind === 'prompt') {
         const prompt = event.prompt ?? '';
         const state = readSession(db, tool, event.session, now) ?? { started: now.toISOString(), updated: now.toISOString(), injected: [] };
@@ -213,8 +233,6 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
 
       let codeRefresh = false;
       if (fresh && kind === 'session_start') {
-        const { outputs } = renderOutputs(paths, cfg, db, { items: teamItems() });
-        detectForeignEdits(paths, db, tool, { rendered: outputs, summaries: teamItems().map((i) => i.summary) });
         if (cfg.git.auto_install_hooks && db.kvGet('githooks_checked') !== today()) {
           const res = ensureGitHooks(root);
           if (res.installed.length > 0) logLine(paths.log, 'info', 'installed git hooks', { hooks: res.installed });
@@ -226,7 +244,9 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
       }
       const extractNow = fresh && kind !== 'prompt' && extractionDue(db.pendingCandidates(), kind !== 'turn_end');
       const historyNow = fresh && kind !== 'prompt' && (historyReady || db.hasReadyHistory());
-      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || extractNow || historyNow)) spawnWorker(root, kind, event.host);
+      // Auto-commit happens in the worker at session end, also when this hook has nothing new.
+      const commitNow = fresh && kind === 'session_end' && cfg.git.commit_mode === 'auto-commit';
+      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || extractNow || historyNow || commitNow)) spawnWorker(root, kind, event.host);
       return output;
     } finally {
       db.close();

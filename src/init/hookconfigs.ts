@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import type { HookKind, ToolId } from '../types.ts';
 import { readText, writeFileAtomic } from '../util/fsx.ts';
@@ -7,7 +8,7 @@ type Json = Record<string, unknown>;
 export interface HookFileResult {
   tool: ToolId;
   file: string;
-  action: 'created' | 'updated' | 'unchanged' | 'skipped';
+  action: 'created' | 'updated' | 'unchanged' | 'skipped' | 'removed';
   note?: string;
 }
 
@@ -134,26 +135,30 @@ export function installToolHooks(root: string, tool: ToolId): HookFileResult {
         }
         return { version: typeof d.version === 'number' ? d.version : 1, ...d, hooks };
       });
-    case 'copilot': {
+    case 'copilot':
       // Own file: read by Copilot CLI, the cloud agent (default branch) and VS Code agent mode.
-      const hooks: Json = {};
-      for (const [event, kind, timeoutSec] of COPILOT_EVENTS) {
-        hooks[event] = [{ type: 'command', bash: hookCommand(tool, kind), timeoutSec }];
-      }
-      const rel = '.github/hooks/devctx.json';
-      return writeIfChanged(tool, root, rel, { version: 1, hooks }, readText(path.join(root, rel)) !== null);
-    }
-    case 'kiro': {
-      const rel = '.kiro/hooks/devctx.json';
-      const hooks = KIRO_EVENTS.map(([trigger, kind, timeout]) => ({
-        name: `devctx ${kind.replace('_', ' ')}`,
-        description: 'devctx: records project decisions and injects relevant ones',
-        trigger,
-        action: { type: 'command', command: hookCommand(tool, kind) },
-        timeout,
-      }));
-      return writeIfChanged(tool, root, rel, { version: 'v1', hooks }, readText(path.join(root, rel)) !== null);
-    }
+      // Entries someone else added to it are kept; only devctx's own are replaced.
+      return writeMerged(tool, root, '.github/hooks/devctx.json', (d) => {
+        const hooks = obj(d.hooks);
+        for (const [event, kind, timeoutSec] of COPILOT_EVENTS) {
+          const list = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]).map(obj).filter((h) => !isOurs(h.bash) && !isOurs(h.command)) : [];
+          list.push({ type: 'command', bash: hookCommand(tool, kind), timeoutSec });
+          hooks[event] = list;
+        }
+        return { ...d, version: typeof d.version === 'number' ? d.version : 1, hooks };
+      });
+    case 'kiro':
+      return writeMerged(tool, root, '.kiro/hooks/devctx.json', (d) => {
+        const others = Array.isArray(d.hooks) ? (d.hooks as unknown[]).map(obj).filter((h) => !isOurs(obj(h.action).command)) : [];
+        const ours = KIRO_EVENTS.map(([trigger, kind, timeout]) => ({
+          name: `devctx ${kind.replace('_', ' ')}`,
+          description: 'devctx: records project decisions and injects relevant ones',
+          trigger,
+          action: { type: 'command', command: hookCommand(tool, kind) },
+          timeout,
+        }));
+        return { ...d, version: typeof d.version === 'string' ? d.version : 'v1', hooks: [...others, ...ours] };
+      });
   }
 }
 
@@ -168,4 +173,57 @@ export const HOOK_FILES: Record<ToolId, string> = {
 export function hookInstalled(root: string, tool: ToolId): boolean {
   const text = readText(path.join(root, HOOK_FILES[tool]));
   return text !== null && OURS.test(text);
+}
+
+/** An event map without devctx's entries; events left empty are dropped. */
+function withoutOurs(hooks: Json, keep: (entry: Json) => Json | null): Json {
+  const out: Json = {};
+  for (const [event, value] of Object.entries(hooks)) {
+    if (!Array.isArray(value)) {
+      out[event] = value;
+      continue;
+    }
+    const kept = (value as unknown[]).map(obj).map(keep).filter((e): e is Json => e !== null);
+    if (kept.length > 0) out[event] = kept;
+  }
+  return out;
+}
+
+/**
+ * Removes devctx's entries from a tool's hook file and keeps everything else. A file left with
+ * nothing but devctx's scaffolding (version, empty hooks) is deleted. `apply: false` only reports.
+ */
+export function removeToolHooks(root: string, tool: ToolId, apply: boolean): HookFileResult {
+  const rel = HOOK_FILES[tool];
+  const file = path.join(root, rel);
+  const { data, exists, invalid } = readJsonFile(file);
+  if (!exists) return { tool, file: rel, action: 'unchanged' };
+  if (invalid) return { tool, file: rel, action: 'skipped', note: 'not valid JSON; remove the devctx entries by hand' };
+  let next: Json;
+  if (tool === 'kiro') {
+    const hooks = Array.isArray(data.hooks) ? (data.hooks as unknown[]).map(obj).filter((h) => !isOurs(obj(h.action).command)) : [];
+    next = { ...data, hooks };
+  } else if (tool === 'claude' || tool === 'codex') {
+    next = {
+      ...data,
+      hooks: withoutOurs(obj(data.hooks), (g) => {
+        if (!Array.isArray(g.hooks)) return g;
+        const inner = (g.hooks as unknown[]).map(obj).filter((h) => !isOurs(h.command));
+        return inner.length > 0 ? { ...g, hooks: inner } : null;
+      }),
+    };
+  } else {
+    next = { ...data, hooks: withoutOurs(obj(data.hooks), (h) => (isOurs(h.command) || isOurs(h.bash) ? null : h)) };
+  }
+  const hooks = next.hooks;
+  const emptyHooks = Array.isArray(hooks) ? hooks.length === 0 : Object.keys(obj(hooks)).length === 0;
+  if (emptyHooks) delete next.hooks;
+  const rest = Object.keys(next).filter((k) => k !== 'version');
+  if (rest.length === 0) {
+    if (apply) fs.rmSync(file, { force: true });
+    return { tool, file: rel, action: 'removed' };
+  }
+  if (JSON.stringify(next) === JSON.stringify(data)) return { tool, file: rel, action: 'unchanged' };
+  if (apply) writeFileAtomic(file, `${JSON.stringify(next, null, 2)}\n`);
+  return { tool, file: rel, action: 'updated' };
 }

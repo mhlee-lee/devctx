@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { git } from '../util/git.ts';
+import { lockHeld, tryLock } from '../util/lock.ts';
 import { packageRoot } from '../util/paths.ts';
 
 /**
@@ -44,30 +45,13 @@ export function listRepoFiles(root: string): string[] {
 
 /** One indexer per worktree; a crashed holder (dead pid or older than 15 min) is ignored. */
 export function takeIndexLock(root: string): (() => void) | null {
-  const file = codeLockPath(root);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: 'wx' });
-      return () => fs.rmSync(file, { force: true });
-    } catch (error) {
-      // Not "someone else holds it": a read-only checkout or sandbox. Callers report that.
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (indexingInProgress(root)) return null;
-      fs.rmSync(file, { force: true });
-    }
-  }
-  return null;
+  // Not "someone else holds it": a read-only checkout or sandbox throws. Callers report that.
+  const lock = tryLock(codeLockPath(root), LOCK_STALE_MS, { throwOnError: true });
+  return lock ? () => lock.release() : null;
 }
 
 export function indexingInProgress(root: string): boolean {
-  try {
-    const info = JSON.parse(fs.readFileSync(codeLockPath(root), 'utf8')) as { pid: number; at: number };
-    process.kill(info.pid, 0);
-    return Date.now() - info.at < LOCK_STALE_MS;
-  } catch {
-    return false;
-  }
+  return lockHeld(codeLockPath(root), LOCK_STALE_MS);
 }
 
 /** Vendored grammars: `vendor/grammars/<id>.wasm.br`, provenance in `MANIFEST.json`. */

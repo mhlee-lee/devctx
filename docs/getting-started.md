@@ -4,13 +4,13 @@ devctx를 처음 쓸 때 알아야 할 것만 모았다. 설치 명령은 [READM
 
 ## 1. 한 줄 요약
 
-AI 도구와 대화하며 정한 규칙을 자동으로 Git에 남기고, Claude Code·Codex·Copilot·Cursor·Kiro가 모두 같은 규칙을 따르게 한다. 함께 들어 있는 코드 인덱스는 AI가 파일을 통째로 읽지 않고 필요한 코드만 찾게 한다. `devctx init` 뒤에는 따로 할 일이 없다.
+AI 도구와 대화하며 정한 규칙을 자동으로 Git에 남기고, Claude Code·Codex·Copilot·Cursor·Kiro가 모두 같은 규칙을 따르게 한다. 함께 들어 있는 코드 인덱스는 AI가 파일을 통째로 읽지 않고 필요한 코드만 찾게 한다. `devctx init`과 도구별 hook 승인(아래 2장) 뒤에는 따로 할 일이 없다. 도구마다 지원 범위는 조금씩 다르다([README의 도구별 지원](../README.md#도구별-지원)).
 
 ## 2. 설치 직후 확인할 것
 
-1. `devctx init`이 만든 파일을 커밋한다. 커밋해야 팀원에게도 적용된다.
+1. `devctx init`이 만든 파일을 커밋한다. 커밋해야 팀원에게도 적용된다. `init`이 마지막에 실제로 만들거나 바꾼 경로만 담은 `git add` 명령을 출력하니 그대로 실행한다. 예:
    ```sh
-   git add .devctx AGENTS.md .gitattributes .agents .claude .codex .github .cursor .kiro .vscode/settings.json
+   git add -A -- .devctx AGENTS.md .gitattributes .gitignore .claude .github/hooks .agents .vscode/settings.json
    git commit -m "chore: devctx 설정"
    ```
 2. 도구마다 프로젝트 hook을 한 번 승인한다. 승인하지 않으면 아무것도 기록되지 않는다.
@@ -18,8 +18,26 @@ AI 도구와 대화하며 정한 규칙을 자동으로 Git에 남기고, Claude
    - Claude Code: 프로젝트 설정을 신뢰할지 물으면 허용
    - Cursor, VS Code: 신뢰한 워크스페이스로 연다
 3. 로그인된 AI CLI가 하나 이상 있어야 한다(`claude`, `codex`, `copilot`, `cursor-agent`, `kiro-cli`). 규칙 추출에 이 CLI를 쓴다. 없으면 "앞으로", "항상" 같은 표현이 있는 문장만 확인 대기로 남고, 표시 없이 말한 지시는 기록되지 않는다.
-4. `devctx doctor`로 hook, git hook, 실행 스크립트, 쓸 수 있는 CLI를 확인한다.
-5. 팀과 공유한다면 `devctx init --source github:<owner>/dev-context#<태그>`로 설치 위치를 정한다. 기본값은 이 PC의 경로라 다른 PC에서 동작하지 않는다.
+4. `devctx doctor`로 hook, git hook, 실행 스크립트(`hook runtime`: hook이 실제로 실행할 devctx), 설치된 CLI를 확인한다. 여기서 `ok`는 파일과 설치가 맞다는 뜻이다. AI CLI가 로그인되어 실제로 답하는지는 아래 5분 확인의 4단계로 본다.
+5. 팀과 공유한다면 설치 위치를 공개 저장소의 커밋으로 정하고 커밋한다. 기본값은 이 PC의 경로라 다른 PC에서 동작하지 않는다.
+   ```sh
+   SHA=$(git -C <devctx를 clone한 폴더> rev-parse HEAD)
+   devctx init --source github:mhlee-lee/devctx#$SHA
+   git add -A -- .devctx && git commit -m "chore: devctx 설치 위치 고정"
+   ```
+   팀원 PC는 hook이 처음 실행될 때 이 코드를 설치해 실행하므로, 태그나 브랜치처럼 나중에 바뀔 수 있는 값은 쓰지 않는다. `init`을 다시 실행해도 이 값은 `--source`를 줄 때만 바뀐다.
+
+### 5분 확인: 규칙 하나가 저장되고 AI에 전달되는지
+
+설치가 맞아도 hook 승인이나 CLI 로그인이 빠지면 아무것도 기록되지 않는다. 아래 순서로 한 번 확인한다.
+
+1. **hook이 도는지:** AI 도구에서 이 저장소로 새 세션을 열고 아무 말이나 한 번 한다. `devctx doctor`의 `capture`에 방금 시각(`last AI hook event`)이 나오면 된다. "no AI hook event"면 그 도구의 프로젝트 hook 승인(위 2번)을 확인한다.
+2. **규칙 저장:** 같은 세션에서 "앞으로 커밋 메시지는 한국어로 써줘"라고 말하고 답을 받는다. 턴이 끝나면 백그라운드에서 정리된다(몇 초~수십 초).
+3. **확인:** `devctx status`의 `[active]`에 그 규칙이 보이면 저장된 것이다. `[proposed]`(확인 대기)에 있으면 이 PC에만 있는 상태다. `devctx approve <ID>`로 확정하거나 같은 말을 한 번 더 한다. `devctx log`는 무엇이 왜 바뀌었는지와 지금 상태를 보여준다.
+4. **LLM이 실제로 답하는지:** `devctx doctor`의 `llm usage (7d)`에 `ok` 1 이상이 보이면 CLI가 로그인되어 동작한 것이다. 호출은 있는데 `ok 0`이면 그 CLI를 직접 한 번 실행해 로그인한다. `extraction`에 실패가 쌓여 있으면 `.devctx/local/devctx.log`를 본다.
+5. **전달:** 새 세션을 열고 "커밋 메시지 규칙이 뭐야?"라고 묻는다. 세션 시작 때 받은 규칙으로 답하면 된다. 어떤 결정이 왜 붙는지는 `devctx why "커밋 메시지 써줘"`로 본다.
+
+hook 없이 바로 시험하려면 `devctx remember "커밋 메시지는 한국어로 쓴다"`도 된다. 직접 남긴 규칙이라 LLM 없이 바로 `[active]`가 된다.
 
 ## 3. 무엇이 기록되나
 
@@ -42,8 +60,8 @@ AI 도구와 대화하며 정한 규칙을 자동으로 Git에 남기고, Claude
 
 | 판단 | 결과 | 예 |
 |---|---|---|
-| 앞으로도 지킬 규칙이 확실함 | 결정 파일이 되어 Git과 AGENTS.md에 들어간다 | "DTO는 record로 작성해", "불필요한 일반화는 하지 마" |
-| 지속 규칙인지 애매함 | 확인 대기(proposed). 이 PC에만 두고, 다시 말하면 결정 파일이 된다 | 맥락 없이 한 번 나온 짧은 지시 |
+| 앞으로도 지킬 규칙이 확실함 | 결정 파일이 되어 Git에 들어가고, 다음 세션부터 모든 도구에 전달된다(지금 세션에는 다음 프롬프트에 덧붙는다) | "DTO는 record로 작성해", "불필요한 일반화는 하지 마" |
+| 지속 규칙인지 애매함 | 확인 대기(proposed). 이 PC에만 두고, 다시 말하거나 `devctx approve <ID>`로 확정하면 결정 파일이 된다 | 맥락 없이 한 번 나온 짧은 지시 |
 | 지금 하는 작업 요청 | 기록하지 않는다 | "LoginForm에 토글 버튼 추가해줘", "이 테스트 고쳐줘" |
 | 나에게만 해당하는 선호 | 이 PC(`~/.local/share/devctx/`)에 저장 | "나한테는 짧게 답해줘" |
 
@@ -56,9 +74,11 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 ### 원하는 대로 기록되게 하려면
 
 - 확실히 남기려면 "앞으로", "항상", "이 프로젝트에서는"을 붙인다. 그 턴이 끝나면 바로 처리한다.
-- hook이 없는 환경에서는 `devctx remember "규칙"`으로 직접 남긴다.
+- `devctx remember "규칙"`으로 직접 남길 수 있다. 직접 남긴 것이라 LLM이 없어도 바로 확정되고, 결과(저장됨·이미 있음·충돌)를 보여준다.
+- 확인 대기 목록은 `devctx approve`, 확정은 `devctx approve <ID>`, 버리기는 `devctx discard <ID>`.
 - 남기지 않으려면 "이번만", "일단"을 붙인다.
-- 규칙을 바꾸려면 새 규칙을 말한다("앞으로 테스트는 Jest 말고 Vitest로"). 이전 결정은 대체됨으로 표시되고 더는 전달되지 않는다.
+- 규칙을 바꾸려면 새 규칙을 말한다("앞으로 테스트는 Jest 말고 Vitest로"). 이전 결정은 대체됨으로 표시되고 더는 전달되지 않는다. 단, 다른 팀원이 만든 규칙은 조용히 바꾸지 않고 충돌로 남긴다(8장).
+- 내 프롬프트를 아예 분석하지 않게 하려면 `devctx capture off`. 내 AI CLI 쿼터로 LLM을 부르지 않고, 팀 규칙은 그대로 받는다. `devctx capture on`으로 다시 켠다.
 - 명시 표현이 있는 프롬프트만 보내고 싶으면 `.devctx/config.yaml`에서 `memory.implicit_rules: false`로 바꾼다.
 
 ### 기록된 것 확인하고 고치기
@@ -68,24 +88,25 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | 지금 적용 중인 결정 보기 | `devctx status` |
 | 자동으로 바뀐 내용과 이유 보기 | `devctx log` |
 | 어떤 프롬프트에 어떤 결정이 붙는지 보기 | `devctx why "프롬프트"` |
-| 잘못 기록된 결정 고치기 | `.devctx/knowledge/decisions/`의 파일을 직접 고치거나 지우고 커밋한다. 사람이 고친 내용이 가장 우선한다 |
+| 잘못 기록된 결정 고치기 | `.devctx/knowledge/decisions/`의 파일에서 `## 규칙` 구간을 고치거나 파일을 지우고 커밋한다. AI에 전달되는 것은 `## 규칙` 구간이다(front matter `summary`와 다르면 `devctx doctor`가 알린다) |
 
 ## 4. 어디에 저장되나
 
 | 무엇 | 위치 | Git |
 |---|---|---|
 | 결정 | `.devctx/knowledge/decisions/` (1건 1파일) | 공유 |
-| AI가 읽는 규칙 파일 | `AGENTS.md`, 도구별 규칙 파일 | 공유 (결정에서 자동 생성) |
+| AGENTS.md | 사람이 쓴 내용 + devctx 블록(규칙이 어디서 오는지 안내, 바뀌지 않음) | 공유 (사람이 관리) |
+| 규칙 목록, 도구별 경로 규칙 파일 | `.devctx/rules.md`, `.github/instructions/devctx-*` 등 | 이 PC만 (결정에서 PC마다 똑같이 만든다, `.gitignore`) |
 | 설정 | `.devctx/config.yaml` | 공유 |
 | hook, 스킬, 명령 허용 설정 | `.claude/`, `.codex/`, `.github/hooks/`, `.cursor/`, `.kiro/`, `.agents/`, `.vscode/settings.json` | 공유 |
-| 대화 기록, 확인 대기, 반복·위반 횟수 | `.devctx/local/state.sqlite` | 이 PC만 |
+| 대화 기록(프롬프트·AI 마지막 응답, 비밀값은 자리표시자로), 확인 대기, 반복·위반 횟수 | `.devctx/local/state.sqlite` | 이 PC만 |
 | 코드 인덱스 | `.devctx/local/code.sqlite` | 이 PC만 |
 | 로그 | `.devctx/local/devctx.log` | 이 PC만 |
 | 프롬프트 히스토리 (켰을 때만) | `.devctx/history/` (세션마다 파일 1개, 커밋 뒤 이어지면 새 파일) | 공유 |
-| 히스토리 켜짐/꺼짐 | `~/.local/share/devctx/history.json` | 이 PC만 |
+| 히스토리·프롬프트 분석 켜짐/꺼짐 | `~/.local/share/devctx/history.json`, `capture.json` | 이 PC만 |
 | 개인 선호, 모델 평가 결과 | `~/.local/share/devctx/` | 이 PC만 |
 
-`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
+`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 다만 hook은 히스토리를 꺼도 프롬프트를 이 PC의 `state.sqlite`에 저장한다(규칙 추출과 세션 이어가기용). 분석이 끝난 것은 90일이 지나면 지우고, 지금 지우려면 `devctx purge`를 실행한다(아직 분석하지 않은 프롬프트 속 규칙은 기록되지 않는다). 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
 
 ## 5. 비용과 토큰
 
@@ -94,21 +115,22 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 - 작업 중인 도구의 CLI와 계정으로 호출한다. 사용량은 그 계정의 구독이나 쿼터에서 차감된다.
 - 모델은 요구사항 평가를 전부 통과한 후보 중 가장 싼 것을 쓴다. 실측(Codex)으로 추출 한 번에 약 $0.0018, 판정 한 번에 약 $0.0006였다.
 - 추출 한 번에 프롬프트 5개까지 묶는다. 명시 표현이 없는 프롬프트는 5개씩 모아 보내서, 평범한 작업 요청이 많아도 호출은 5개에 한 번 정도다.
-- 시간당 호출은 기본 30번까지다(`llm.max_calls_per_hour`). 넘으면 다음 실행으로 미루고 버리지 않는다.
+- 시간당 호출은 기본 30번까지다(`llm.max_calls_per_hour`). 넘으면 다음 실행으로 미루고 버리지 않는다. `0`으로 두거나 `llm.providers: []`면 LLM을 부르지 않는다. 그때는 "앞으로", "항상" 같은 명시 표현만 확인 대기로 남는다.
 - 프롬프트 히스토리를 켜면 턴마다 요약 호출이 한 번 더 든다. 상한은 따로 센다(`history.max_calls_per_hour`, 기본 30). 그래서 히스토리가 결정 추출을 막지 않는다.
 - 처음 쓸 때와 devctx가 평가 기준을 바꿨을 때는 모델 평가를 돌린다. 모델 하나에 추출 12번, 판정 22번, 요약 4번 정도 호출한다(요약 평가는 히스토리를 켰을 때만). 결과는 CLI 버전별로 30일 동안 보관한다.
+- 모델 평가도 시간당 상한 안에서 센다. 평가 한 번은 시작할 때 남은 호출 수 안에 들어와야 한다. 단, 상한을 평가 한 번보다 낮게 잡으면(예: 10) 평가는 그 시간에 다른 호출이 없을 때만 시작하고, 그 시간에는 상한을 넘는다. 이것도 피하려면 `llm.pin`으로 모델을 고정해(평가 생략) 쓰거나 상한을 `0`으로 둔다.
 
 ### 대화에 붙는 토큰
 
 | 언제 | 상한 |
 |---|---|
-| 항상 읽히는 AGENTS.md 핵심 규칙 | 1500 |
+| 세션 시작 때 붙이는 항상 따를 규칙 (`core_budget_tokens`) | 1500 |
 | 프롬프트마다 관련 결정 | 600 |
 | 프롬프트에 코드 이름이 있을 때 선언 위치 힌트 | 200 |
 | 세션 시작 (개인 선호, 충돌 안내) | 400 |
 | 새 세션이 직전 작업을 이어갈 때 한 번 | 300 |
 
-상한은 `.devctx/config.yaml`의 `inject`에서 바꾼다. AGENTS.md는 결정이 바뀔 때만 다시 만들어 프롬프트 캐시가 유지된다.
+상한은 `.devctx/config.yaml`의 `inject`에서 바꾼다. 규칙은 세션 시작 때 한 번 붙고 세션 동안 바뀌지 않는다. AGENTS.md와 도구별 규칙 파일도 세션 중에는 바뀌지 않아서, 파일을 요청마다 보내는 도구(Copilot, Cursor, Kiro)도 프롬프트 캐시가 유지된다. 세션 중에 새로 정한 결정은 다음 프롬프트에 덧붙는다.
 
 ## 6. 코드 인덱스
 
@@ -126,6 +148,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 |---|---|
 | 켜기 (이 PC에서 이 저장소, 모든 worktree) | `devctx history on` |
 | 끄기 (이미 쓴 기록은 그대로) | `devctx history off` |
+| 끄면서 아직 쓰지 않은 항목도 버리기 | `devctx history off --discard` |
 | 켜짐/꺼짐과 최근 기록 보기 | `devctx history` (`devctx status`, `devctx doctor`에도 나온다) |
 
 켜져 있으면 세션을 시작할 때 AI가 "히스토리 기록 중"이라고 한 번 알려준다.
@@ -157,23 +180,35 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 
 **알아둘 것**
 
-- 커밋할 때 함께 올라간다. 팀원도 볼 수 있으니 공유하면 안 되는 내용은 켜기 전에 판단한다. 키·토큰처럼 보이는 값(`password=...`, `token = ...`, `sk-...`)은 코드 속이어도 `[REDACTED]`로 가린다.
+- 커밋할 때 함께 올라간다. 팀원도 볼 수 있으니 공유하면 안 되는 내용은 켜기 전에 판단한다. 키·토큰처럼 보이는 값(`password=...`, `token = ...`, `sk-...`)은 코드 속이어도 `{token}`, `{api_key}`처럼 종류를 알 수 있는 자리표시자로 바꾼다. "비번은 hunter2"처럼 문장으로 쓴 비밀값도 숫자·기호가 섞여 있으면 `{password}`로 바꾼다. 이 PC의 로컬 DB(`state.sqlite`)에 저장할 때도 같다. 모든 형태를 잡지는 못하니 비밀값은 프롬프트에 쓰지 않는다.
 - 한 번 커밋된 히스토리 파일은 다시 고치지 않는다. 커밋 뒤 같은 세션에서 이어진 프롬프트는 새 파일에 쓰고, 머리에 "이어서: 이 세션의 N번째 프롬프트부터 (앞부분: …)"를 적는다. 그래서 브랜치를 바꾸거나 병합해도 히스토리 파일 때문에 막히지 않는다.
 - "바뀐 파일"은 프롬프트를 받을 때와 턴이 끝날 때의 작업 트리를 git으로 비교한 것이다. 그 사이에 내가 에디터에서 직접 고친 것도 함께 잡힌다. 비교는 보통 수십 ms지만 `.gitignore`에 없는 큰 파일(빌드 결과물 등)이 작업 트리에 있으면 느려진다. 그런 파일은 `.gitignore`에 넣는다.
 - "실행한 명령"은 도구가 대화 기록 파일을 넘겨줄 때만 나온다.
 - 요약은 턴이 끝난 뒤 백그라운드에서 쓰여서 몇 초 늦게 나타난다. LLM을 쓸 수 없으면 AI 응답 앞부분을 그대로 넣는다.
+- 그래서 켜져 있을 때 보낸 프롬프트는 끈 뒤에 파일로 쓰일 수 있다. `devctx history off`가 그런 항목 수를 알려주고, 남기지 않으려면 `--discard`를 붙인다.
 - 프롬프트가 20,000자를 넘으면 뒷부분을 생략 표시와 함께 자른다.
 
 ## 8. 팀으로 쓸 때
 
 - 팀원은 clone만 하면 된다. 첫 AI 세션에서 devctx 설치와 git hook 설치가 자동으로 된다(`devctx_source`가 원격 위치여야 한다).
-- 결정 파일은 새로 추가만 해서 브랜치를 병합해도 충돌이 나지 않는다. AGENTS.md는 병합 뒤 자동으로 다시 만든다.
+- 결정 파일은 새로 추가만 해서 브랜치를 병합해도 충돌이 나지 않는다. 규칙 목록과 도구별 규칙 파일은 커밋하지 않고 PC마다 만들어서, GitHub에서 PR을 병합해도 오래된 규칙이 남거나 pull한 사람의 작업 트리가 바뀌지 않는다.
+- AGENTS.md는 팀이 직접 관리한다. devctx는 끝의 자기 블록만 확인한다. hook은 git이 추적하는 파일을 고치지 않아서 업그레이드 전 브랜치를 오가도 checkout이 막히지 않는다.
 - 두 사람이 같은 규칙을 서로 다르게 바꾸면 충돌로 표시되고, 관련 작업 때 AI가 어느 쪽을 따를지 한 번 묻는다.
+- 내가 만든 규칙은 새로 말하면 대체되지만, 다른 팀원이 만든 규칙을 바꾸는 말은 충돌로 남는다. 정리는 대화에서 한쪽을 다시 말하거나 `devctx resolve <ID>`(ID는 `devctx status`의 6자리).
+- `git commit <파일>`처럼 파일을 지정해 커밋하면(JetBrains IDE 등) 결정 파일은 다음 일반 커밋에 올라간다. git 출력에 그렇게 알린다.
+- 팀원 PC의 devctx 설치는 백그라운드로 하고 실패해도 커밋에 오류를 찍지 않는다. 기록이 안 되면 `devctx doctor`의 `hook runtime`을 본다.
 - 기본 커밋 방식(`ride-along`)에서는 내가 커밋할 때 새 결정 파일(히스토리를 켰다면 히스토리 파일도)이 함께 들어간다.
+- 결정만 따로 커밋하고 싶거나 `commit_mode: manual`이면:
+  ```sh
+  git add .devctx/knowledge
+  git commit -m "chore: devctx 결정" -- .devctx/knowledge
+  ```
+- `--source`로 설치 위치를 바꾸거나 devctx를 업데이트한 뒤 `devctx init`을 다시 실행했으면, 출력되는 `git add` 명령으로 `.devctx/tools.lock`과 `.devctx/bin/devctx`를 커밋해야 팀원에게 반영된다. 실행 스크립트가 다른 버전이면 `devctx doctor`가 `shim version`으로 알린다.
 
 ## 9. 알아둘 한계
 
 - macOS와 Linux만 지원한다. Windows는 아직이다.
+- Cursor는 프롬프트 hook이 컨텍스트를 붙일 수 없어서 프롬프트마다 관련 결정을 붙이지 못하고 세션 이어가기도 없다. 대신 세션 시작 때 받지 않은 규칙을 `.cursor/rules/devctx-on-demand.mdc`에 넣어 Cursor Agent가 관련 있을 때 읽게 한다. Kiro는 세션 종료 hook이 없어서 `auto-commit`이 동작하지 않는다. 도구별 차이는 [README의 도구별 지원](../README.md#도구별-지원)에 있다.
 - hook이 꺼지면 아무것도 기록되지 않는다. 커밋은 있는데 hook 기록이 14일째 없으면 커밋할 때 경고가 뜬다.
 - 질문 형태로 말한 규칙("record로 하는 게 낫지 않아?")은 보내지 않는다. AI가 그 제안을 받아 "그렇게 할까요?"라고 묻고 내가 "응"이라고 답하면 수락으로 보낸다(도구가 AI 응답이나 대화 기록 파일을 넘겨줄 때). 확실히 남기려면 "앞으로"를 붙이거나 `devctx remember`를 쓴다.
 - 명시 표현이 없는 문장은 바로 반영되지 않는다. 5개가 모이거나 세션이 시작·종료될 때, 또는 1시간이 지난 뒤 다음 턴이 끝날 때 처리된다.
@@ -185,11 +220,16 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | 명령 | 언제 |
 |---|---|
 | `devctx doctor` | 기록이 안 되는 것 같을 때 먼저 |
-| `devctx status` | 지금 적용 중인 결정 보기 (히스토리 켜짐/꺼짐도) |
+| `devctx status` | 지금 적용 중인 결정 보기 (히스토리·프롬프트 분석 켜짐/꺼짐도) |
 | `devctx log` | 자동으로 무엇이 왜 바뀌었는지 |
 | `devctx why "프롬프트"` | 결정이 안 붙거나 엉뚱한 결정이 붙을 때 |
-| `devctx remember "규칙"` | hook 없이 직접 기록 |
+| `devctx remember "규칙"` | 직접 기록 (바로 확정) |
+| `devctx approve [<ID>]`, `devctx discard <ID>` | 확인 대기 목록 보기, 확정, 버리기 |
+| `devctx resolve <ID>` | 충돌 정리 (고른 규칙만 남김) |
+| `devctx capture [on\|off]` | 내 프롬프트 분석 켜기·끄기 (이 PC) |
 | `devctx history [on\|off]` | 프롬프트 히스토리 켜기·끄기, 상태와 최근 기록 |
+| `devctx purge` | 이 PC에 저장된 프롬프트·AI 응답 원문 지우기 |
+| `devctx uninstall [--yes]` | 이 저장소에서 devctx 제거 (`--yes` 없이는 지울 것만 보여줌) |
 | `devctx models` | 추출·판정·요약에 쓰는 모델과 비용 |
 | `devctx code status` | 코드 인덱스 상태, 스킬·허용 설치 상태 |
 

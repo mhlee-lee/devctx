@@ -1,6 +1,6 @@
 # devctx 동작 방식
 
-devctx는 AI 도구와 나눈 대화에서 프로젝트 결정을 골라 Git에 파일로 남기고, 그 결정을 모든 AI 도구에 다시 전달한다. 코드 구조는 내장 코드 인덱스가 그래프로 만들어 AI가 파일을 통째로 읽지 않고 찾게 한다. 사용자가 따로 할 일은 없다.
+devctx는 AI 도구와 나눈 대화에서 프로젝트 결정을 골라 Git에 파일로 남기고, 그 결정을 모든 AI 도구에 다시 전달한다. 코드 구조는 내장 코드 인덱스가 그래프로 만들어 AI가 파일을 통째로 읽지 않고 찾게 한다. `devctx init`과 도구별 hook 승인 뒤에는 사용자가 따로 할 일이 없다. 도구마다 hook이 할 수 있는 일이 달라 지원 범위가 조금씩 다르다([README의 도구별 지원](../README.md#도구별-지원)).
 
 그림은 [Archify](https://github.com/tt-a1i/archify)로 만들었다. 이미지를 누르면 인터랙티브 HTML이 열린다. GitHub에서는 HTML이 소스로 보이니 clone한 뒤 브라우저로 연다. HTML에서는 단계별 보기(Guided views), 경로 추적, 확대, 라이트/다크 전환, PNG·SVG 내보내기를 쓸 수 있고, 뷰어 메뉴는 영어다.
 
@@ -16,8 +16,8 @@ open docs/diagrams/architecture.html   # macOS
 |---|---|---|
 | 캡처 | AI 도구의 hook이 프롬프트와 턴 종료를 기록한다 | 이 PC (`.devctx/local/`, git 제외) |
 | 정리 | 백그라운드 worker가 규칙을 추출하고 기존 결정과 비교해 파일을 추가하거나 대체한다 | 이 PC |
-| 전달 | 결정을 AGENTS.md와 도구별 규칙 파일로 만들고, 프롬프트마다 관련 결정을 hook으로 붙인다 | 저장소 |
-| 공유 | 결정 파일이 사용자 커밋에 함께 실려 clone한 팀원에게도 적용된다 | Git |
+| 전달 | 세션 시작 hook이 규칙 목록을 붙이고, 프롬프트마다 관련 결정을 붙인다. 이 PC에서 규칙 목록(`.devctx/rules.md`)과 도구별 규칙 파일을 만든다. AGENTS.md에는 바뀌지 않는 안내 블록만 둔다 | 이 PC (생성 파일은 git 제외) |
+| 공유 | 결정 파일만 사용자 커밋에 함께 실려 clone한 팀원에게도 적용된다. 각 PC가 같은 결정 파일에서 같은 규칙 목록을 만든다 | Git |
 
 ## 2. 대화 한 턴에서 일어나는 일
 
@@ -27,8 +27,8 @@ open docs/diagrams/architecture.html   # macOS
 2. `UserPromptSubmit` hook이 프롬프트를 기록하고, 관련 결정이 있으면 600토큰 이내로 붙인다. hook은 약 0.1초 만에 끝나고 실패해도 AI 도구를 막지 않는다. 이때 LLM 없이 프롬프트를 분류한다(아래 표).
 3. 턴이 끝나면(`Stop`) 바로 추출할 프롬프트가 있을 때 hook이 worker를 분리된 프로세스로 띄운다.
 4. worker가 작업 중인 도구의 CLI로 규칙을 추출하고, 비슷한 기존 결정과 비교(판정)한다.
-5. 판정 결과대로 결정 파일을 추가·보강·대체하고 AGENTS.md를 다시 만든다.
-6. 다음 세션부터 모든 도구가 바뀐 결정을 읽는다.
+5. 판정 결과대로 결정 파일을 추가·보강·대체하고 이 PC의 규칙 목록(`.devctx/rules.md`)을 다시 만든다. AGENTS.md와 도구별 규칙 파일은 세션 중에 바꾸지 않는다(프롬프트 캐시 유지).
+6. 지금 세션에는 새 결정이 다음 프롬프트에 덧붙는다. 다음 세션부터는 세션 시작 hook이 붙이는 규칙 목록과 그때 다시 만든 도구별 규칙 파일에 들어간다.
 
 추출로 보내는 프롬프트 (`src/hooks/signals.ts`):
 
@@ -49,7 +49,7 @@ open docs/diagrams/architecture.html   # macOS
 - 프롬프트가 구체적인 파일을 가리키는데 결정의 경로 범위 밖이면 뺀다. `packages/api` 규칙은 `packages/web` 작업에 붙지 않는다.
 - 대체됐거나 기한이 지난 결정, 이 세션에 이미 붙인 결정은 붙이지 않는다. 예산에 안 맞는 긴 결정은 건너뛰고 다음 결정을 계속 넣는다.
 - 슬래시 명령(`/compact`), 셸 명령(`!ls`), "응"·"continue" 같은 짧은 대답에는 관련 결정을 찾지 않는다.
-- `devctx why "<프롬프트>"`가 같은 계산을 보여준다: 결정별 점수 구성, 붙은 것과 빠진 이유(기준 미달, 예산 초과, 이미 붙임, AGENTS.md에 이미 있음).
+- `devctx why "<프롬프트>"`가 같은 계산을 보여준다: 결정별 점수 구성, 붙은 것과 빠진 이유(기준 미달, 예산 초과, 이미 붙임, 세션 시작 때 이미 전달함).
 
 새 세션의 첫 요청 세 개 중 하나가 직전 작업을 이어가는 말("이어서", "아까 하던 거", "continue")이거나 직전 세션과 같은 코드 이름·파일을 담으면, 이 worktree의 직전 세션(다른 도구였어도)의 마지막 요청 두 개와 마지막 응답 앞부분을 300토큰 이내로 한 번 붙인다. 7일 넘은 세션, 대화가 압축·재개된 세션에는 붙이지 않는다. 마지막 응답은 도구가 턴 종료 hook에 응답을 넘겨줄 때만 있다.
 
@@ -77,14 +77,16 @@ open docs/diagrams/architecture.html   # macOS
 
 상태는 모든 파일을 함께 읽고 계산한다. 더 새로운 파일이 가리킬 때만 대체되므로 순환이 생기지 않는다. 순서는 파일에 적힌 기록 시각(없으면 ULID id의 시각)으로 정해서 PC마다 같다. 파일 수정 시각은 쓰지 않는다.
 
-기한은 사용자가 끝나는 날을 말했을 때만 저장한다("10월 10일 릴리스 전까지", "이번 달 말까지"는 메시지를 쓴 날 기준으로 날짜를 정한다). 날짜로 계산하므로 다음 날부터 바로 빠지고, 다음 세션 때 worker가 AGENTS.md와 경로 규칙 파일을 다시 만든다.
+기한은 사용자가 끝나는 날을 말했을 때만 저장한다("10월 10일 릴리스 전까지", "이번 달 말까지"는 메시지를 쓴 날 기준으로 날짜를 정한다). 날짜로 계산하므로 다음 날부터 바로 빠지고, 다음 세션 시작 때 규칙 목록과 경로 규칙 파일을 다시 만든다.
 
 ### 여러 사람과 병합
 
 - 결정 파일은 새로 추가만 하니 두 사람의 변경이 같은 파일에 닿지 않는다. 병합 충돌은 사람이 같은 파일을 직접 고쳤을 때만 난다.
-- AGENTS.md와 도구별 규칙 파일은 `.gitattributes`의 `merge=union`(git 기본 기능, PC별 설정 불필요)으로 양쪽 줄을 합치고, post-merge·post-rewrite hook이 합쳐진 결정으로 다시 만든다. AGENTS.md는 Git에 있는 파일(결정과 코드)만으로 만들어서, 새로 clone한 PC도 바이트까지 같은 결과를 낸다.
-- 같은 규칙을 두 사람이 서로 다르게 대체했으면(A는 Jest→Vitest, B는 Jest→Kotest) 두 새 규칙이 충돌이 된다. B의 지시가 A의 규칙과 반대라서 대체가 아닌 충돌(`conflict_with: [Jest]`)로 기록됐어도, 병합 뒤 Jest가 이미 Vitest로 대체돼 있으면 충돌은 Vitest로 옮겨간다. 어느 쪽으로 정하든 새 파일 하나가 양쪽을 모두 대체한다. 같은 문장이 두 번 기록됐으면 오래된 쪽 하나만 전달하고, 그 원본이 대체됐으면 사본도 같이 대체된다.
-- 병합으로 들어온 팀원의 AGENTS.md 줄은 사람이 직접 고친 것으로 보지 않는다. 지금 결정으로 다시 만들면 나오는 줄, 알려진 결정의 문장, 제목, devctx 안내 문장을 뺀 나머지만 직접 수정으로 본다.
+- 규칙 목록(`.devctx/rules.md`)과 도구별 규칙 파일은 커밋하지 않는다(`init`이 `.gitignore`에 넣는다). post-merge·post-checkout·post-rewrite hook과 세션 시작 hook이 그 PC에서 다시 만든다. Git에 있는 파일(결정과 코드)만으로 만들어서 새로 clone한 PC도 바이트까지 같다. 커밋했던 이전 방식은 GitHub에서 PR을 병합할 때처럼 hook 없이 서버에서 병합하면 합쳐진 생성 파일이 낡은 채 저장소에 남았고, pull한 사람마다 다시 만들어진 파일이 바뀐 상태로 보여 각자의 다음 PR에 섞였다.
+- AGENTS.md는 사람이 관리한다. devctx는 끝의 `<!-- devctx:begin -->` ~ `<!-- devctx:end -->` 블록만 관리하는데, 이 블록은 언어와 코드 인덱스 설정만으로 정해져서 결정이 바뀌어도 그대로다. 이전 버전이 만든 AGENTS.md는 `preamble.md`의 사람 내용 + 블록으로 한 번 바꾸고, 그 변경은 다음 커밋에 함께 올라간다. 바꾸는 것은 `devctx init`이나 `devctx compile`을 실행할 때뿐이다. hook(세션 시작, checkout·merge 뒤, worker)은 git이 추적하는 파일, 즉 AGENTS.md와 업그레이드 전 브랜치에 커밋된 규칙 파일을 고치지 않는다. 고치면 업그레이드 전 브랜치를 checkout했을 때 작업 트리가 바뀌어 다음 checkout이 막힌다. 그런 브랜치의 `.gitattributes`에는 아직 `AGENTS.md merge=union`이 있어서, 병합하면 예전 규칙 목록이 블록 밖에 남을 수 있다. 예전 형식에만 있던 문장으로 이를 찾아 `devctx doctor`가 알린다.
+- pre-commit hook은 `git commit <파일>`(`--only`, JetBrains IDE 방식)일 때 결정 파일을 스테이징하지 않는다. git이 이때 임시 index(`next-index-*.lock`)로 커밋을 만들어서, 거기에 넣은 파일은 실제 index에 남지 않고 다음 커밋에서 삭제로 잡히기 때문이다. 다음 일반 커밋에 올라가고, git 출력에 그렇게 알린다.
+- 같은 규칙을 두 사람이 서로 다르게 대체했으면(A는 Jest→Vitest, B는 Jest→Kotest) 두 새 규칙이 충돌이 된다. B의 지시가 A의 규칙과 반대라서 대체가 아닌 충돌(`conflict_with: [Jest]`)로 기록됐어도, 병합 뒤 Jest가 이미 Vitest로 대체돼 있으면 충돌은 Vitest로 옮겨간다. 어느 쪽으로 정하든 새 파일 하나가 양쪽을 모두 대체한다. 같은 문장이 따로 두 번 기록됐으면 오래된 쪽 하나만 전달하고, 그 원본이 대체됐으면 사본도 같이 대체된다. 같은 문장이라도 `supersedes`로 이전 규칙을 (직접이든 중간 규칙을 거쳐서든) 대체한 파일은 사본이 아니라 일부러 다시 정한 최신 규칙이다(Jest→Vitest→Jest로 되돌림, 기한 연장, 충돌을 한쪽 문장으로 정리).
+- 다른 사람이 만든 규칙(`source.actor`가 다름)을 반대로 바꾸는 말은 대체가 아니라 충돌로 남긴다. 같은 사람이 자기 규칙을 바꾸면 대체다. 충돌은 대화에서 한쪽을 다시 말하거나 `devctx resolve <ID>`로 정리한다. `resolve`는 고른 규칙의 문장으로 새 파일을 만들어 그 규칙과 상대 규칙을 모두 `supersedes`로 가리킨다.
 
 ### 코드 근거
 
@@ -94,7 +96,7 @@ open docs/diagrams/architecture.html   # macOS
 - "Jest 대신 Vitest", "npm 말고", "never use X"처럼 그만 쓰라는 이름은 적지 않는다.
 - 규칙의 경로 범위 중 실제로 파일이 있는 것.
 
-compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 적어둔 것이 사라졌으면, 규칙을 지우지 않고 "확인 필요: 저장소에서 `jest`을(를) 찾을 수 없음"을 붙여 AGENTS.md 항상 읽는 목록에서 내린다. 관련 작업 때는 표시와 함께 전달되어 AI가 확인한다. 다시 생기면 표시도 없어진다. `tier: core`로 고정한 규칙은 내리지 않는다. Git 색인만 보고 LLM 없이 판단해서 같은 커밋이면 모든 PC가 같은 결과를 낸다. 이 기능이 생기기 전에 만든 결정 파일에는 `anchors`가 없어서 확인하지 않는다.
+compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 적어둔 것이 사라졌으면, 규칙을 지우지 않고 "확인 필요: 저장소에서 `jest`을(를) 찾을 수 없음"을 붙여 세션 시작 때 항상 전달하는 목록에서 내린다. 관련 작업 때는 표시와 함께 전달되어 AI가 확인한다. 다시 생기면 표시도 없어진다. `tier: core`로 고정한 규칙은 내리지 않는다. Git 색인만 보고 LLM 없이 판단해서 같은 커밋이면 모든 PC가 같은 결과를 낸다. 이 기능이 생기기 전에 만든 결정 파일에는 `anchors`가 없어서 확인하지 않는다.
 
 ### 스스로 알리기
 
@@ -105,11 +107,11 @@ compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 �
 | AI 도구 hook 기록이 14일째 없는데 커밋이 5번 이상 있음 | 커밋·병합할 때, 3일에 한 번 | git hook 출력 |
 | 도구 업데이트로 hook 설정에서 devctx 항목이 빠짐 | 하루 한 번 (세션 hook이나 git hook 중 먼저 도는 쪽) | 알리지 않고 다시 넣는다 |
 
-경고를 AGENTS.md에 넣지 않는 이유는 그 파일이 모든 PC에서 같아야 하기 때문이다.
+경고를 규칙 목록에 넣지 않는 이유는 그 목록이 모든 PC에서 같아야 하기 때문이다.
 
 판정은 새 지시를 기존 결정과 비교해 `new`, `duplicate`(합침), `refine`(예외·범위 추가), `supersede`(대체), `conflict` 중 하나로 정한다. 사용자 지시는 AI 제안보다 우선하고, 다른 사람의 규칙은 조용히 바꾸지 않는다.
 
-- 표현만 다른 같은 문장(구두점·대소문자·거의 같은 어순)은 LLM을 부르지 않고 `duplicate`로 처리한다. 숫자·버전·이름이 다르거나 한쪽만 부정문이면 이 지름길을 쓰지 않는다.
+- 표현만 다른 같은 문장(구두점·대소문자·거의 같은 어순)이고 적용 경로도 같으면 LLM을 부르지 않고 `duplicate`로 처리한다. 숫자·버전·이름이 다르거나, 한쪽만 부정문이거나, 적용 경로가 다르면 이 지름길을 쓰지 않는다.
 - 판정 모델에는 기존 결정을 26자 ID 대신 "1", "2" 번호로 보여주고 답을 ID로 되돌린다. 싼 모델이 ID를 잘못 옮겨 판정이 버려지는 일을 막는다.
 - 숫자·버전·도구 이름이 다르면 `duplicate`가 아니다("Node.js 20" → "Node.js 22"는 대체나 충돌). 다른 경로·모듈의 규칙은 다른 주제다.
 - 추출한 규칙에 사용자가 쓰지 않은 이름·숫자가 들어가면(원문에도 직전 AI 응답에도 없음) 확인 대기(`proposed`)로 둔다. 싼 모델이 규칙을 "보강"하며 도구나 버전을 지어내는 것을 막는다. 사용자가 다시 말하면 `active`가 된다.
@@ -137,7 +139,7 @@ compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 �
 | | 정확도 | 비슷한 주제 중 같은 대상 고르기, 버전만 다른 규칙은 duplicate가 아님, 다른 경로의 규칙은 new, 대체되는 규칙에 기대는 규칙 표시(cascade) |
 | 요약 (10개) | 히스토리 항목 | 코드 변경은 change, 설명만 한 턴은 answer·investigation이고 바꿨다고 쓰지 않기, 바뀐 것과 테스트 결과 전하기, 설정한 언어로 쓰기, 사실에 없는 파일 지어내지 않기 |
 
-실측 예시 (2026-09-29, Codex CLI 0.158, 요구사항 평가 v3: 추출 31개·판정 12개 기준. 지금은 v4로 추출 44개라 각 PC에서 다시 평가한다):
+실측 예시 (2026-09-29, Codex CLI 0.158, 요구사항 평가 v3: 추출 31개·판정 12개 기준. 지금은 v5(추출 44개, 대화를 JSON으로 넣는 프롬프트)라 각 PC에서 다시 평가한다):
 
 | 작업 | 결과 | 호출당 비용 |
 |---|---|---|
@@ -153,7 +155,7 @@ compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 �
 AI가 파일을 grep하고 통째로 읽으며 구조를 다시 파악하는 대신, devctx가 만든 코드 그래프에서 심볼·호출 관계·타입 계층을 바로 찾게 한다. 외부 엔진 없이 devctx 안에서 파싱하고 해석한다.
 
 - **바탕:** [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp)(CBM)가 150개 넘는 언어를 다루는 방식, 즉 언어마다 함수·클래스·호출·import 노드 종류를 적은 표를 옮겨 왔다. 파서는 [Graft](https://github.com/trailhq/Graft)처럼 tree-sitter WASM을 쓴다. 두 프로젝트 모두 MIT 라이선스다.
-- **문법:** tree-sitter 문법 36개를 brotli로 압축해 devctx에 넣었다(76MB → 4MB). 출처·버전·라이선스·sha256은 `vendor/grammars/MANIFEST.json`에 있다. 네이티브 빌드, 설치 스크립트, 다운로드가 없다.
+- **문법:** tree-sitter 문법 35개를 brotli로 압축해 devctx에 넣었다(76MB → 4MB). JSX는 JavaScript 문법을 쓰고, Vue·Svelte·Astro는 `<script>`와 frontmatter를 JS/TS 문법으로 읽어 39개 언어가 된다. 출처·버전·라이선스·sha256은 `vendor/grammars/MANIFEST.json`에 있다. 네이티브 빌드, 설치 스크립트, 다운로드가 없다.
 - **연결:** `devctx init`이 도구별 스킬 폴더에 `devctx-code/SKILL.md`를 넣고, 스킬 명령을 각 도구의 권한 설정에 미리 허용한다(6장 표). 평소 컨텍스트에는 스킬 이름과 설명만 들어가고, 명령 표와 실행 규칙이 적힌 본문은 AI가 코드 구조가 필요할 때만 읽는다. MCP 서버는 쓰지 않는다. 세션 내내 떠 있는 프로세스가 없고, 도구마다 다른 MCP 설정을 맞출 필요도 없다.
 - **색인:** 세션 시작과 브랜치 전환(checkout·merge·rebase) 때 worker가 백그라운드에서 한다. 크기·수정 시각이 바뀐 파일만 읽고, 내용 해시가 바뀐 파일만 다시 파싱한다. 파일마다 사실(심볼, 호출, import, 타입이 있는 변수)을 `.devctx/local/code.sqlite`에 저장하고, 호출 관계까지 해석한 그래프를 스냅샷으로 함께 저장한다.
 - **조회:** AI가 `.devctx/bin/devctx code <도구> <인자>`를 실행한다. 명령은 바뀐 파일이 있으면 먼저 그 파일만 다시 파싱하고, 스냅샷을 읽어 답한다. 호출 관계를 명령마다 다시 해석하지 않으므로 django 규모도 스냅샷 읽기가 약 40ms다. 바뀐 파일이 150개를 넘으면(브랜치 전환 직후 등) 별도 색인 프로세스를 띄우고 최대 45초 기다린다. 쓰기가 막힌 환경(Codex 샌드박스 등)에서는 있는 색인으로 답하고 결과에 그렇다고 적는다.
@@ -190,6 +192,8 @@ AI가 파일을 grep하고 통째로 읽으며 구조를 다시 파악하는 대
 - 그 밖의 파일(YAML, Markdown, 설정 등)은 `search_text`로 찾는다.
 
 ### 확인 결과
+
+`npm run bench:codeindex`는 39개 언어마다 작은 파일 하나를 읽어 파싱 오류가 없는지, 선언과 호출을 찾는지 확인하고, Python 상대 import와 상속한 tsconfig `paths`를 실제 저장소로 확인한다. 문법을 바꿨는데 노드 이름이 달라져 추출이 비는 일을 여기서 잡는다. 실제 저장소에서도 파서가 문법 오류를 복구하며 읽은 파일 수를 언어별로 세어 `devctx code status`에 보여주고, 한 언어 파일의 절반 넘게 그렇다면 `devctx doctor`가 알린다. Groovy 문법은 세미콜론 없는 문장이나 타입 없는 매개변수 같은 올바른 코드도 오류로 표시하므로(선언과 호출은 읽는다) 이 경고에서 뺀다.
 
 39개 언어마다 같은 구조의 샘플 저장소를 만들어 검사했다. 다른 모듈에 이름이 같은 함수와 타입을 일부러 두고, 이어져야 할 호출·생성·상속 239개와 이어지면 안 되는 연결 76개를 확인했다. 315개 모두 맞았다. 이전에 연결했던 두 엔진이 놓치던 세 가지도 된다.
 
@@ -230,23 +234,26 @@ AI가 파일을 grep하고 통째로 읽으며 구조를 다시 파악하는 대
   config.yaml            설정 (Git 공유)
   tools.lock             devctx 버전과 설치 위치 (Git 공유)
   bin/devctx             hook이 부르는 실행 스크립트 (Git 공유)
+  rules.md               이 PC에서 만든 전체 규칙 목록 (hook이 없는 에이전트용, Git 제외)
   knowledge/
-    preamble.md          AGENTS.md 맨 위에 그대로 들어가는 내용
     decisions/           규칙·결정 (1건 = 파일 1개)
     context/ runbooks/ lessons/
   history/               프롬프트 히스토리 (켠 사람만, 세션마다 파일, 커밋된 파일은 고치지 않음, Git 공유)
   local/                 Git 제외: state.sqlite (hook 기록, 확인 대기·보관 규칙, 반복·위반 횟수, 결정 파일 읽기 캐시, 자동 변경 기록, 주입 기록, 히스토리 대기 턴), devctx.log, code.sqlite (코드 인덱스)
-AGENTS.md                생성 파일
+AGENTS.md                사람이 관리. 끝에 devctx 블록(규칙이 어디서 오는지 안내, 바뀌지 않음)
+.github/instructions/devctx-* .claude/rules/devctx-* .cursor/rules/devctx-* .kiro/steering/devctx-*
+                         도구별 경로 규칙 파일 (이 PC에서 생성, Git 제외)
 .claude/skills/devctx-code/SKILL.md   코드 인덱스 스킬 (Claude Code)
 .agents/skills/devctx-code/SKILL.md   같은 스킬 (Codex, Copilot, Cursor)
 .kiro/skills/devctx-code/SKILL.md     같은 스킬 (Kiro)
 .codex/rules/devctx.rules             Codex 명령 미리 허용 (나머지 도구는 아래 표)
-~/.local/share/devctx/   이 PC 전용: 개인 선호, 모델 평가 결과, 가격 캐시, 프롬프트 히스토리 켜짐/꺼짐(history.json)
+~/.local/share/devctx/   이 PC 전용: 개인 선호, 모델 평가 결과, 가격 캐시, 프롬프트 히스토리·분석 켜짐/꺼짐(history.json, capture.json),
+                         hook이 실행할 devctx 설치본(versions/<버전>-<설치 위치>/)
 ```
 
 스킬 파일은 생성 파일이다. `devctx init`과 세션 시작 hook이 다시 만들고, 사람이 고친 지식으로 옮기지 않는다.
 
-결정 파일은 YAML front matter와 `## 규칙`, `## 이유`, `## 예외`, `## 메모` 구간으로 된 Markdown이다. 사람이 직접 고치거나 새로 써도 되고, 사람이 쓴 내용이 가장 우선한다. devctx는 만든 파일을 다시 고치지 않는다(3장). AGENTS.md를 직접 고치면 그 내용을 지식으로 옮긴 뒤 다시 생성한다.
+결정 파일은 YAML front matter와 `## 규칙`, `## 이유`, `## 예외`, `## 메모` 구간으로 된 Markdown이다. 사람이 직접 고치거나 새로 써도 된다. AI에 전달되는 문장은 `## 규칙` 구간이고(여러 줄이면 한 줄로 이어 붙인다), front matter의 `summary`는 `## 규칙`이 비었을 때만 쓴다. 둘이 다르면 `devctx doctor`가 알린다. 판정할 때 출처의 우선순위는 사람이 직접 쓴 파일(`human-edit`) > 사용자 지시 > PR 리뷰 > AI 제안이다. devctx는 만든 파일을 다시 고치지 않는다(3장). AGENTS.md는 사람이 고친 그대로 둔다. 규칙으로 전달하려면 결정 파일을 쓰거나 `devctx remember`를 쓴다.
 
 hook은 결정 파일을 매번 다시 읽지 않는다. 크기와 수정 시각이 그대로인 파일은 `state.sqlite`에 저장해 둔 해석 결과를 쓴다. 결정 파일 2,000개(대부분 대체된 기록)에서 읽기와 상태 계산이 25ms였다(캐시 없이 파싱하면 280ms).
 
@@ -254,11 +261,11 @@ hook은 결정 파일을 매번 다시 읽지 않는다. 크기와 수정 시각
 
 | 도구 | hook 파일 | 규칙 전달 | 코드 인덱스 스킬 | 명령 미리 허용 |
 |---|---|---|---|---|
-| Claude Code | `.claude/settings.json` | AGENTS.md (CLAUDE.md가 있으면 맨 위에 `@AGENTS.md` 추가), 경로 규칙 `.claude/rules/` | `.claude/skills/` | 스킬의 `allowed-tools`, `.claude/settings.json`의 `permissions.allow` |
-| Codex | `.codex/hooks.json` | AGENTS.md, 경로 규칙은 프롬프트 hook으로 주입 | `.agents/skills/` | `.codex/rules/devctx.rules` (신뢰한 프로젝트만 읽음) |
-| GitHub Copilot | `.github/hooks/devctx.json` | AGENTS.md, 경로 규칙 `.github/instructions/` | `.agents/skills/` | VS Code `.vscode/settings.json`, CLI `~/.copilot/permissions-config.json` |
-| Cursor | `.cursor/hooks.json` | AGENTS.md, 경로 규칙 `.cursor/rules/` | `.agents/skills/` | `.cursor/permissions.json` |
-| Kiro | `.kiro/hooks/devctx.json` | AGENTS.md, 경로 규칙 `.kiro/steering/` | `.kiro/skills/` | `~/.kiro/workspace-roots/<저장소>/permissions.yaml` |
+| Claude Code | `.claude/settings.json` | 세션 시작 hook, AGENTS.md 블록(CLAUDE.md가 있으면 맨 위에 `@AGENTS.md` 추가), 경로 규칙 `.claude/rules/` | `.claude/skills/` | 스킬의 `allowed-tools`, `.claude/settings.json`의 `permissions.allow` |
+| Codex | `.codex/hooks.json` | 세션 시작 hook, AGENTS.md 블록, 경로 규칙은 프롬프트 hook으로 주입 | `.agents/skills/` | `.codex/rules/devctx.rules` (신뢰한 프로젝트만 읽음) |
+| GitHub Copilot | `.github/hooks/devctx.json` | 세션 시작 hook, AGENTS.md 블록, 경로 규칙 `.github/instructions/` | `.agents/skills/` | VS Code `.vscode/settings.json`, CLI `~/.copilot/permissions-config.json` |
+| Cursor | `.cursor/hooks.json` | 세션 시작 hook, AGENTS.md 블록, 경로 규칙 `.cursor/rules/`, 관련 있을 때만 읽는 규칙 `.cursor/rules/devctx-on-demand.mdc` (프롬프트 hook은 컨텍스트를 붙일 수 없다) | `.agents/skills/` | `.cursor/permissions.json` |
+| Kiro | `.kiro/hooks/devctx.json` | 세션 시작 hook, AGENTS.md 블록, 경로 규칙 `.kiro/steering/` | `.kiro/skills/` | `~/.kiro/workspace-roots/<저장소>/permissions.yaml` |
 
 미리 허용하는 명령은 `.devctx/bin/devctx code`(앞에 `./`가 붙은 형태 포함)로 시작하는 명령 하나다. 도구마다 적는 형식은 이렇다.
 
@@ -269,30 +276,44 @@ hook은 결정 파일을 매번 다시 읽지 않는다. 크기와 수정 시각
 - Cursor: Auto-review가 읽는 `autoRun.allow_instructions`에 안내를 넣는다. 터미널 허용 목록(`terminalAllowlist`)은 이미 파일로 관리되고 있을 때만 거기에도 추가한다. 새로 만들면 사용자가 IDE에서 정한 허용 목록을 덮어쓰기 때문이다. `.cursor/cli.json`도 이미 있을 때만 `Shell(.devctx/bin/devctx:code *)`를 추가한다.
 - Kiro: `capability: shell`, `effect: allow`, `match: [".devctx/bin/devctx code *"]` 규칙. 폴더 이름은 저장소 절대 경로의 sha256 앞 16자다. `~/.kiro`가 있는 PC에만 쓴다.
 
-각 파일에는 devctx 항목만 추가하고 다른 설정은 그대로 둔다. 주석이 있는 JSON 설정 파일은 다시 쓰면 주석이 사라지므로 건드리지 않는다. 이때는 `devctx init` 결과에 건너뛴 파일이 나오고 `devctx code status`에 빠진 항목으로 표시되니, 위 형식대로 직접 넣으면 된다. Copilot CLI와 Kiro 항목은 사용자 폴더에 있어서 커밋으로 공유되지 않는다. 그래서 세션 시작 hook이 하루 한 번 확인하고 없으면 쓴다. 이전 버전이 등록한 `devctx-code` MCP 서버 항목(`.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json`, `.kiro/settings/mcp.json`, `.codex/config.toml`)도 이때 지운다. `code_index.preapprove: false`면 미리 허용을 하지 않고, `code_index.enabled: false` 뒤 `devctx init`을 다시 실행하면 스킬과 허용 항목을 모두 지운다.
+각 파일에는 devctx 항목만 추가하고 다른 설정은 그대로 둔다. 주석이 있는 JSON 설정 파일은 다시 쓰면 주석이 사라지므로 건드리지 않는다. 이때는 `devctx init` 결과에 건너뛴 파일이 나오고, `devctx doctor`와 `devctx code status`가 넣어야 할 JSON 항목을 그대로 보여준다(`devctx init`을 다시 해도 해결되지 않는다). Copilot CLI와 Kiro 항목은 사용자 폴더에 있어서 커밋으로 공유되지 않는다. 그래서 세션 시작 hook이 하루 한 번 확인하고 없으면 쓴다. 이전 버전이 등록한 `devctx-code` MCP 서버 항목(`.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json`, `.kiro/settings/mcp.json`, `.codex/config.toml`)도 이때 지운다. `code_index.preapprove: false`면 미리 허용을 하지 않고, `code_index.enabled: false` 뒤 `devctx init`을 다시 실행하면 스킬과 허용 항목을 모두 지운다.
 
-경로 규칙은 합쳐서 800토큰 이하면 AGENTS.md에 함께 넣고, 넘으면 도구별 경로 규칙 파일로 나눈다.
+경로 규칙은 합쳐서 800토큰 이하면 세션 시작 규칙 목록에 함께 넣고, 넘으면 도구별 경로 규칙 파일로 나눈다.
 
 ### 토큰 예산
 
 | 위치 | 상한(토큰) | 내용 |
 |---|---|---|
-| AGENTS.md 핵심 규칙 | 1500 | 항상 읽히는 규칙. 넘치는 규칙은 관련 있을 때만 주입 |
-| 경로 규칙 | 800 | 이 이하면 AGENTS.md에 포함 |
+| 항상 따를 규칙 | 1500 | 세션 시작 hook이 붙인다(`.devctx/rules.md`에도 같은 목록). 넘치는 규칙은 관련 있을 때만 주입 |
+| 경로 규칙 | 800 | 이 이하면 세션 시작 목록에 포함 |
 | 프롬프트마다 | 600 | 이번 프롬프트와 관련된 결정만 |
 | 세션 시작 | 400 | 개인 선호, 아직 정리되지 않은 충돌 |
 | 세션 이어가기 | 300 | 새 세션이 직전 작업을 이어갈 때 한 번, 직전 세션의 마지막 요청과 응답 앞부분 |
 
-AGENTS.md는 결정이 바뀔 때만 다시 만들고 순서가 고정이라 프롬프트 캐시가 잘 유지된다. 사용자가 이미 있는 규칙을 다시 말해야 했다면(AI가 어겼다면) 위반 횟수가 늘고, 그 규칙은 더 자주 읽히는 위치로 올라간다.
+AGENTS.md는 결정이 바뀌어도 그대로고, 도구별 규칙 파일은 세션 시작·git hook·세션 종료 때만 다시 만든다. 세션 시작 목록도 세션 동안 바뀌지 않는다. Copilot(VS Code)·Cursor·Kiro처럼 이 파일들을 요청마다 보내는 도구도 세션 중에 앞부분이 바뀌지 않아 프롬프트 캐시가 유지된다. 사용자가 이미 있는 규칙을 다시 말해야 했다면(AI가 어겼다면) 위반 횟수가 늘고, 그 규칙은 더 자주 읽히는 위치로 올라간다.
 
 ### 안전장치
 
 - hook은 실패해도 AI 도구를 막지 않는다. devctx가 내부에서 부르는 LLM 호출은 hook을 다시 실행하지 않는다.
 - 근거 인용이 사용자가 쓴 원문에 없으면 버린다. 붙여넣은 코드·로그·인용문 속 지시는 규칙이 되지 않는다.
-- 키·토큰 같은 비밀값 형태는 LLM에 보내기 전과 파일에 쓰기 전, 세션 이어가기로 붙이기 전에 가린다.
+- 키·토큰 같은 비밀값은 hook이 프롬프트와 AI 응답을 `state.sqlite`에 저장할 때 종류를 나타내는 자리표시자(`{password}`, `{token}`, `{api_key}`, `{secret}`, `{private_key}`)로 바꾼다. LLM에 보내기 전, 파일에 쓰기 전, 세션 이어가기로 붙이기 전에도 한 번 더 적용한다(이미 바뀐 글은 그대로다). 모양으로 알 수 있는 값(`sk-…`, `ghp_…`, `AKIA…`, `AIza…`, `npm_…`, `xox?-…`, JWT, 개인 키 블록), `Bearer` 뒤의 값, 접속 URL의 비밀번호(`scheme://user:{password}@host`), `password=`·`"api_key": "…"` 같은 대입이 대상이다. 대입 값이 `${X}`, `process.env.X`, `os.getenv("X")` 같은 참조면 그대로 둔다. "비번은 hunter2"처럼 문장으로 쓴 값도 이름(비밀번호·토큰·password 등) 뒤에 숫자나 기호가 섞인 값이 오고 그 값으로 절이 끝나면("hunter2야", "Abc!2345 입니다") 가린다. 값 뒤에 '에·로·를' 같은 조사나 '쿠키·헤더' 같은 말이 오면 규칙에 나온 이름("HttpOnly 쿠키에", "Argon2id로")으로 보고 둔다. 12자 이상의 영문·숫자 섞인 값은 뒤에 무엇이 와도 가린다. 대소문자나 하이픈만 섞인 값(`localStorage`, `X-Api-Key`), 환경변수 이름, `process.env.X` 같은 참조, 경로는 그대로 둔다.
+- 팀원 PC의 실행 스크립트(`.devctx/bin/devctx`)는 hook에서 불릴 때 설치를 백그라운드로 돌리고 출력하지 않는다(`npm install --allow-git=all`, npm 12의 git 설치 차단 대응). 실패하면 기록을 남기고 hook에서는 1시간 동안 다시 시도하지 않는다(사람이 직접 실행한 명령은 바로 다시 시도한다). 설치 잠금이 30분 넘게 남아 있으면(설치 중 잠자기·재부팅) 한 호출만 넘겨받는다. `devctx doctor`가 hook이 실제로 실행할 설치본과 실패 로그를 보여준다. node는 PATH에서 먼저 찾고, 없으면 nvm 폴더를 버전 숫자 순으로 보며 `node:sqlite`를 플래그 없이 쓸 수 있는 버전(22.13+, 23.4+, 24+)만 쓴다.
+- 세션 종료 자동 커밋(`auto-commit`)은 결정 파일과 히스토리만 커밋한다. 생성 파일을 경로 지정 커밋에 넣으면 `.gitignore`에 있어도 다시 추적되기 때문이다.
+- `devctx capture off`면 그 사람의 프롬프트는 규칙 후보로 표시하지 않아 LLM 호출이 없다. 규칙 전달은 그대로다.
+- `llm.max_calls_per_hour: 0`이나 `llm.providers: []`면 결정 추출·판정에 LLM을 부르지 않는다(명시 표현만 확인 대기로 남김). `history.max_calls_per_hour: 0`이면 히스토리 요약 없이 AI 응답 앞부분을 쓴다. 예전에는 `0`이 `1`로, `[]`가 전체 목록으로 바뀌었다.
+- hook이 저장하는 프롬프트·응답 원문은 이 PC의 `state.sqlite`에만 있고, 분석이 끝난 것은 90일 뒤 지운다. `devctx purge`는 원문을 바로 지운다(기록 시각은 고장 알림용으로 남긴다).
+- `devctx code` 조회는 잘못된 요청(모르는 옵션, 정해진 값 밖의 값, 숫자가 아닌 숫자 옵션, 잘못된 정규식, 없는 브랜치)에 종료 코드 1과 이유를 돌려준다. 예전에는 `--direction outgoing`이 조용히 callers로 조회되는 식이었다. 결과가 없는 것은 종료 코드 0이다.
+- `--help`는 어느 명령이든 도움말만 보여준다. `init --tools`의 모르는 이름은 오류다(예전에는 다섯 도구 전체를 설치했다).
+- `devctx uninstall`은 devctx가 쓴 것만 지운다. 도구 설정 파일의 다른 항목, AGENTS.md의 사람 내용, `.gitignore`의 다른 줄은 그대로 둔다. `--yes` 없이 실행하면 지울 것만 보여준다.
 - 세션 이어가기와 주입 기록(어떤 결정을 몇 토큰 붙였는지)은 이 PC의 `state.sqlite`에만 있다. 주입 기록과 처리가 끝난 hook 기록은 90일이 지나면 지운다. 아직 처리하지 않은 기록은 오래돼도 남긴다. 결정은 결정 파일(원문 인용 포함)에 있으므로 기록을 지워도 사라지지 않는다.
-- 시간당 LLM 호출 수에 상한이 있다(`max_calls_per_hour`, 기본 30). 넘으면 다음 실행으로 미룬다.
+- 시간당 LLM 호출 수에 상한이 있다(`llm.max_calls_per_hour`, 기본 30, 히스토리 요약은 `history.max_calls_per_hour`로 따로). 다른 모델로 다시 시도하는 호출과 모델 평가 호출도 호출마다 확인하고, 넘으면 다음 실행으로 미룬다. 평가 한 번이 시간당 상한보다 크면 그 시간에 다른 호출이 없을 때만 시작한다.
+- 결정 파일을 쓰다 실패하면(쓰기 권한 등) 확인 대기 규칙을 지우지 않고 그 대화 기록도 처리 완료로 표시하지 않는다. 다음 실행에서 다시 시도하고, 3번 실패하면 오류와 함께 남긴다.
 - 코드 인덱스 데이터는 저장소의 `.devctx/local/`에만 쓰고 네트워크를 쓰지 않는다. 색인이 실패해도 AI 도구는 평소처럼 동작하고, 파싱에 실패한 파일은 `devctx code status`에 숫자로 나온다.
+- 대화·AI 응답·diff처럼 바깥에서 온 글은 LLM 프롬프트에 JSON 문자열로 넣는다. 그 안의 따옴표·코드 울타리·제목이 데이터 구간을 끝내거나 새 메시지인 척할 수 없다.
+- LLM CLI는 자기 프로세스 그룹으로 실행하고, 시간이 넘으면 그 CLI가 띄운 하위 프로세스까지 함께 끝낸다. 출력에서 답을 고를 때는 작업의 형식 검사를 통과한 JSON만 받는다(로그나 예시 객체가 먼저 나와도 그것을 답으로 쓰지 않는다).
+- worker와 코드 색인은 잠금 파일로 하나씩만 돈다. 잠금에는 주인 표시가 있어 주인만 풀 수 있고, 오래된 잠금은 원자적 이름 바꾸기로 한 프로세스만 넘겨받는다.
+- `config.yaml`을 읽지 못하면 기본값으로 돌되 `commit_mode: manual`로 둔다(저장소를 스스로 바꾸지 않음). 알 수 없는 `commit_mode` 값도 `manual`로 본다. `devctx doctor`가 이유를 보여준다.
+- git hook은 저장소의 git 폴더(연결된 worktree는 원래 저장소의 것) 안에만 쓰고, 심볼릭 링크를 따라 쓰지 않으며 원자적으로 바꾼다.
 - 도구 설정에는 스킬 명령 하나를 허용하는 devctx 항목만 넣는다. 저장소 밖에 쓰는 것은 Copilot CLI와 Kiro의 이 저장소 전용 권한 항목뿐이다(`code_index.preapprove: false`로 끈다). 허용하는 명령은 hook이 이미 자동으로 실행하는 `.devctx/bin/devctx`의 `code` 하위 명령뿐이다.
 - 파싱 메모리는 색인하는 동안만 쓴다(전체 색인 최고치 실측: gin 141MB, django 449MB, okhttp·alamofire 최대 약 960MB). 색인과 스킬 명령은 끝나면 종료되는 프로세스라 메모리를 바로 돌려받고, 한 프로세스가 1GB를 넘으면 새 프로세스가 이어서 한다.
 
@@ -312,7 +333,7 @@ AGENTS.md는 결정이 바뀔 때만 다시 만들고 순서가 고정이라 프
 
 ### 메모리 벤치마크
 
-`npm run bench:memory`는 [Agent Memory Benchmark](https://github.com/vectorize-io/agent-memory-benchmark)와 PrecisionMemBench 방식으로 devctx의 메모리를 LLM 없이 검사한다. 결정 24개가 든 저장소에 프롬프트 15개를 넣어, 붙여야 할 결정과 붙이면 안 되는 결정(대체된 규칙, 기한 지난 규칙, 다른 경로의 규칙)을 ID로 확인한다. 만료 경계, 중복 지름길, 지어낸 이름 걸러내기, 판정 번호 되돌리기, 세션 이어가기도 함께 본다. 파일 링크로 계산하는 상태(대체, 두 브랜치의 이중 대체, 다른 브랜치에서 대체된 규칙과의 충돌, 중복, 충돌 정리, 파일 순서와 무관), 실제 git 저장소에서 두 브랜치를 병합했을 때(충돌 없음, 기존 결정 파일 그대로, 팀원 AGENTS.md를 직접 수정으로 착각하지 않음, 새 clone과 AGENTS.md가 바이트까지 같음), 코드 근거, 확인 대기 보관과 되살리기, 오래된 기록 정리, 고장 알림, 파일 2,000개 속도, 어떤 프롬프트를 언제 추출로 보내는지(명시 표현, 메모 형태의 정책, 제안 수락, 질문·짧은 대답 제외, 5개 묶음과 1시간 상한), 프롬프트 히스토리(켜고 끄기, 턴별 바뀐 파일, 원문 보존과 비밀값 가리기, 세션별 파일과 시간순, 대화 기록 읽기)도 본다. 현재 161/161 통과, 붙인 결정의 정밀도 0.92·재현율 1.00이다. 추출·판정 모델의 품질은 4장의 요구사항 평가가 맡는다.
+`npm run bench:memory`는 [Agent Memory Benchmark](https://github.com/vectorize-io/agent-memory-benchmark)와 PrecisionMemBench 방식으로 devctx의 메모리를 LLM 없이 검사한다. 결정 24개가 든 저장소에 프롬프트 15개를 넣어, 붙여야 할 결정과 붙이면 안 되는 결정(대체된 규칙, 기한 지난 규칙, 다른 경로의 규칙)을 ID로 확인한다. 만료 경계, 중복 지름길, 지어낸 이름 걸러내기, 판정 번호 되돌리기, 세션 이어가기도 함께 본다. 파일 링크로 계산하는 상태(대체, 두 브랜치의 이중 대체, 다른 브랜치에서 대체된 규칙과의 충돌, 중복, 충돌 정리, 파일 순서와 무관), 실제 git 저장소에서 두 브랜치를 병합했을 때(충돌 없음, 기존 결정 파일 그대로, hook 없는 서버 병합 뒤에도 작업 트리가 깨끗함, 새 clone과 규칙 목록이 바이트까지 같음), 코드 근거, 확인 대기 보관과 되살리기, 오래된 기록 정리, 고장 알림, 파일 2,000개 속도, 어떤 프롬프트를 언제 추출로 보내는지(명시 표현, 메모 형태의 정책, 제안 수락, 질문·짧은 대답 제외, 5개 묶음과 1시간 상한), 프롬프트 히스토리(켜고 끄기, 턴별 바뀐 파일, 원문 보존과 비밀값 가리기, 세션별 파일과 시간순, 대화 기록 읽기), 되돌린 규칙·기한 연장·같은 문장으로 정리한 충돌, 경로가 다른 같은 문장, 쓰기 실패 뒤 재시도, Cursor 규칙 파일, 세션 종료 자동 커밋, init 재실행 때 설치 위치 유지, `## 규칙` 직접 수정, 재시도를 포함한 시간당 호출 상한, 안전장치(저장소 밖·심볼릭 링크 hook에 쓰지 않음, 잠금, 프로세스 그룹 종료, 로그 대신 답 고르기, 추측한 분류는 확인 대기, 프롬프트 데이터 JSON 인코딩, 모델 ID 구분, 깨진 설정, 설치 위치 고정, 도구 hook 파일 병합), AGENTS.md 고정과 서버 병합(생성 파일 미커밋, 사람이 고친 AGENTS.md 유지, 이전 형식 변환은 init·compile에서만, 업그레이드 전 브랜치 checkout 왕복, 병합으로 남은 예전 규칙 목록 찾기), 실행 스크립트(node 버전 고르기, 조용한 설치 실패, 오래된 설치 잠금, hook만 재시도 대기, doctor와 같은 설치 위치), `tools.lock` 버전, 파일 지정 커밋(`git commit <파일>`), `remember` 즉시 확정, `approve`·`discard`·`resolve`, 프롬프트 분석 끄기, 자동 커밋에서 생성 파일 제외, 주석 있는 설정 파일 안내, 문장 속 비밀값, 모르는 명령), 처음 쓰는 사람 기준의 점검(`--help`는 실행하지 않음, 잘못된 도구 이름, CLAUDE.md가 빠지지 않는 커밋 안내, 확인 대기·확정을 구분하는 로그 문구, 코드 조회의 잘못된 옵션·실패는 종료 코드 1, 긴 설치 위치의 키, 히스토리 끌 때 대기 항목 버리기, 로컬 원문 지우기, `0`·`[]`이면 LLM을 부르지 않음, 비밀값 자리표시자와 로컬 DB 저장, 제거 명령)도 본다. 현재 240/240 통과, 붙인 결정의 정밀도 0.92·재현율 1.00이다. 추출·판정 모델의 품질은 4장의 요구사항 평가가 맡는다.
 
 ### 참고한 메모리 도구
 

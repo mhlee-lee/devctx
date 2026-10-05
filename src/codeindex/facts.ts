@@ -5,7 +5,7 @@
  */
 
 /** Bump when extractors change what they emit: every file is re-parsed on the next sync. */
-export const FACTS_VERSION = 2;
+export const FACTS_VERSION = 3;
 
 /** Language id from `languages.ts` (`java`, `rust`, `tsx`, ...). */
 export type LangId = string;

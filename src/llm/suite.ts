@@ -29,7 +29,7 @@ import type { Language } from '../types.ts';
  * Bump SUITE_VERSION whenever a case, a pass rule or a production prompt changes: every cached
  * verdict is then re-evaluated.
  */
-export const SUITE_VERSION = 4;
+export const SUITE_VERSION = 5;
 
 /** Message date the suite's cases are written against (relative end dates resolve from it). */
 const SUITE_DATE = '2026-09-28';

@@ -5,8 +5,8 @@ import { approxTokens, today } from '../util/text.ts';
 
 /**
  * Decides how each active team item reaches the tools:
- * - core: always-loaded AGENTS.md (budgeted)
- * - scoped: items with path globs (AGENTS.md when small, otherwise per-tool path rules)
+ * - core: given to every session when it starts (budgeted)
+ * - scoped: items with path globs (in the session-start block when small, otherwise per-tool path rules)
  * - onDemand: injected by hooks only when a prompt is relevant
  */
 export interface TierPlan {
@@ -15,7 +15,7 @@ export interface TierPlan {
   onDemand: KnowledgeItem[];
   /** Items that wanted core but did not fit the budget (also listed in onDemand). */
   overflow: KnowledgeItem[];
-  /** True when all scoped rules fit `scoped_budget_tokens` and are written into AGENTS.md. */
+  /** True when all scoped rules fit `scoped_budget_tokens` and go into the session-start block. */
   scopedInAgents: boolean;
   coreTokens: number;
   scopedTokens: number;

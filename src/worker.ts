@@ -1,10 +1,9 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { indexNeedsRefresh, refreshIndex } from './codeindex/service.ts';
 import type { SyncResult } from './codeindex/sync.ts';
 import { compile, type CompileResult } from './compile/compile.ts';
+import { committedPaths } from './init/attributes.ts';
 import { isExpired } from './compile/tiers.ts';
-import { loadConfig, type DevctxConfig } from './config.ts';
+import { llmOff, loadConfig, type DevctxConfig } from './config.ts';
 import { processHistory, type HistoryReport } from './history/process.ts';
 import { HISTORY_DIR } from './history/writer.ts';
 import { extractionDue } from './hooks/signals.ts';
@@ -18,12 +17,15 @@ import { extractCandidates } from './memory/extract.ts';
 import { StateDb } from './state/db.ts';
 import { recordExtractionHealth } from './state/health.ts';
 import { gitCommitPaths, gitUserEmail } from './util/git.ts';
+import { tryLock } from './util/lock.ts';
 import { errorMessage, logLine } from './util/log.ts';
 import { personalDir, projectPaths, type ProjectPaths } from './util/paths.ts';
 
 /** A live worker may run long (first-time model evaluations); a dead one never holds the lock. */
 const LOCK_STALE_MS = 60 * 60 * 1000;
 const MAX_ROUNDS = 10;
+/** Worker runs that may fail to store what one event said before the event is given up. */
+const MAX_EVENT_ATTEMPTS = 3;
 /** Model evaluations one worker run may start (each runs a task's requirement suite). */
 const QUALIFICATIONS_PER_RUN = 3;
 
@@ -50,40 +52,16 @@ export interface WorkerReport {
 /** Worker runs that also bring the code index up to date (turn ends leave it to the engine). */
 const CODE_INDEX_REASONS = new Set(['session_start', 'code-index', 'manual']);
 
-function acquireLock(file: string): boolean {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(file, 'wx');
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-      fs.closeSync(fd);
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
-      let stale = true;
-      try {
-        const info = JSON.parse(fs.readFileSync(file, 'utf8')) as { pid: number; at: string };
-        const alive = (() => {
-          try {
-            process.kill(info.pid, 0);
-            return true;
-          } catch {
-            return false;
-          }
-        })();
-        stale = !alive || Date.now() - Date.parse(info.at) > LOCK_STALE_MS;
-      } catch {
-        stale = true;
-      }
-      if (!stale) return false;
-      fs.rmSync(file, { force: true });
-    }
-  }
-  return false;
-}
-
 /** Processed events older than this are deleted (decisions live in files; unprocessed events stay). */
 const EVENT_RETENTION_DAYS = 90;
+
+/**
+ * Paths devctx commits: decision files and history (plus a pending AGENTS.md conversion). The
+ * rule files compile builds are local and gitignored: a path-limited commit would track them again.
+ */
+export function ownedPaths(root: string): string[] {
+  return committedPaths(root, ['.devctx/knowledge', HISTORY_DIR]);
+}
 
 /**
  * Housekeeping without touching knowledge files: archives unconfirmed proposals of this PC after
@@ -141,7 +119,8 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
 export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
   const paths = projectPaths(opts.root);
   const report: WorkerReport = { skipped: null, processed: 0, candidates: 0, applied: [], retired: 0, compiled: null, committed: false, errors: [] };
-  if (!acquireLock(paths.workerLock)) {
+  const lock = tryLock(paths.workerLock, LOCK_STALE_MS);
+  if (!lock) {
     report.skipped = 'another worker is running';
     return report;
   }
@@ -153,7 +132,11 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       const route: RouteOptions | null = opts.allowLlm
         ? { cfg, host: opts.host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
         : null;
-      if (route) await refreshCommunityPrices(cfg.llm.pricing_refresh_days);
+      // `max_calls_per_hour: 0` or `providers: []` turn calls off: rules fall back to the no-LLM
+      // path (explicit markers kept as proposals), history entries to the assistant's reply.
+      const decisionRoute = route && !llmOff(cfg, 'decisions') ? route : null;
+      const historyRoute = route && !llmOff(cfg, 'history') ? route : null;
+      if (decisionRoute || historyRoute) await refreshCommunityPrices(cfg.llm.pricing_refresh_days);
       const viewOpts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
       let repo: RepoContext | null | undefined;
       const ctx: ConsolidateContext = {
@@ -163,7 +146,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         team: loadTeam(paths, db, viewOpts).items,
         personal: loadPersonal(db, viewOpts).items,
         actor: gitUserEmail(paths.root),
-        route,
+        route: decisionRoute,
         repo: () => (repo === undefined ? (repo = repoContext(paths.root)) : repo),
       };
       let attempted = 0;
@@ -177,32 +160,43 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         const events = flushImplicit ? pending : pending.filter((e) => !(e.candidate && e.flags.includes('implicit')));
         if (events.length === 0) break;
         const candidates = events.filter((e) => e.candidate && e.prompt);
-        const outcome = await extractCandidates(candidates, db, route);
-        if (route && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length) {
+        const outcome = await extractCandidates(candidates, db, decisionRoute);
+        if (decisionRoute && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length) {
           attempted++;
           if (outcome.usedLlm) succeeded++;
           else lastError = outcome.errors[outcome.errors.length - 1] ?? 'no model answered';
         }
         report.errors.push(...outcome.errors);
         report.candidates += outcome.candidates.length;
+        const failed = new Map<string, string>();
         for (const c of outcome.candidates) {
           try {
             report.applied.push(await consolidate(c, ctx));
           } catch (error) {
             report.errors.push(`consolidate failed: ${errorMessage(error)}`);
+            failed.set(c.eventId, errorMessage(error));
           }
         }
+        // An event whose rule could not be stored (a write error) stays pending and is tried again
+        // by a later run; after MAX_EVENT_ATTEMPTS it is kept with its error instead of retried.
+        const retry = new Set<string>();
+        for (const [id, message] of failed) {
+          if (db.noteEventFailure(id) < MAX_EVENT_ATTEMPTS) retry.add(id);
+          else db.markProcessed([id], `consolidate failed ${MAX_EVENT_ATTEMPTS} times: ${message}`.slice(0, 500));
+        }
         const deferred = new Set(outcome.deferredEventIds);
-        const done = events.filter((e) => !deferred.has(e.id)).map((e) => e.id);
+        const done = events.filter((e) => !deferred.has(e.id) && !failed.has(e.id)).map((e) => e.id);
         db.markProcessed(done);
         report.processed += done.length;
-        if (deferred.size > 0) break;
+        if (deferred.size > 0 || retry.size > 0) break;
       }
       if (attempted > 0) recordExtractionHealth(db, succeeded > 0, lastError);
       report.retired = maintain(paths, db, cfg);
-      report.compiled = compile(paths, cfg, db, { tool: opts.host ?? 'worker' });
+      // At a turn end the session is still running: only .devctx/rules.md is rebuilt, the tools'
+      // rule files wait for the next session (new decisions reach this one through the prompt hook).
+      report.compiled = compile(paths, cfg, db, { tool: opts.host ?? 'worker', toolFiles: opts.reason !== 'turn_end' });
       try {
-        report.history = await processHistory(paths, cfg, db, route);
+        report.history = await processHistory(paths, cfg, db, historyRoute);
         report.errors.push(...report.history.errors);
       } catch (error) {
         report.errors.push(`history: ${errorMessage(error)}`);
@@ -220,11 +214,10 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
           report.errors.push(`code index: ${errorMessage(error)}`);
         }
       }
-      const historyWritten = (report.history?.written.length ?? 0) > 0;
-      const touched = report.applied.some((a) => a.files.length > 0) || report.retired > 0 || report.compiled.changed.length > 0 || historyWritten;
-      if (touched && cfg.git.commit_mode === 'auto-commit' && opts.reason === 'session_end') {
-        const extra = historyWritten ? [HISTORY_DIR] : [];
-        const res = gitCommitPaths(paths.root, ['.devctx/knowledge', ...extra, ...report.compiled.changed, ...report.compiled.removed], 'chore(devctx): update project decisions');
+      // Auto-commit takes everything devctx owns that is still uncommitted, also what earlier turns
+      // of the session wrote (gitCommitPaths commits only when something in these paths changed).
+      if (cfg.git.commit_mode === 'auto-commit' && opts.reason === 'session_end') {
+        const res = gitCommitPaths(paths.root, ownedPaths(paths.root), 'chore(devctx): update project decisions');
         report.committed = Boolean(res?.ok);
         if (res && !res.ok) report.errors.push(`auto-commit failed: ${res.stderr}`);
       }
@@ -246,6 +239,6 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
     logLine(paths.log, 'error', 'worker failed', { error: errorMessage(error) });
     return report;
   } finally {
-    fs.rmSync(paths.workerLock, { force: true });
+    lock.release();
   }
 }

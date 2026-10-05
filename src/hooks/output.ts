@@ -6,6 +6,15 @@ const CLAUDE_EVENT: Partial<Record<HookKind, string>> = {
 };
 
 /**
+ * Whether the tool's prompt hook can add context. Cursor's beforeSubmitPrompt only answers
+ * `continue`/`user_message`; Cursor gets on-demand rules through an agent-selected rule file instead
+ * (compile/render.ts `renderOnDemandRules`).
+ */
+export function promptInjectable(tool: ToolId): boolean {
+  return tool !== 'cursor';
+}
+
+/**
  * Renders what a hook prints on stdout for each tool. Returns null when nothing should be
  * printed. Cursor's beforeSubmitPrompt always needs `{"continue": true}` so the prompt goes through.
  */

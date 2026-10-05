@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { redactSecrets } from '../memory/evidence.ts';
 import type { HookKind } from '../types.ts';
 import { ulid } from '../util/ulid.ts';
 
@@ -250,8 +251,9 @@ export class StateDb {
         ev.kind,
         ev.session,
         ev.cwd,
-        ev.prompt,
-        ev.lastAssistant,
+        // Credentials never reach the disk, also when nothing else is recorded (history off).
+        ev.prompt === null ? null : redactSecrets(ev.prompt),
+        ev.lastAssistant === null ? null : redactSecrets(ev.lastAssistant),
         ev.transcriptPath,
         ev.model,
         JSON.stringify(ev.flags),
@@ -314,7 +316,19 @@ export class StateDb {
 
   markProcessed(ids: readonly string[], error?: string): void {
     const stmt = this.db.prepare('update events set processed = ?, error = ? where id = ?');
-    for (const id of ids) stmt.run(error ? 2 : 1, error ?? null, id);
+    const clear = this.db.prepare('delete from kv where key = ?');
+    for (const id of ids) {
+      stmt.run(error ? 2 : 1, error ?? null, id);
+      clear.run(`event_retry:${id}`);
+    }
+  }
+
+  /** Counts a failed attempt to apply what a pending event said; returns the failures so far. */
+  noteEventFailure(id: string): number {
+    const key = `event_retry:${id}`;
+    const n = Number(this.kvGet(key) ?? '0') + 1;
+    this.kvSet(key, String(n));
+    return n;
   }
 
   /** When the session's latest turn ended (any tool's hook config). */
@@ -433,10 +447,11 @@ export class StateDb {
       );
   }
 
-  llmCallsSince(isoTs: string, opts: { task?: string; excludeTask?: string } = {}): number {
-    const where = opts.task ? ' and task = ?' : opts.excludeTask ? ' and task != ?' : '';
-    const args = opts.task ? [isoTs, opts.task] : opts.excludeTask ? [isoTs, opts.excludeTask] : [isoTs];
-    const row = this.db.prepare(`select count(*) as n from llm_calls where ts >= ?${where}`).get(...args) as Row | undefined;
+  llmCallsSince(isoTs: string, opts: { tasks?: readonly string[]; excludeTasks?: readonly string[] } = {}): number {
+    const list = opts.tasks ?? opts.excludeTasks ?? [];
+    const marks = list.map(() => '?').join(', ');
+    const where = list.length === 0 ? '' : opts.tasks ? ` and task in (${marks})` : ` and task not in (${marks})`;
+    const row = this.db.prepare(`select count(*) as n from llm_calls where ts >= ?${where}`).get(isoTs, ...list) as Row | undefined;
     return Number(row?.n ?? 0);
   }
 
@@ -470,7 +485,7 @@ export class StateDb {
         `insert into history_turns(id, tool, session, skey, model, branch, prompt_ts, prompt, before_tree, transcript_path, state)
          values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
       )
-      .run(id, t.tool, t.session, t.skey, t.model, t.branch, t.promptTs, t.prompt, t.beforeTree, t.transcriptPath);
+      .run(id, t.tool, t.session, t.skey, t.model, t.branch, t.promptTs, redactSecrets(t.prompt), t.beforeTree, t.transcriptPath);
     return id;
   }
 
@@ -487,7 +502,7 @@ export class StateDb {
            last_assistant = coalesce(?, last_assistant), transcript_path = coalesce(?, transcript_path)
          where id = ? and state = 'open'`,
       )
-      .run(end.endTs, end.afterTree, end.lastAssistant, end.transcriptPath, id);
+      .run(end.endTs, end.afterTree, end.lastAssistant === null ? null : redactSecrets(end.lastAssistant), end.transcriptPath, id);
   }
 
   readyHistoryTurns(limit: number): HistoryTurn[] {
@@ -551,6 +566,29 @@ export class StateDb {
   }
 
   /** Written entries live in `.devctx/history/`; their rows are only bookkeeping. */
+  /** Drops history turns not written yet (prompt text included). Returns how many. */
+  discardPendingHistory(): number {
+    const res = this.db.prepare("delete from history_turns where state in ('open', 'ready')").run();
+    return Number(res.changes ?? 0);
+  }
+
+  /**
+   * Erases the prompt and reply text this PC keeps: in hook events (also ones not analyzed yet;
+   * their timestamps stay for the health checks), history turns not written yet, the text kept
+   * with written turns, restatement quotes and session hand-off state. Decision files, counters
+   * and proposals stay.
+   */
+  purgePromptText(): { events: number; turns: number } {
+    const events = Number(
+      this.db.prepare('update events set prompt = null, last_assistant = null, transcript_path = null where prompt is not null or last_assistant is not null').run().changes ?? 0,
+    );
+    const turns = this.discardPendingHistory();
+    this.db.prepare("update history_turns set prompt = '', last_assistant = null where state = 'done'").run();
+    this.db.prepare("update item_stats set evidence = '[]'").run();
+    this.db.prepare("delete from kv where key like 'sess:%'").run();
+    return { events, turns };
+  }
+
   pruneHistoryTurns(beforeIso: string): number {
     const res = this.db.prepare("delete from history_turns where state = 'done' and prompt_ts < ?").run(beforeIso);
     return Number(res.changes ?? 0);
@@ -663,6 +701,10 @@ export class StateDb {
 
   deleteKfile(path: string): void {
     this.db.prepare('delete from kfiles where path = ?').run(path);
+  }
+
+  clearKfiles(): void {
+    this.db.exec('delete from kfiles');
   }
 
   // ---- housekeeping ----------------------------------------------------------------------------

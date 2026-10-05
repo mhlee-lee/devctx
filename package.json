@@ -2,7 +2,7 @@
   "name": "devctx",
   "version": "0.1.0",
   "private": true,
-  "description": "Project decision memory for AI coding tools: captures corrections through tool hooks, consolidates them in git, and compiles them into AGENTS.md and tool-specific rules.",
+  "description": "Project decision memory for AI coding tools: captures corrections through tool hooks, consolidates them in git, and delivers them to every tool at session start and per prompt.",
   "type": "module",
   "bin": {
     "devctx": "dist/cli.js"
@@ -21,7 +21,8 @@
     "prepare": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "bench:memory": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/memory-bench.ts",
-    "dev": "node --disable-warning=ExperimentalWarning src/cli.ts"
+    "dev": "node --disable-warning=ExperimentalWarning src/cli.ts",
+    "bench:codeindex": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/codeindex-smoke.ts"
   },
   "dependencies": {
     "web-tree-sitter": "0.27.0",

@@ -5,9 +5,10 @@ import { isToolId } from '../types.ts';
 import { readJson, writeJsonAtomic } from '../util/fsx.ts';
 import { machineDir } from '../util/paths.ts';
 import { callCostUsd, rankModels, type CostEstimate } from './catalog.ts';
+import { pickAnswer } from './json.ts';
 import { getProvider } from './providers/index.ts';
 import { qualifyModel, type QualifyResult } from './qualify.ts';
-import { SUITE_TASKS, SUITE_VERSION, type SuiteTask } from './suite.ts';
+import { SUITE_TASKS, SUITE_VERSION, suiteCalls, type SuiteTask } from './suite.ts';
 import {
   candidateKey,
   TIERS,
@@ -267,7 +268,7 @@ async function runQualification(
   const s = statsFor(cache, key);
   for (const c of res.calls) {
     addCost(s, c.costUsd);
-    db?.recordLlmCall({ provider: provider.id, model: key, task: 'qualify', ok: c.ok, ms: c.ms, costUsd: c.costUsd, error: c.error ?? null });
+    db?.recordLlmCall({ provider: provider.id, model: key, task: `qualify:${task}`, ok: c.ok, ms: c.ms, costUsd: c.costUsd, error: c.error ?? null });
   }
   if (res.blocked === 'auth' || res.blocked === 'quota') {
     block(cache, provider.id, res.blocked, res.details.join(' '));
@@ -275,6 +276,22 @@ async function runQualification(
     storeQualification(cache, key, version, res);
   }
   return res;
+}
+
+/** History summaries (and their model evaluations) have their own hourly budget. */
+const HISTORY_TASKS = ['summarize', 'qualify:summarize'];
+
+/**
+ * Calls left this hour for the task's budget: `history.max_calls_per_hour` for summaries,
+ * `llm.max_calls_per_hour` for everything else. Counted from recorded calls, so it holds across
+ * worker runs; checked before every call, retries and model evaluations included.
+ */
+export function callsLeft(cfg: DevctxConfig, db: StateDb | null, task: SuiteTask): number {
+  if (!db) return Number.POSITIVE_INFINITY;
+  const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
+  const history = task === 'summarize';
+  const used = db.llmCallsSince(hourAgo, history ? { tasks: HISTORY_TASKS } : { excludeTasks: HISTORY_TASKS });
+  return (history ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour) - used;
 }
 
 /**
@@ -289,19 +306,16 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const { cfg, db } = opts;
   const task = taskOf(req);
   const attempts: string[] = [];
-  if (db) {
-    const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
-    // History summaries have their own hourly budget so they never starve decision extraction.
-    const history = req.task === 'summarize';
-    const used = db.llmCallsSince(hourAgo, history ? { task: 'summarize' } : { excludeTask: 'summarize' });
-    if (used >= (history ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour)) {
-      return { ok: false, error: RATE_LIMIT_ERROR, attempts };
-    }
-  }
+  const limit = task === 'summarize' ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour;
+  if (callsLeft(cfg, db, task) <= 0) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
+  // An evaluation runs the whole suite. It must fit the hour's remaining calls; one that is larger
+  // than the whole hourly limit may only start in an hour with no calls yet.
+  const evaluationCalls = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
+  let limited = false;
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
-    for (const pid of providerOrder(cfg, opts.host)) {
+    providers: for (const pid of providerOrder(cfg, opts.host)) {
       const blocked = activeBlock(cache, pid);
       if (blocked) {
         attempts.push(`${pid}: skipped (${blocked.kind} until ${blocked.until.slice(11, 16)}Z)`);
@@ -329,6 +343,10 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           if (q && q.status !== 'pass') continue; // failed, or its evaluation errored recently
           if (!q) {
             if (!opts.allowQualify || budget.remaining <= 0) continue;
+            if (callsLeft(cfg, db, task) < Math.min(evaluationCalls, limit)) {
+              limited = true;
+              break providers;
+            }
             budget.remaining--;
             const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
             opts.log?.('qualification', { model: key, task, pass: res.pass, score: `${res.score}/${res.total}`, blocked: res.blocked });
@@ -341,8 +359,12 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           }
         }
         tries++;
+        if (callsLeft(cfg, db, task) <= 0) {
+          limited = true;
+          break providers;
+        }
         const raw = await provider.run(bin, model, req);
-        const value = raw.ok ? parse(raw.data) : null;
+        const value = raw.ok ? pickAnswer(raw.data, raw.text, parse) : null;
         const ok = value !== null;
         const error = ok ? null : raw.error ?? 'answer did not match the expected shape';
         const costUsd = callCostUsd(model, raw);
@@ -360,6 +382,8 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
       }
       if (providerBlocked) opts.log?.('provider blocked', { provider: pid });
     }
+    // Out of calls for this hour: callers keep the work for later instead of falling back.
+    if (limited) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
     return { ok: false, error: 'no provider produced a valid answer', attempts };
   } finally {
     saveCache(cache);

@@ -1,3 +1,4 @@
+import { sessionRuleLines } from '../compile/render.ts';
 import { isExpired, itemLine, planTiers } from '../compile/tiers.ts';
 import type { DevctxConfig } from '../config.ts';
 import { scoreAll, type ScoreParts } from '../knowledge/retrieve.ts';
@@ -5,8 +6,9 @@ import type { KnowledgeItem } from '../knowledge/types.ts';
 import type { Language } from '../types.ts';
 import { approxTokens } from '../util/text.ts';
 
-const TEXT: Record<Language, { personal: string; conflict: string; related: string; fresh: string; conflictMark: string }> = {
+const TEXT: Record<Language, { rules: string; personal: string; conflict: string; related: string; fresh: string; conflictMark: string }> = {
   ko: {
+    rules: '[devctx] 프로젝트 규칙 (이 저장소의 결정. 이 세션 동안 따른다):',
     personal: '[devctx] 이 사용자의 개인 설정:',
     conflict: '[devctx] 충돌 중인 결정이 있다. 해당 범위를 수정하기 전에 사용자에게 어느 쪽을 따를지 한 번만 확인할 것:',
     related: '[devctx] 이 요청과 관련된 프로젝트 결정 (자동 제공):',
@@ -14,6 +16,7 @@ const TEXT: Record<Language, { personal: string; conflict: string; related: stri
     conflictMark: ' (충돌: 사용자 확인 필요)',
   },
   en: {
+    rules: '[devctx] Project rules (decisions of this repository; follow them for this session):',
     personal: "[devctx] This user's personal preferences:",
     conflict: '[devctx] Conflicting decisions exist. Before changing that area, ask the user once which one to follow:',
     related: '[devctx] Project decisions relevant to this request (auto-provided):',
@@ -68,8 +71,10 @@ const NOTICE: Record<Language, string> = {
 };
 
 /**
- * Injected once per session: devctx health notices (the agent passes them on), personal
- * preferences and unresolved conflicts.
+ * Injected once per session, and the same for the whole session (tools keep their prompt cache):
+ * the project rules (always-apply rules, and path rules when they are few), devctx health notices
+ * (the agent passes them on), personal preferences and unresolved conflicts. AGENTS.md only points
+ * here, so recording a decision never changes a file the tools load with every request.
  */
 export function sessionContext(
   team: readonly KnowledgeItem[],
@@ -81,9 +86,15 @@ export function sessionContext(
   let budget = cfg.inject.session_budget_tokens;
   const parts: string[] = [];
   const ids: string[] = [];
+  // Already within inject.core_budget_tokens / scoped_budget_tokens (planTiers).
+  const rules = sessionRuleLines(planTiers(team, cfg), cfg.language);
+  if (rules.length > 0) {
+    parts.push(t.rules, ...rules.map((r) => r.line));
+    ids.push(...rules.map((r) => r.id));
+  }
   if (notices.length > 0) {
     parts.push(NOTICE[cfg.language], ...notices.map((n) => `- ${n}`));
-    budget -= approxTokens(parts.join('\n'));
+    budget -= approxTokens([NOTICE[cfg.language], ...notices].join('\n'));
   }
   const addBlock = (header: string, items: readonly KnowledgeItem[], render: (i: KnowledgeItem) => string): void => {
     if (items.length === 0) return;
@@ -127,7 +138,7 @@ export interface PromptOptions {
   codePaths?: readonly string[];
   /**
    * How often the assistant broke each rule on this PC. Such rules are found more easily
-   * (ranking only: what AGENTS.md contains depends on committed files alone).
+   * (ranking only: the session-start rules depend on committed files alone).
    */
   violations?: ReadonlyMap<string, number>;
 }
@@ -137,8 +148,8 @@ const VIOLATION_BOOST = 0.1;
 
 /**
  * Injected per prompt. Two sources, never repeating an id already injected in this session:
- * 1. items recorded during this session (the tool loaded AGENTS.md before they existed)
- * 2. items not delivered by always-loaded files that match the prompt, the files it mentions or
+ * 1. items recorded during this session (the session started before they existed)
+ * 2. items not delivered at session start that match the prompt, the files it mentions or
  *    the files declaring the code symbols it mentions
  */
 export function selectPromptContext(team: readonly KnowledgeItem[], prompt: string, cfg: DevctxConfig, opts: PromptOptions): PromptSelection {

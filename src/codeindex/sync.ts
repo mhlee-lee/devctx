@@ -5,7 +5,7 @@ import type { DevctxConfig } from '../config.ts';
 import { git } from '../util/git.ts';
 import { matchAny } from '../util/glob.ts';
 import { errorMessage } from '../util/log.ts';
-import { extractFacts } from './extract/index.ts';
+import { extractFactsChecked } from './extract/index.ts';
 import { encodeFacts, type FileFacts } from './facts.ts';
 import { codeDbPath, listRepoFiles, takeIndexLock } from './files.ts';
 import { languageOf } from './languages.ts';
@@ -19,7 +19,8 @@ const BATCH = 200;
 
 /** Path aliases and module roots the resolver needs (tsconfig paths, go.mod, package names). */
 export interface ProjectInfo {
-  tsconfigs: { dir: string; baseUrl: string | null; paths: Record<string, string[]> }[];
+  /** `pathsDir`: where `paths` resolve from without a baseUrl (older snapshots: the config's dir). */
+  tsconfigs: { dir: string; baseUrl: string | null; paths: Record<string, string[]>; pathsDir?: string }[];
   gomods: { dir: string; module: string }[];
   packages: { dir: string; name: string }[];
 }
@@ -37,21 +38,45 @@ function readJsonc(file: string): Record<string, unknown> | null {
   }
 }
 
-function tsconfigOptions(root: string, rel: string, depth = 0): { baseUrl: string | null; paths: Record<string, string[]>; dir: string } | null {
+interface TsOptions {
+  baseUrl: string | null;
+  paths: Record<string, string[]>;
+  /** Directory `paths` entries are relative to when there is no baseUrl: the config that set them. */
+  pathsDir: string;
+}
+
+/**
+ * baseUrl and paths of a tsconfig, merged over what it extends (local files, a string or a list,
+ * followed up to three levels). Like TypeScript: each option the file sets replaces the inherited
+ * one, baseUrl resolves from the file that sets it, and paths without a baseUrl resolve from the
+ * file that sets them.
+ */
+function tsconfigOptions(root: string, rel: string, depth = 0): TsOptions | null {
   const json = readJsonc(path.join(root, rel));
   if (!json) return null;
   const dir = path.posix.dirname(rel);
-  const opts = (json.compilerOptions ?? {}) as Record<string, unknown>;
-  const paths = opts.paths && typeof opts.paths === 'object' ? (opts.paths as Record<string, string[]>) : null;
-  const baseUrl = typeof opts.baseUrl === 'string' ? path.posix.normalize(path.posix.join(dir, opts.baseUrl)) : null;
-  if (paths || baseUrl) return { dir, baseUrl, paths: paths ?? {} };
-  // `extends` of a local file (tsconfig.app.json → tsconfig.base.json) is followed once or twice.
-  if (typeof json.extends === 'string' && json.extends.startsWith('.') && depth < 2) {
-    const parent = path.posix.normalize(path.posix.join(dir, json.extends.endsWith('.json') ? json.extends : `${json.extends}.json`));
-    const inherited = tsconfigOptions(root, parent, depth + 1);
-    if (inherited) return { ...inherited, dir: inherited.dir };
+  let inherited = null as TsOptions | null;
+  const parents = typeof json.extends === 'string' ? [json.extends] : Array.isArray(json.extends) ? json.extends.filter((e): e is string => typeof e === 'string') : [];
+  if (depth < 3) {
+    for (const ext of parents) {
+      if (!ext.startsWith('.')) continue; // package configs (@tsconfig/node20) set no project paths
+      const parentRel = path.posix.normalize(path.posix.join(dir, ext.endsWith('.json') ? ext : `${ext}.json`));
+      const p = tsconfigOptions(root, parentRel, depth + 1);
+      if (!p) continue;
+      inherited = {
+        baseUrl: p.baseUrl ?? inherited?.baseUrl ?? null,
+        paths: Object.keys(p.paths).length > 0 ? p.paths : (inherited?.paths ?? {}),
+        pathsDir: Object.keys(p.paths).length > 0 ? p.pathsDir : (inherited?.pathsDir ?? p.pathsDir),
+      };
+    }
   }
-  return null;
+  const opts = (json.compilerOptions ?? {}) as Record<string, unknown>;
+  const ownPaths = opts.paths && typeof opts.paths === 'object' ? (opts.paths as Record<string, string[]>) : null;
+  const ownBase = typeof opts.baseUrl === 'string' ? path.posix.normalize(path.posix.join(dir, opts.baseUrl)) : null;
+  const baseUrl = ownBase ?? inherited?.baseUrl ?? null;
+  const paths = ownPaths ?? inherited?.paths ?? {};
+  if (!baseUrl && Object.keys(paths).length === 0) return null;
+  return { baseUrl, paths, pathsDir: ownPaths ? dir : (inherited?.pathsDir ?? dir) };
 }
 
 export function readProjectInfo(root: string, files: readonly string[]): ProjectInfo {
@@ -61,7 +86,7 @@ export function readProjectInfo(root: string, files: readonly string[]): Project
     if (matchAny(rel, BUILTIN_SKIP)) continue;
     if (base === 'tsconfig.json' || base === 'jsconfig.json') {
       const opts = tsconfigOptions(root, rel);
-      if (opts) info.tsconfigs.push({ dir: path.posix.dirname(rel), baseUrl: opts.baseUrl, paths: opts.paths });
+      if (opts) info.tsconfigs.push({ dir: path.posix.dirname(rel), baseUrl: opts.baseUrl, paths: opts.paths, pathsDir: opts.pathsDir });
     } else if (base === 'go.mod') {
       try {
         const m = /^module\s+(\S+)/m.exec(fs.readFileSync(path.join(root, rel), 'utf8'));
@@ -109,6 +134,7 @@ export function pendingChanges(root: string, cfg: DevctxConfig): number {
       try {
         st = fs.statSync(path.join(root, rel));
       } catch {
+        if (prev) n++; // deleted but not staged yet: its symbols must go
         continue;
       }
       if (!prev || !prev.hash || prev.size !== st.size || prev.mtime !== st.mtimeMs) n++;
@@ -215,7 +241,13 @@ export async function syncIndex(root: string, cfg: DevctxConfig, opts: SyncOptio
       try {
         st = fs.statSync(abs);
       } catch {
-        continue; // deleted but still in the git index
+        // Deleted but still in the git index (not staged yet): drop what the index knew about it.
+        if (rows.has(rel)) {
+          store.remove(rel);
+          rows.delete(rel);
+          result.removed++;
+        }
+        continue;
       }
       if (!st.isFile()) continue;
       const prev = rows.get(rel);
@@ -239,8 +271,8 @@ export async function syncIndex(root: string, cfg: DevctxConfig, opts: SyncOptio
         continue;
       }
       try {
-        const facts = await extractFacts(lang, src, rel);
-        pending.push({ row: { path: rel, lang, size: st.size, mtime: st.mtimeMs, hash, error: null }, facts: encodeFacts(facts), syms: symbolRows(rel, facts) });
+        const { facts, syntaxErrors } = await extractFactsChecked(lang, src, rel);
+        pending.push({ row: { path: rel, lang, size: st.size, mtime: st.mtimeMs, hash, error: null, syntax: syntaxErrors }, facts: encodeFacts(facts), syms: symbolRows(rel, facts) });
         result.parsed++;
       } catch (error) {
         pending.push({ row: { path: rel, lang, size: st.size, mtime: st.mtimeMs, hash, error: errorMessage(error).slice(0, 200) }, facts: null });

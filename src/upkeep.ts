@@ -1,5 +1,5 @@
 import type { DevctxConfig } from './config.ts';
-import { ensureGitAttributes } from './init/attributes.ts';
+import { ensureGitAttributes, ensureGitIgnore } from './init/attributes.ts';
 import { installAgentAccess, removeLegacyMcp } from './init/access.ts';
 import { hookInstalled, installToolHooks } from './init/hookconfigs.ts';
 import type { StateDb } from './state/db.ts';
@@ -23,6 +23,7 @@ export function dailyUpkeep(root: string, cfg: DevctxConfig, db: StateDb): strin
     if (res.action === 'created' || res.action === 'updated') changed.push(`${res.action} ${res.file}`);
   }
   if (ensureGitAttributes(root)) changed.push('updated .gitattributes');
+  if (ensureGitIgnore(root)) changed.push('updated .gitignore');
   // The skill and its pre-approvals follow the devctx version and config (a teammate's machine
   // gets the per-machine entries without running init); the old MCP server entry is removed.
   for (const a of [
@@ -74,7 +75,7 @@ export function noteCommit(db: StateDb): void {
 /**
  * Problems people should hear about, at most once per `everyDays` per kind. Printed by the git
  * hooks (visible when a person or an agent commits) and added to the session context (the agent
- * tells the user). Never written into AGENTS.md: that file must be the same on every clone.
+ * tells the user). Never written into the rule list or the rule files: those come from committed files alone.
  */
 export function healthNotices(db: StateDb, lang: Language, opts: { capture: boolean; everyDays: number }): string[] {
   const out: string[] = [];

@@ -5,7 +5,7 @@ import type { ItemStats, StateDb } from '../state/db.ts';
 import { listFiles, readText } from '../util/fsx.ts';
 import { personalDir, type ProjectPaths } from '../util/paths.ts';
 import { today } from '../util/text.ts';
-import { parseItem } from './format.ts';
+import { parseItem, PARSE_VERSION } from './format.ts';
 import { isKnowledgeFile, type LoadResult } from './store.ts';
 import type { KnowledgeItem } from './types.ts';
 
@@ -19,7 +19,7 @@ import type { KnowledgeItem } from './types.ts';
  * - a rule past its `valid_until` is retired; exact duplicates (same wording and scope, e.g. said
  *   on two branches) collapse into the oldest.
  * The result depends only on the files, so every clone at the same commit computes the same thing
- * and AGENTS.md comes out identical everywhere. What only this PC knows (how often a rule came up,
+ * and the rule list (.devctx/rules.md) comes out identical everywhere. What only this PC knows (how often a rule came up,
  * unconfirmed proposals) is added on top in the "local" view and never reaches the compiled files.
  */
 
@@ -44,6 +44,10 @@ export function readKnowledgeFiles(dirs: readonly string[], db: StateDb | null):
   const items: KnowledgeItem[] = [];
   const errors: { file: string; error: string }[] = [];
   const seenIds = new Map<string, string>();
+  if (db && db.kvGet('kfiles_parse') !== PARSE_VERSION) {
+    db.clearKfiles();
+    db.kvSet('kfiles_parse', PARSE_VERSION);
+  }
   const cache = db ? db.kfiles() : null;
   const present = new Set<string>();
   for (const dir of dirs) {
@@ -141,14 +145,43 @@ export function deriveStatus(items: readonly KnowledgeItem[], opts: { proposedTt
   }
 
   // 2. The same rule recorded twice (typically on two branches): the oldest one stands, and the
-  //    copy shares its fate (if the original was replaced, so is the copy).
+  //    copy shares its fate (if the original was replaced, so is the copy). A newer file that
+  //    replaces a rule with the same wording through `supersedes` (restating a rule after a detour,
+  //    a new end date, settling a conflict) is not a copy: it is the rule's current version.
+  const ancestors = new Map<string, Set<string>>();
+  const ancestorsOf = (i: KnowledgeItem): Set<string> => {
+    const known = ancestors.get(i.id);
+    if (known) return known;
+    const out = new Set<string>();
+    ancestors.set(i.id, out); // links only point at older files, but guard anyway
+    for (const tid of i.supersedes) {
+      const t = byId.get(tid);
+      if (!t || t === i || !older(t, i)) continue;
+      out.add(t.id);
+      for (const a of ancestorsOf(t)) out.add(a);
+    }
+    return out;
+  };
+  const textKey = (i: KnowledgeItem): string => `${i.audience}\u0000${canonical(i.summary)}\u0000${[...i.scope.paths].sort().join('\n')}`;
+  const keyOf = new Map(items.map((i) => [i.id, textKey(i)]));
   const firstByText = new Map<string, KnowledgeItem>();
   for (const i of sorted) {
     if (i.status !== 'active' && i.status !== 'superseded') continue;
-    const key = `${i.audience}\u0000${canonical(i.summary)}\u0000${[...i.scope.paths].sort().join('\n')}`;
+    const key = keyOf.get(i.id) as string;
     const first = firstByText.get(key);
-    if (!first) firstByText.set(key, i);
-    else if (i.status === 'active') {
+    if (!first) {
+      firstByText.set(key, i);
+      continue;
+    }
+    if (i.status !== 'active') continue;
+    const restated = [...ancestorsOf(i)].some((a) => keyOf.get(a) === key);
+    if (restated) {
+      if (first.status === 'active' && !ancestorsOf(i).has(first.id)) {
+        first.status = 'superseded';
+        first.superseded_by = i.id;
+      }
+      firstByText.set(key, i);
+    } else {
       i.status = 'superseded';
       i.superseded_by = first.status === 'superseded' && first.superseded_by ? first.superseded_by : first.id;
     }
@@ -281,7 +314,7 @@ const STALE_KEY = 'stale';
 
 /**
  * Code-evidence results of the last compile (which reads manifests and `git ls-files`), so hooks
- * deliver exactly what AGENTS.md was built from without touching git on every prompt.
+ * deliver exactly what the rule list was built from without touching git on every prompt.
  */
 export function saveStale(db: StateDb, items: readonly KnowledgeItem[]): void {
   const map: Record<string, string> = {};

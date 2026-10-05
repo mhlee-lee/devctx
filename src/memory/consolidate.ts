@@ -3,7 +3,7 @@ import type { DevctxConfig } from '../config.ts';
 import { anchorsFor, type RepoContext } from '../knowledge/anchors.ts';
 import { searchItems, type Scored } from '../knowledge/retrieve.ts';
 import { newItem, writeItem } from '../knowledge/store.ts';
-import type { Enforcement, Evidence, KnowledgeItem, SourceKind } from '../knowledge/types.ts';
+import type { Enforcement, Evidence, ItemStatus, KnowledgeItem, SourceKind } from '../knowledge/types.ts';
 import { routeCall, type RouteOptions } from '../llm/router.ts';
 import type { StateDb } from '../state/db.ts';
 import type { Language } from '../types.ts';
@@ -43,6 +43,9 @@ export interface ApplyResult {
   targetId: string | null;
   files: string[];
   detail: string;
+  /** State of `itemId` afterwards: `proposed` means kept on this PC until confirmed. */
+  status: ItemStatus | null;
+  summary: string | null;
 }
 
 const LIVE = new Set(['active', 'proposed', 'conflict']);
@@ -75,17 +78,24 @@ function neighborsOf(c: Candidate, pool: readonly KnowledgeItem[]): Scored[] {
     .sort((a, b) => b.score - a.score);
 }
 
+/** Rules for different paths are different rules, even with the same wording. */
+function sameScope(c: Candidate, item: KnowledgeItem): boolean {
+  const a = [...new Set(c.scope.paths)].sort();
+  const b = [...new Set(item.scope.paths)].sort();
+  return a.length === b.length && a.every((p, i) => p === b[i]);
+}
+
 function heuristicVerdict(c: Candidate, neighbors: readonly Scored[], why: string): JudgeResult {
   const top = neighbors[0];
-  if (top && top.score >= 0.75 && !differsInSubstance(c.statement, top.item.summary)) {
+  if (top && top.score >= 0.75 && sameScope(c, top.item) && !differsInSubstance(c.statement, top.item.summary)) {
     return { relation: 'duplicate', target_id: top.item.id, merged_statement: null, cascade_ids: [], why, confidence: Math.min(1, top.score) };
   }
   return { relation: 'new', target_id: null, merged_statement: null, cascade_ids: [], why, confidence: 0.5 };
 }
 
-/** A neighbour that already says exactly this: settled without an LLM call. */
+/** A neighbour that already says exactly this, for the same paths: settled without an LLM call. */
 export function fastVerdict(c: Candidate, neighbors: readonly Scored[]): JudgeResult | null {
-  const same = neighbors.find((n) => sameRule(c.statement, n.item.summary) || sameRule(c.statement, n.item.sections.rule));
+  const same = neighbors.find((n) => sameScope(c, n.item) && (sameRule(c.statement, n.item.summary) || sameRule(c.statement, n.item.sections.rule)));
   if (!same) return null;
   return { relation: 'duplicate', target_id: same.item.id, merged_statement: null, cascade_ids: [], why: 'same wording as the existing rule (no LLM call)', confidence: 1 };
 }
@@ -178,7 +188,7 @@ function successor(t: KnowledgeItem, c: Candidate, ctx: ConsolidateContext, over
  * add a rule. Returns the new files (never modified ones).
  */
 export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promise<ApplyResult> {
-  const dropped = (detail: string): ApplyResult => ({ relation: 'dropped', itemId: null, targetId: null, files: [], detail });
+  const dropped = (detail: string): ApplyResult => ({ relation: 'dropped', itemId: null, targetId: null, files: [], detail, status: null, summary: null });
   if (c.durability === 'one_off') return dropped('one-off instruction');
   const personal = c.audience === 'personal';
   if (personal && !ctx.cfg.memory.personal) return dropped('personal memory disabled');
@@ -259,9 +269,9 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
   let note = '';
 
   if (target?.local) {
-    // An unconfirmed proposal of this PC (possibly archived months ago).
+    // An unconfirmed proposal of this PC (possibly archived months ago). The proposal is dropped
+    // only after its replacement is stored, so a failed write leaves it in place.
     if (relation === 'duplicate' || relation === 'refine') {
-      dropLocal(target);
       const merged = relation === 'refine' ? (verdict.merged_statement ?? target.summary) : target.summary;
       const item = commit({
         ...target,
@@ -273,14 +283,15 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
         valid_until: c.validUntil ?? target.valid_until,
         source: { ...target.source, captured_at: target.source.captured_at },
       });
+      dropLocal(target);
       ctx.db.bumpStats(item.id, { reinforced: 1, at: now });
       itemId = item.id;
       note = target.archived ? 'revived an archived proposal' : 'confirmed a proposal';
     } else {
       // Replaced or contradicted before anyone confirmed it: the new statement stands on its own.
-      dropLocal(target);
       const created = createItem(c, ctx, relation === 'supersede' ? { status: 'active' } : {});
       itemId = (created.status === 'active' ? commit(created) : propose(created)).id;
+      dropLocal(target);
       relation = 'new';
       note = 'replaced an unconfirmed proposal';
     }
@@ -370,5 +381,6 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
   }
   const detail = [verdict.why, note].filter(Boolean).join('; ');
   ctx.db.recordOp({ eventId: c.eventId, relation, itemId, targetId: target?.id ?? null, detail });
-  return { relation, itemId, targetId: target?.id ?? null, files, detail };
+  const result = itemId ? byId(itemId) : undefined;
+  return { relation, itemId, targetId: target?.id ?? null, files, detail, status: result?.status ?? null, summary: result?.summary ?? null };
 }

@@ -46,6 +46,8 @@ export interface FileRow {
   mtime: number;
   hash: string;
   error: string | null;
+  /** Parsed, but the parser recovered from syntax errors. */
+  syntax?: boolean;
 }
 
 type Row = Record<string, unknown>;
@@ -62,6 +64,9 @@ export class CodeStore {
     const db = new DatabaseSync(file);
     db.exec('pragma busy_timeout = 5000; pragma journal_mode = wal; pragma synchronous = normal;');
     db.exec(SCHEMA);
+    // Added after the first release: whether the parser recovered from syntax errors.
+    const columns = (db.prepare('pragma table_info(files)').all() as Row[]).map((r) => String(r.name));
+    if (!columns.includes('syntax')) db.exec('alter table files add column syntax integer not null default 0');
     const store = new CodeStore(db);
     // New extractor output: keep rows (for the file list) but force every file to be parsed again.
     if (store.meta('facts_version') !== String(FACTS_VERSION)) {
@@ -135,11 +140,11 @@ export class CodeStore {
   upsert(row: FileRow, facts: string | null): void {
     this.db
       .prepare(
-        `insert into files(path, lang, size, mtime, hash, facts, error) values(?, ?, ?, ?, ?, ?, ?)
+        `insert into files(path, lang, size, mtime, hash, facts, error, syntax) values(?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(path) do update set lang = excluded.lang, size = excluded.size, mtime = excluded.mtime,
-           hash = excluded.hash, facts = excluded.facts, error = excluded.error`,
+           hash = excluded.hash, facts = excluded.facts, error = excluded.error, syntax = excluded.syntax`,
       )
-      .run(row.path, row.lang, row.size, row.mtime, row.hash, facts, row.error);
+      .run(row.path, row.lang, row.size, row.mtime, row.hash, facts, row.error, row.syntax ? 1 : 0);
   }
 
   touch(file: string, size: number, mtime: number): void {
@@ -185,6 +190,26 @@ export class CodeStore {
       .prepare('select count(*) as n, sum(facts is not null) as parsed, sum(error is not null) as failed from files')
       .get() as Row | undefined;
     return { files: Number(row?.n ?? 0), parsed: Number(row?.parsed ?? 0), failed: Number(row?.failed ?? 0) };
+  }
+
+  /** Parsed files the parser had to recover from syntax errors, per language, with a few examples. */
+  syntaxErrors(): { lang: string; files: number; total: number; examples: string[] }[] {
+    try {
+      const rows = this.db
+        .prepare(
+          `select lang, sum(syntax) as bad, count(*) as total, group_concat(case when syntax = 1 then path end, '\n') as paths
+           from files where facts is not null group by lang having bad > 0 order by bad desc`,
+        )
+        .all() as Row[];
+      return rows.map((r) => ({
+        lang: String(r.lang),
+        files: Number(r.bad),
+        total: Number(r.total),
+        examples: String(r.paths ?? '').split('\n').filter(Boolean).slice(0, 3),
+      }));
+    } catch {
+      return []; // an index from before the column existed (read-only open does not migrate)
+    }
   }
 
   transaction<T>(fn: () => T): T {

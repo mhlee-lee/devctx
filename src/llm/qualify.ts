@@ -1,5 +1,6 @@
 import type { Language } from '../types.ts';
 import { callCostUsd } from './catalog.ts';
+import { pickAnswer } from './json.ts';
 import { suiteCalls, suiteSize, type SuiteTask } from './suite.ts';
 import type { FailureKind, ModelCandidate, Provider } from './types.ts';
 
@@ -61,7 +62,7 @@ export async function qualifyModel(
         res.details.push(`${call.name}: could not run (${raw.kind}: ${raw.error ?? ''})`);
         return finish();
       }
-      const outcome = raw.ok ? call.check(raw.data) : null;
+      const outcome = raw.ok ? pickAnswer(raw.data, raw.text, (d) => call.check(d)) : null;
       if (!outcome) {
         res.details.push(`run ${run} ${call.name}: unusable answer (${raw.error ?? 'bad shape'})`);
         return finish();

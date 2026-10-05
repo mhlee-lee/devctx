@@ -19,7 +19,7 @@
     { "id": "state", "type": "database", "label": "state.sqlite", "sublabel": "로컬" },
     { "id": "worker", "type": "backend", "label": "worker", "sublabel": "백그라운드" },
     { "id": "llm", "type": "external", "label": "도구 CLI", "sublabel": "선택된 모델" },
-    { "id": "repo", "type": "database", "label": "저장소", "sublabel": "Git 공유 파일" }
+    { "id": "repo", "type": "database", "label": "저장소", "sublabel": "결정 파일 (Git 공유)" }
   ],
   "segments": [
     { "from": 168, "to": 300, "label": "캡처: 도구는 기다리지 않는다" },
@@ -37,7 +37,7 @@
     { "id": "candidates", "from": "llm", "to": "worker", "y": 376, "label": "규칙 후보", "variant": "return" },
     { "id": "judge", "from": "worker", "to": "llm", "y": 404, "label": "기존 결정과 비교", "variant": "default" },
     { "id": "verdict", "from": "llm", "to": "worker", "y": 432, "label": "supersede", "variant": "return" },
-    { "id": "write", "from": "worker", "to": "repo", "y": 460, "label": "결정 파일 · AGENTS.md 갱신", "variant": "emphasis" },
+    { "id": "write", "from": "worker", "to": "repo", "y": 460, "label": "결정 파일 추가 · 규칙 목록 갱신", "variant": "emphasis" },
     { "id": "next-session", "from": "repo", "to": "tool", "y": 492, "label": "다음 세션에서 읽음", "variant": "dashed" }
   ],
   "activations": [
@@ -52,6 +52,6 @@
   "cards": [
     { "dot": "emerald", "title": "할 일 없음", "items": ["hook은 기록하고 바로 끝난다", "추출과 판정은 턴이 끝난 뒤 백그라운드에서 한다"] },
     { "dot": "violet", "title": "정책 변경", "items": ["바뀐 규칙은 이전 규칙을 대체한다 (superseded)", "다른 사람의 규칙과 부딪히면 conflict로 남기고 한 번 묻는다"] },
-    { "dot": "amber", "title": "토큰", "items": ["프롬프트마다 관련 결정만 600토큰 이내로 붙인다", "AGENTS.md 핵심 규칙은 1500토큰 이내로 유지한다"] }
+    { "dot": "amber", "title": "토큰", "items": ["프롬프트마다 관련 결정만 600토큰 이내로 붙인다", "세션 시작 규칙 목록은 1500토큰 이내, 세션 동안 바뀌지 않는다"] }
   ]
 }

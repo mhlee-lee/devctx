@@ -2,8 +2,10 @@ import { codeLookup } from './codeindex/hints.ts';
 import { loadConfig } from './config.ts';
 import { PROMPT_MIN_SCORE, selectPromptContext, type TraceEntry } from './hooks/context.ts';
 import { continuesSession, renderHandoff } from './hooks/handoff.ts';
+import { localTime } from './history/writer.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
+import { relationLabel, statusLabel } from './memory/labels.ts';
 import { StateDb } from './state/db.ts';
 import { projectPaths } from './util/paths.ts';
 import { approxTokens, truncate } from './util/text.ts';
@@ -87,7 +89,7 @@ function explainRest(
   const loaded = sel.trace.filter((e) => e.outcome === 'always loaded').length;
   const rest = sel.trace.length - shown.length - (all ? 0 : loaded);
   if (!all && (loaded > 0 || rest > 0)) {
-    out.push(`  (${loaded} always loaded from AGENTS.md or path rules${rest > 0 ? `, ${rest} not related` : ''}; --all lists every decision)`);
+    out.push(`  (${loaded} given at session start or by path rule files${rest > 0 ? `, ${rest} not related` : ''}; --all lists every decision)`);
   }
   return out.join('\n');
 }
@@ -108,13 +110,18 @@ export function memoryLog(root: string, limit: number): string {
     const items = [...loadTeam(paths, db, opts).items, ...loadPersonal(db, opts).items];
     const byId = new Map(items.map((i) => [i.id, i]));
     const rows = db.recentOps(limit);
-    if (rows.length === 0) return 'no automatic changes recorded yet';
+    const lang = cfg.language;
+    if (rows.length === 0) return lang === 'ko' ? '아직 기록된 변경이 없다' : 'no automatic changes recorded yet';
     return rows
       .map((r) => {
-        const when = String(r.ts).slice(0, 16).replace('T', ' ');
+        const when = localTime(String(r.ts)).slice(0, 16);
         const target = r.target_id && r.target_id !== r.item_id ? ` → ${describe(byId, r.target_id)}` : '';
-        const detail = typeof r.detail === 'string' && r.detail ? `\n${' '.repeat(28)}${truncate(r.detail, 110)}` : '';
-        return `${when}  ${String(r.relation).padEnd(9)} ${describe(byId, r.item_id)}${target}${detail}`;
+        const detail = typeof r.detail === 'string' && r.detail ? `\n${' '.repeat(18)}${truncate(r.detail, 110)}` : '';
+        // What happened then, and where the rule stands now (a rule "added" may still be a proposal).
+        const item = typeof r.item_id === 'string' ? byId.get(r.item_id) : undefined;
+        const now = item ? statusLabel(item.status, lang, item.archived) : '';
+        const state = now ? `  [${lang === 'ko' ? '지금' : 'now'}: ${now}]` : '';
+        return `${when}  ${relationLabel(String(r.relation), lang, typeof r.detail === 'string' ? r.detail : null)}  ${describe(byId, r.item_id)}${target}${state}${detail}`;
       })
       .join('\n');
   } finally {

@@ -22,6 +22,11 @@ function lineAt(src: string, index: number): number {
   return n;
 }
 
+/** Same length and line breaks, no content: offsets in the template stay offsets in the file. */
+function blank(text: string): string {
+  return text.replace(/[^\n]/g, ' ');
+}
+
 function scriptBlocks(src: string, lang: LangId): { blocks: Block[]; template: string } {
   const blocks: Block[] = [];
   let template = src;
@@ -29,17 +34,18 @@ function scriptBlocks(src: string, lang: LangId): { blocks: Block[]; template: s
     const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(src);
     if (fm?.[1] !== undefined) {
       blocks.push({ code: fm[1], line: 1, ts: true });
-      template = template.replace(fm[0], '');
+      template = blank(fm[0]) + template.slice(fm[0].length);
     }
   }
   for (const m of src.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
     const attrs = m[1] ?? '';
     const code = m[2] ?? '';
-    const start = (m.index ?? 0) + m[0].indexOf('>') + 1;
+    const at = m.index ?? 0;
+    const start = at + m[0].indexOf('>') + 1;
     blocks.push({ code, line: lineAt(src, start), ts: /lang\s*=\s*["'](ts|tsx|typescript)["']/.test(attrs) || lang === 'astro' });
-    template = template.replace(m[0], '');
+    template = template.slice(0, at) + blank(m[0]) + template.slice(at + m[0].length);
   }
-  template = template.replace(/<style\b[\s\S]*?<\/style>/g, '');
+  template = template.replace(/<style\b[\s\S]*?<\/style>/g, (s) => blank(s));
   return { blocks, template };
 }
 
@@ -54,7 +60,7 @@ function componentName(file: string): string {
 
 const HTML_LIKE = /^(slot|template|component|transition|keep-alive|teleport|suspense|router-view|router-link|svelte:[\w-]+)$/;
 
-export async function extractEmbedded(lang: LangId, src: string, file: string): Promise<FileFacts> {
+export async function extractEmbedded(lang: LangId, src: string, file: string): Promise<{ facts: FileFacts; syntaxErrors: boolean }> {
   const b = new Builder(lang, src);
   const name = componentName(file) || 'Component';
   const lines = src.split('\n').length;
@@ -68,6 +74,7 @@ export async function extractEmbedded(lang: LangId, src: string, file: string): 
   for (const block of blocks) {
     const sub = new Builder(lang, block.code);
     await parseInto(sub, block.ts ? 'typescript' : 'javascript', block.code, file);
+    if (sub.syntaxErrors) b.syntaxErrors = true;
     const base = b.f.syms.length;
     const shift = (i: number): number => (i >= 0 ? i + base : comp);
     for (const s of sub.f.syms) {
@@ -80,17 +87,12 @@ export async function extractEmbedded(lang: LangId, src: string, file: string): 
     for (const [exported, local] of sub.f.exps) if (exported !== 'default') b.f.exps.push([exported, local]);
   }
 
-  // Components the template renders: `<UserCard>` and `<user-card>`.
-  const seen = new Set<string>();
+  // Components the template renders: `<UserCard>` and `<user-card>`, one reference per use.
   for (const m of template.matchAll(/<([A-Z][\w]*(?:\.[A-Z]\w*)?|[a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]/g)) {
     const tag = m[1] ?? '';
     if (HTML_LIKE.test(tag)) continue;
     const pascal = tag.includes('-') ? tag.split('-').map((p) => p[0]?.toUpperCase() + p.slice(1)).join('') : tag.split('.').pop() ?? tag;
-    const at = src.indexOf(m[0]);
-    const key = `${pascal}:${at}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    b.ref(comp, pascal, 'render', lineAt(src, at >= 0 ? at : 0) + 1, tag.includes('.') ? `v:${tag.split('.')[0]}` : '');
+    b.ref(comp, pascal, 'render', lineAt(src, m.index ?? 0) + 1, tag.includes('.') ? `v:${tag.split('.')[0]}` : '');
   }
-  return b.f;
+  return { facts: b.f, syntaxErrors: b.syntaxErrors };
 }

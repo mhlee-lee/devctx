@@ -94,7 +94,8 @@ export function renderSkill(lang: Language, claude: boolean): string {
           '- 결과는 `path:line` 형식이다. 전체 파일 대신 필요한 줄만 읽는다.',
           '- `(by name)`이 붙은 연결은 import나 타입 근거 없이 이름만 보고 이은 것이다. 수정 근거로 쓰기 전에 코드를 확인한다.',
           '- 리플렉션, 동적 디스패치, 프레임워크가 대신 부르는 코드는 빠질 수 있다. 그럴 땐 `search_text`로 확인한다.',
-          '- 명령이 실패하거나 없으면 평소처럼 파일을 읽는다.',
+          '- 종료 코드 1은 요청이 잘못됐다는 뜻이다(모르는 옵션·값, 잘못된 정규식, 없는 브랜치). 메시지대로 고쳐 다시 실행한다. 결과가 없는 것은 오류가 아니다(종료 코드 0).',
+          '- 명령을 쓸 수 없으면 평소처럼 파일을 읽는다.',
           '',
           '## 예시',
           '',
@@ -126,7 +127,8 @@ export function renderSkill(lang: Language, claude: boolean): string {
           '- Results are `path:line`; read just those lines instead of whole files.',
           '- Links marked `(by name)` were matched by name only (no import or type evidence); check the code before relying on them.',
           '- Reflection, dynamic dispatch and framework-invoked code can be missing; confirm with `search_text`.',
-          '- If a command fails or is unavailable, read files as usual.',
+          '- Exit status 1 means the request was wrong (unknown option or value, bad regex, unknown revision): fix it as the message says and run again. No results is not an error (exit 0).',
+          '- If the command is unavailable, read files as usual.',
           '',
           '## Examples',
           '',
@@ -225,35 +227,33 @@ function dropEmpty(data: Json, key: string): void {
 const CLAUDE_RULES = [`Bash(${CODE_COMMAND} *)`, `Bash(./${CODE_COMMAND} *)`];
 
 /** Claude Code: project `.claude/settings.json` permission rules (the hooks live in the same file). */
+const claudeEdit =
+  (enabled: boolean) =>
+  (d: Json): void => {
+    const perms = nested(d, 'permissions');
+    setStrings(perms, 'allow', CLAUDE_RULES, enabled);
+    dropEmpty(d, 'permissions');
+  };
+
 function claudeSettings(root: string, enabled: boolean): AccessResult {
-  return editJson(
-    root,
-    '.claude/settings.json',
-    (d) => {
-      const perms = nested(d, 'permissions');
-      setStrings(perms, 'allow', CLAUDE_RULES, enabled);
-      dropEmpty(d, 'permissions');
-    },
-    { create: enabled },
-  );
+  return editJson(root, '.claude/settings.json', claudeEdit(enabled), { create: enabled });
 }
 
 const VSCODE_KEY = 'chat.tools.terminal.autoApprove';
 const VSCODE_RULE = '/^(\\./)?\\.devctx/bin/devctx code(\\s|$)/';
 
 /** Copilot in VS Code: terminal auto-approval rules in the workspace settings (trusted workspaces). */
+const vscodeEdit =
+  (enabled: boolean) =>
+  (d: Json): void => {
+    const rules = nested(d, VSCODE_KEY);
+    if (enabled) rules[VSCODE_RULE] = true;
+    else delete rules[VSCODE_RULE];
+    dropEmpty(d, VSCODE_KEY);
+  };
+
 function vscodeSettings(root: string, enabled: boolean): AccessResult {
-  return editJson(
-    root,
-    '.vscode/settings.json',
-    (d) => {
-      const rules = nested(d, VSCODE_KEY);
-      if (enabled) rules[VSCODE_RULE] = true;
-      else delete rules[VSCODE_RULE];
-      dropEmpty(d, VSCODE_KEY);
-    },
-    { create: enabled },
-  );
+  return editJson(root, '.vscode/settings.json', vscodeEdit(enabled), { create: enabled });
 }
 
 const CURSOR_INSTRUCTION = `Commands that start with \`${CODE_COMMAND}\` are read-only queries of this repository's code index (search_symbols, get_symbol, trace_calls, file_outline, repo_overview, change_impact, search_text); allow them.`;
@@ -273,19 +273,17 @@ function cursorUserAllowlist(): boolean {
  * in-app allowlist, so devctx only appends to one that is already file-controlled; otherwise it
  * steers the Auto-review classifier, which merges with personal settings.
  */
+const cursorEdit =
+  (enabled: boolean, userList: boolean) =>
+  (d: Json): void => {
+    if (Array.isArray(d.terminalAllowlist) || (userList && enabled)) setStrings(d, 'terminalAllowlist', [CODE_COMMAND], enabled);
+    const auto = nested(d, 'autoRun');
+    setStrings(auto, 'allow_instructions', [CURSOR_INSTRUCTION], enabled);
+    dropEmpty(d, 'autoRun');
+  };
+
 function cursorPermissions(root: string, enabled: boolean): AccessResult {
-  const userList = cursorUserAllowlist();
-  return editJson(
-    root,
-    '.cursor/permissions.json',
-    (d) => {
-      if (Array.isArray(d.terminalAllowlist) || (userList && enabled)) setStrings(d, 'terminalAllowlist', [CODE_COMMAND], enabled);
-      const auto = nested(d, 'autoRun');
-      setStrings(auto, 'allow_instructions', [CURSOR_INSTRUCTION], enabled);
-      dropEmpty(d, 'autoRun');
-    },
-    { create: enabled },
-  );
+  return editJson(root, '.cursor/permissions.json', cursorEdit(enabled, cursorUserAllowlist()), { create: enabled });
 }
 
 /** Cursor CLI: `.cursor/cli.json` shadows the global CLI config, so it is only extended, never created. */
@@ -460,16 +458,52 @@ export function installAgentAccess(root: string, tools: readonly ToolId[], opts:
   return [...installRepoAccess(root, tools, opts), ...installMachineAccess(root, tools, opts)];
 }
 
+/**
+ * Why init could not add devctx's entry to a JSON settings file, and what to add by hand: devctx
+ * never rewrites a file with comments (they would be lost), so running init again does not help.
+ */
+function jsonHint(file: string, mutate: (d: Json) => void, ok: boolean): string | undefined {
+  const text = ok ? null : readText(file);
+  if (text === null) return undefined;
+  try {
+    JSON.parse(text);
+    return undefined;
+  } catch {
+    // comments or broken
+  }
+  try {
+    JSON.parse(stripJsonc(text));
+  } catch {
+    return 'not valid JSON: fix it, then run "devctx init"';
+  }
+  const want: Json = {};
+  mutate(want);
+  return `has comments, so devctx does not rewrite it ("devctx init" will not help). Merge this in by hand: ${JSON.stringify(want)}`;
+}
+
+export interface AccessStatus {
+  file: string;
+  ok: boolean;
+  /** What to do when the fix is not "run devctx init". */
+  hint?: string;
+}
+
 /** What `devctx doctor` / `devctx code status` report: expected files and whether they are in place. */
-export function agentAccessStatus(root: string, tools: readonly ToolId[], opts: AccessOptions): { file: string; ok: boolean }[] {
+export function agentAccessStatus(root: string, tools: readonly ToolId[], opts: AccessOptions): AccessStatus[] {
   if (!opts.enabled) return [];
-  const out = skillFiles(tools).map((s) => ({ file: s.rel, ok: readText(path.join(root, s.rel)) === renderSkill(opts.language, s.claude) }));
+  const out: AccessStatus[] = skillFiles(tools).map((s) => ({ file: s.rel, ok: readText(path.join(root, s.rel)) === renderSkill(opts.language, s.claude) }));
   if (!opts.preapprove) return out;
   const contains = (file: string, needle: string): boolean => (readText(file) ?? '').includes(needle);
-  if (tools.includes('claude')) out.push({ file: '.claude/settings.json', ok: contains(path.join(root, '.claude/settings.json'), CLAUDE_RULES[0] as string) });
+  const json = (rel: string, needle: string, mutate: (d: Json) => void): AccessStatus => {
+    const file = path.join(root, rel);
+    const ok = contains(file, needle);
+    const hint = jsonHint(file, mutate, ok);
+    return hint ? { file: rel, ok, hint } : { file: rel, ok };
+  };
+  if (tools.includes('claude')) out.push(json('.claude/settings.json', CLAUDE_RULES[0] as string, claudeEdit(true)));
   if (tools.includes('codex')) out.push({ file: '.codex/rules/devctx.rules', ok: readText(path.join(root, '.codex/rules/devctx.rules')) === codexRules() });
-  if (tools.includes('copilot')) out.push({ file: '.vscode/settings.json', ok: contains(path.join(root, '.vscode/settings.json'), 'devctx/bin/devctx code') });
-  if (tools.includes('cursor')) out.push({ file: '.cursor/permissions.json', ok: contains(path.join(root, '.cursor/permissions.json'), CODE_COMMAND) });
+  if (tools.includes('copilot')) out.push(json('.vscode/settings.json', 'devctx/bin/devctx code', vscodeEdit(true)));
+  if (tools.includes('cursor')) out.push(json('.cursor/permissions.json', CODE_COMMAND, cursorEdit(true, cursorUserAllowlist())));
   if (tools.includes('kiro') && fs.existsSync(path.dirname(path.dirname(path.dirname(kiroPermissionsFile(root)))))) {
     out.push({ file: '~/.kiro/workspace-roots/…/permissions.yaml', ok: contains(kiroPermissionsFile(root), KIRO_MATCH[0] as string) });
   }

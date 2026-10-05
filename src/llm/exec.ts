@@ -79,20 +79,32 @@ export function runProcess(
       resolve({ code, stdout, stderr, timedOut, ms: Date.now() - started, ...(error ? { error } : {}) });
     };
     let child: ReturnType<typeof spawn>;
+    // Its own process group (POSIX), so a timeout also stops whatever the CLI started (helpers,
+    // MCP servers, shells) instead of leaving them running against a deleted scratch directory.
+    const group = process.platform !== 'win32';
     try {
       child = spawn(cmd, [...args], {
         cwd: opts.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: group,
         env: { ...process.env, DEVCTX_INTERNAL: '1', NO_COLOR: '1', FORCE_COLOR: '0', ...opts.env },
       });
     } catch (error) {
       finish(null, (error as Error).message);
       return;
     }
+    const kill = (signal: NodeJS.Signals): void => {
+      try {
+        if (group && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        // already gone
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
+      kill('SIGTERM');
+      setTimeout(() => kill('SIGKILL'), 2_000).unref();
     }, opts.timeoutMs);
     child.stdout?.on('data', (d: Buffer) => {
       if (stdout.length < MAX_OUTPUT) stdout += d.toString('utf8');

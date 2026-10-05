@@ -7,7 +7,7 @@
     "views": [
       { "id": "capture", "label": "1. 캡처", "focus": ["dev", "tools", "hook", "state"], "note": "AI 도구의 hook이 대화를 로컬에 기록한다. 도구는 기다리지 않는다." },
       { "id": "organize", "label": "2. 정리", "focus": ["state", "worker", "router", "cli", "knowledge"], "note": "worker가 백그라운드에서 규칙을 추출하고 기존 결정과 비교해 파일로 정리한다." },
-      { "id": "deliver", "label": "3. 전달", "focus": ["knowledge", "agents", "tools", "hook"], "note": "결정은 AGENTS.md와 도구별 규칙 파일로, 관련 결정은 프롬프트마다 hook으로 전달된다." },
+      { "id": "deliver", "label": "3. 전달", "focus": ["knowledge", "agents", "tools", "hook"], "note": "세션 시작 hook이 규칙 목록을, 프롬프트마다 관련 결정과 새 결정을 전달한다. 도구별 규칙 파일은 PC마다 만든다." },
       { "id": "share", "label": "4. 공유", "focus": ["knowledge", "agents", "git"], "note": "결정 파일은 사용자 커밋에 함께 실려 clone한 팀원에게도 그대로 적용된다." }
     ]
   },
@@ -20,11 +20,11 @@
     { "id": "router", "type": "backend", "label": "모델 라우터", "sublabel": "요구사항 통과 · 최저가", "pos": [1170, 340], "size": [170, 64] },
     { "id": "cli", "type": "external", "label": "도구 CLI", "sublabel": "claude -p · codex exec", "pos": [1170, 120], "size": [170, 64] },
     { "id": "knowledge", "type": "database", "label": ".devctx/knowledge", "sublabel": "결정 1건 = 파일 1개", "pos": [900, 560], "size": [150, 64] },
-    { "id": "agents", "type": "frontend", "label": "AGENTS.md · 규칙 파일", "sublabel": "compile로 생성", "pos": [290, 560], "size": [220, 64] },
+    { "id": "agents", "type": "frontend", "label": "규칙 목록 · 도구별 규칙 파일", "sublabel": "PC마다 compile (Git 제외)", "pos": [290, 560], "size": [220, 64] },
     { "id": "git", "type": "cloud", "label": "Git 저장소", "sublabel": "clone하면 같은 규칙", "pos": [1170, 560], "size": [170, 64] }
   ],
   "boundaries": [
-    { "kind": "region", "label": "Git으로 공유", "wraps": ["agents", "knowledge"] }
+    { "kind": "region", "label": "저장소 작업 트리", "wraps": ["agents", "knowledge"] }
   ],
   "connections": [
     { "id": "dev-to-tools", "from": "dev", "to": "tools", "label": "프롬프트", "variant": "emphasis" },
@@ -41,7 +41,7 @@
   ],
   "cards": [
     { "dot": "cyan", "title": "자동", "items": ["평소처럼 AI 도구만 쓴다", "hook은 기록만 하고 바로 끝난다", "정리는 백그라운드 worker가 한다"] },
-    { "dot": "emerald", "title": "공유", "items": [".devctx/knowledge와 AGENTS.md는 Git에 커밋된다", "clone한 팀원도 같은 규칙과 hook을 쓴다"] },
+    { "dot": "emerald", "title": "공유", "items": ["결정 파일(.devctx/knowledge)만 Git에 커밋된다. AGENTS.md에는 바뀌지 않는 안내 블록만 둔다", "clone한 팀원도 같은 규칙과 hook을 쓴다"] },
     { "dot": "violet", "title": "모델", "items": ["작업 중인 도구의 CLI로 추출한다", "요구사항을 전부 통과한 후보 중 가장 싼 모델을 쓴다"] }
   ]
 }

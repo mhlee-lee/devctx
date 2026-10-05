@@ -85,6 +85,8 @@ export interface KnowledgeItem {
   stale?: string | null;
   /** When `needs_review` was raised (the reviewing rule's time). */
   reviewSince?: string;
+  /** The file's `## 규칙` section and front matter `summary` disagree (the section is used). */
+  summaryDiffers?: boolean;
 }
 
 export interface Anchors {

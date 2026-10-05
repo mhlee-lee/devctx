@@ -73,6 +73,16 @@ export function packageRoot(): string {
   return path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 }
 
+/**
+ * The devctx CLI script next to this module (`src/cli.ts` or `dist/cli.js`), for background
+ * processes devctx starts itself. Not `process.argv[1]`: when devctx code runs inside another
+ * script (tests, tools using it as a library) that would start that script again.
+ */
+export function cliEntry(): string {
+  const here = fileURLToPath(import.meta.url);
+  return path.join(path.dirname(here), '..', `cli${path.extname(here)}`);
+}
+
 export function toPosixRelative(root: string, file: string): string {
   return path.relative(root, file).split(path.sep).join('/');
 }

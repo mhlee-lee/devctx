@@ -73,6 +73,13 @@ export const LANGUAGES: readonly LanguageSpec[] = [
   L('sql', 'SQL', ['.sql'], 'sql', 'sql'),
 ];
 
+/**
+ * Grammars that report syntax errors on valid, idiomatic code (tree-sitter-groovy is Java-based:
+ * no semicolons and untyped parameters read as errors). Their files still yield symbols and calls;
+ * the syntax-error count of these languages says nothing about a grammar mismatch.
+ */
+export const NOISY_GRAMMARS: ReadonlySet<string> = new Set(['groovy']);
+
 const BY_ID = new Map(LANGUAGES.map((l) => [l.id, l]));
 const BY_EXTENSION = new Map<string, LanguageSpec>();
 const BY_FILE = new Map<string, LanguageSpec>();

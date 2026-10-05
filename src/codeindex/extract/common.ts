@@ -65,6 +65,8 @@ export function leadingComment(n: Node): string {
 export class Builder {
   readonly f: FileFacts;
   readonly src: string;
+  /** The parser had to recover from syntax errors (a grammar mismatch shows up as many of these). */
+  syntaxErrors = false;
 
   constructor(lang: LangId, src: string) {
     this.src = src;

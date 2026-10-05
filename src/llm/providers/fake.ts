@@ -5,6 +5,7 @@ import type { LlmRawResult, Provider } from '../types.ts';
  * Test provider, active only when DEVCTX_FAKE_LLM points at a JSON file of queued answers:
  * `{ "extract": [answer, ...], "judge": [...], "qualify": [...] }`. Each call pops one answer for
  * its task (`{"__error": "..."}` simulates a failure) and appends the prompt to `<file>.requests.jsonl`.
+ * DEVCTX_FAKE_MODELS sets how many candidate models it offers (default 1), to test retries.
  */
 export const fakeProvider: Provider = {
   id: 'fake',
@@ -19,7 +20,15 @@ export const fakeProvider: Provider = {
   },
 
   async discover() {
-    return [{ provider: 'fake', id: 'fake-small', extraArgs: [], effort: null, description: 'fast test model', source: 'discovered' }];
+    const n = Math.max(1, Math.min(5, Number(process.env.DEVCTX_FAKE_MODELS ?? 1) || 1));
+    return Array.from({ length: n }, (_, i) => ({
+      provider: 'fake' as const,
+      id: i === 0 ? 'fake-small' : `fake-small-${i + 1}`,
+      extraArgs: [],
+      effort: null,
+      description: 'fast test model',
+      source: 'discovered' as const,
+    }));
   },
 
   async run(_bin, model, req): Promise<LlmRawResult> {

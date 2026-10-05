@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import type { DevctxConfig } from '../config.ts';
 import { git } from '../util/git.ts';
+import { cliEntry } from '../util/paths.ts';
 import { codeDbPath, hasGrammar, indexingInProgress, listRepoFiles } from './files.ts';
 import { detectLanguages, languageById, type DetectedLanguage } from './languages.ts';
 import { CodeStore } from './store.ts';
@@ -25,16 +26,18 @@ export interface IndexMeta {
   files: number;
   parsed: number;
   failed: number;
+  /** Languages whose files the parser had to recover from syntax errors. */
+  syntax: { lang: string; files: number; total: number; examples: string[] }[];
 }
 
 export function readIndexMeta(root: string): IndexMeta {
   const store = CodeStore.openExisting(codeDbPath(root));
-  if (!store) return { exists: false, head: null, syncedAt: null, files: 0, parsed: 0, failed: 0 };
+  if (!store) return { exists: false, head: null, syncedAt: null, files: 0, parsed: 0, failed: 0, syntax: [] };
   try {
     const c = store.counts();
-    return { exists: true, head: store.meta('head') || null, syncedAt: store.meta('synced_at'), ...c };
+    return { exists: true, head: store.meta('head') || null, syncedAt: store.meta('synced_at'), ...c, syntax: store.syntaxErrors() };
   } catch {
-    return { exists: false, head: null, syncedAt: null, files: 0, parsed: 0, failed: 0 };
+    return { exists: false, head: null, syncedAt: null, files: 0, parsed: 0, failed: 0, syntax: [] };
   } finally {
     store.close();
   }
@@ -67,7 +70,7 @@ export async function indexPass(root: string, cfg: DevctxConfig): Promise<SyncRe
 }
 
 function runPass(root: string): Promise<number | null> {
-  const entry = process.argv[1];
+  const entry = cliEntry();
   if (!entry) return Promise.resolve(null);
   return new Promise((resolve) => {
     try {

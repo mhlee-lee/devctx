@@ -169,6 +169,18 @@ function firstLine(text: string): string {
   return '';
 }
 
+/** The `## 규칙` section as one line (list markers dropped): what the agents receive. */
+function ruleText(rule: string): string {
+  return rule
+    .split('\n')
+    .map((line) => line.replace(/^\s*([-*+]|\d+\.)\s+/, '').trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** Bump when parsing changes what an item reads as, so cached parses are redone. */
+export const PARSE_VERSION = '2';
+
 export interface ParseResult {
   item: KnowledgeItem | null;
   error: string | null;
@@ -196,7 +208,11 @@ export function parseItem(text: string, file: string, fallbackDate?: string): Pa
     }
   }
   const baseName = path.basename(file, '.md');
-  const summary = normalizeText(str(m.summary) || firstLine(sections.rule));
+  // The `## 규칙` section is the rule: a person editing the file edits that section, so it wins
+  // over the front matter `summary` (kept for older files and files with only front matter).
+  const bodyRule = normalizeText(ruleText(sections.rule));
+  const metaSummary = normalizeText(str(m.summary));
+  const summary = bodyRule || metaSummary || normalizeText(firstLine(sections.rule));
   if (!summary) return { item: null, error: 'empty rule: add a summary or a "## 규칙" section' };
   const scope = obj(m.scope);
   const source = obj(m.source);
@@ -238,6 +254,7 @@ export function parseItem(text: string, file: string, fallbackDate?: string): Pa
     sections: { ...sections, rule: sections.rule || summary },
     file,
   };
+  if (bodyRule && metaSummary && bodyRule.replace(/[\s.。]+$/u, '') !== metaSummary.replace(/[\s.。]+$/u, '')) item.summaryDiffers = true;
   return { item, error: null };
 }
 

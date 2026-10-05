@@ -13,6 +13,8 @@ interface CatalogFile {
 interface CommunityCache {
   fetched_at: string;
   source: string;
+  /** NORMALIZE_VERSION the keys were made with (missing: the first version). */
+  norm?: number;
   /** normalized model id -> USD per 1M tokens */
   prices: Record<string, { in: number; out: number }>;
 }
@@ -35,18 +37,30 @@ function communityFile(): string {
 let community: CommunityCache | null | undefined;
 
 function loadCommunity(): CommunityCache | null {
-  if (community === undefined) community = readJson<CommunityCache | null>(communityFile(), null);
+  if (community === undefined) {
+    const cached = readJson<CommunityCache | null>(communityFile(), null);
+    // Keys made by an older normalization would match the wrong models: unused until refreshed.
+    community = cached && cached.norm === NORMALIZE_VERSION ? cached : null;
+  }
   return community;
 }
 
-/** `claude-haiku-4.5`, `anthropic/claude-haiku-4-5` and `Claude Haiku 4.5` all normalize alike. */
+/**
+ * `claude-haiku-4.5`, `anthropic/claude-haiku-4-5` and `Claude Haiku 4.5` all normalize to
+ * `claude-haiku-4-5`. Separators become one `-` instead of disappearing, so `gpt-5.6` and `gpt-56`
+ * stay different models.
+ */
 export function normalizeModelId(id: string): string {
   return id
     .toLowerCase()
     .replace(/^[a-z0-9_-]+\//, '')
     .replace(/-\d{8}$/, '')
-    .replace(/[^a-z0-9]/g, '');
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }
+
+/** Bump when `normalizeModelId` changes: cached community prices are keyed by it. */
+const NORMALIZE_VERSION = 2;
 
 export function catalogModels(provider: ProviderId): string[] {
   return loadBundled()
@@ -192,7 +206,7 @@ export async function refreshCommunityPrices(maxAgeDays: number): Promise<boolea
   if (maxAgeDays <= 0 || process.env.DEVCTX_OFFLINE === '1') return false;
   const file = communityFile();
   const cached = readJson<CommunityCache | null>(file, null);
-  if (cached && Date.now() - Date.parse(cached.fetched_at) < maxAgeDays * 86_400_000) return false;
+  if (cached && cached.norm === NORMALIZE_VERSION && Date.now() - Date.parse(cached.fetched_at) < maxAgeDays * 86_400_000) return false;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
@@ -212,7 +226,7 @@ export async function refreshCommunityPrices(maxAgeDays: number): Promise<boolea
       if (!existing || blended(entry.in, entry.out) < blended(existing.in, existing.out)) prices[key] = entry;
     }
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const fresh: CommunityCache = { fetched_at: new Date().toISOString(), source: LITELLM_URL, prices };
+    const fresh: CommunityCache = { fetched_at: new Date().toISOString(), source: LITELLM_URL, norm: NORMALIZE_VERSION, prices };
     writeJsonAtomic(file, fresh);
     community = fresh;
     return true;

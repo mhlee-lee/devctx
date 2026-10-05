@@ -33,6 +33,10 @@ const COMMON = new Set(
   ).split(' '),
 );
 
+export function isCommonName(name: string): boolean {
+  return COMMON.has(name);
+}
+
 export interface Edge {
   /** Calling symbol, or null for file-level code. */
   from: Sym | null;
@@ -890,6 +894,11 @@ export class Graph {
     return this.byName.get(family)?.get(name) ?? [];
   }
 
+  /** Whether some symbol of the language family is still declared under `name`. */
+  declares(family: Family, name: string): boolean {
+    return this.familyNames(family, name).length > 0;
+  }
+
   /** Symbols `name` refers to at file level of `file`, following the language's import rules. */
   private resolveName(file: FileNode, name: string, from: Sym | null = null): Resolved {
     const local = file.top.get(name);
@@ -968,7 +977,7 @@ export class Graph {
         .filter((c) => c.dir === '.' || from.path.startsWith(`${c.dir}/`))
         .sort((a, b) => b.dir.length - a.dir.length);
       for (const c of configs) {
-        const base = c.baseUrl ?? c.dir;
+        const base = c.baseUrl ?? c.pathsDir ?? c.dir;
         for (const [pattern, targets] of Object.entries(c.paths)) {
           const star = pattern.indexOf('*');
           let rest: string | null = null;
