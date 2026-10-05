@@ -123,6 +123,19 @@ export const CODE_TOOLS: readonly CodeTool[] = [
     ],
     example: 'search_text "ORDER_TIMEOUT"',
   },
+  {
+    name: 'search_history',
+    summary: {
+      ko: '이 저장소의 이전 작업: 예전 요청과 그때 한 일·결과, 실패했던 검증과 에러(TS2345 같은 식별자)·그것을 통과시킨 턴, 대체된 결정과 그 이유. 전에 다룬 듯한 문제나 에러를 다루기 전에 쓴다.',
+      en: 'Earlier work in this repository: past requests and how they ended, checks that failed with their error (identifiers like TS2345) and the turn that made them pass, replaced decisions and why. Use before working on a problem or error that may have come up before.',
+    },
+    args: [
+      { name: 'query', hint: '<words | error message | code name>', type: 'string', required: true },
+      { name: 'days', hint: '90', type: 'number' },
+      { name: 'limit', hint: '5', type: 'number' },
+    ],
+    example: 'search_history "refresh token deadlock"',
+  },
 ];
 
 export function codeTool(name: string): CodeTool | undefined {

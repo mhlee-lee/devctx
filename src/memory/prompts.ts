@@ -33,6 +33,9 @@ export interface ExtractedItem {
 
 const stringArray = { type: 'array', items: { type: 'string' } };
 
+/** Topics kept per rule: enough for the words people ask with (Korean, English, synonyms), few enough to stay specific. */
+export const MAX_TOPICS = 8;
+
 export const EXTRACT_SCHEMA: Record<string, unknown> = {
   type: 'object',
   additionalProperties: false,
@@ -120,7 +123,7 @@ Hard rules:
 10. statement: one self-contained sentence in ${languageName(lang)} that names its subject explicitly (imperative for rules). When the developer replaces one option with another, name both (for example "Use Vitest instead of Jest"). Keep it general: no line numbers, error messages or values that only mattered for the current task.
 11. title: at most 6 words in ${languageName(lang)}.
 12. scope.paths: glob patterns only when the developer referred to specific files, directories, modules or file types (for example "src/billing/**", "**/*.kt"); otherwise [].
-13. scope.topics: 1-5 short keywords; include Korean and English variants when natural.
+13. scope.topics: 3-8 short keywords people would use when they ask about this subject: its Korean and English names, common synonyms, the problem the rule prevents or the option it replaces (for example "부동소수점 오차", "float" and "double" for a BigDecimal rule) and the tools it names. No single generic word ("data", "code", "file", "copy", "데이터", "코드") and nothing that only fits this message.
 14. type: rule | decision | fact | procedure ("fact" for plain information about the project, such as where it is deployed). enforcement: "must" for must/never/반드시/절대/무조건/금지, "info" for facts, otherwise "should".
 15. confidence: 0 to 1, how sure you are this is a durable project rule the developer wants kept.
 16. Return {"items": []} when nothing qualifies.
@@ -174,7 +177,7 @@ export function parseExtractResult(data: unknown): ExtractedItem[] | null {
       enforcement: pick(it.enforcement, ['must', 'should', 'info'], 'should'),
       durability: complete || durability === 'one_off' ? durability : 'unclear',
       audience: pick(it.audience, ['team', 'personal'], 'team'),
-      scope: { paths: strings(scope.paths), topics: strings(scope.topics).slice(0, 5) },
+      scope: { paths: strings(scope.paths), topics: strings(scope.topics).slice(0, MAX_TOPICS) },
       evidence_quote: quote,
       reason: typeof it.reason === 'string' && it.reason.trim() ? it.reason.trim() : null,
       valid_until: dateOrNull(it.valid_until),

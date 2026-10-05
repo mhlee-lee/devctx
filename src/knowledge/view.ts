@@ -6,6 +6,7 @@ import { listFiles, readText } from '../util/fsx.ts';
 import { personalDir, type ProjectPaths } from '../util/paths.ts';
 import { today } from '../util/text.ts';
 import { parseItem, PARSE_VERSION } from './format.ts';
+import { heldReason } from './guard.ts';
 import { isKnowledgeFile, type LoadResult } from './store.ts';
 import type { KnowledgeItem } from './types.ts';
 
@@ -260,6 +261,9 @@ export function deriveStatus(items: readonly KnowledgeItem[], opts: { proposedTt
       if (!n.reviewSince || n.reviewSince < r.source.captured_at) n.reviewSince = r.source.captured_at;
     }
   }
+
+  // 6. Text that poses as a chat role or overrides the agent's instructions is never delivered.
+  for (const i of items) i.held = heldReason([i.summary, ...i.scope.paths].join(' '));
 }
 
 // ---------------------------------------------------------------------------------------------

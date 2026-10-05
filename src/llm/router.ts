@@ -8,7 +8,7 @@ import { callCostUsd, rankModels, type CostEstimate } from './catalog.ts';
 import { pickAnswer } from './json.ts';
 import { getProvider } from './providers/index.ts';
 import { qualifyModel, type QualifyResult } from './qualify.ts';
-import { SUITE_TASKS, SUITE_VERSION, suiteCalls, type SuiteTask } from './suite.ts';
+import { SUITE_TASKS, SUITE_VERSIONS, suiteCalls, suiteCurrent, type SuiteTask } from './suite.ts';
 import {
   candidateKey,
   TIERS,
@@ -204,7 +204,7 @@ function trusted(cfg: DevctxConfig, model: ModelCandidate): boolean {
 
 function qualificationFor(cache: RouterCache, key: string, task: SuiteTask, version: string | null): Qualification | null {
   const q = cache.qualification[qKey(key, task)];
-  if (!q || q.suite !== SUITE_VERSION || q.version !== version) return null;
+  if (!q || !suiteCurrent(task, q.suite) || q.version !== version) return null;
   const age = Date.now() - Date.parse(q.at);
   if (age > (q.status === 'error' ? ERROR_BACKOFF_MS : QUALIFICATION_TTL_MS)) return null;
   return q;
@@ -214,7 +214,7 @@ function storeQualification(cache: RouterCache, key: string, version: string | n
   cache.qualification[qKey(key, res.task)] = {
     status: res.blocked ? 'error' : res.pass ? 'pass' : 'fail',
     task: res.task,
-    suite: SUITE_VERSION,
+    suite: SUITE_VERSIONS[res.task],
     runs: res.runs,
     score: res.score,
     total: res.total,

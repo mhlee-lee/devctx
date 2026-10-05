@@ -87,6 +87,11 @@ export interface KnowledgeItem {
   reviewSince?: string;
   /** The file's `## 규칙` section and front matter `summary` disagree (the section is used). */
   summaryDiffers?: boolean;
+  /**
+   * The rule text poses as a chat role or tells the agent to ignore its instructions (see
+   * knowledge/guard.ts): held back from every delivery path until a person rewrites it.
+   */
+  held?: string | null;
 }
 
 export interface Anchors {

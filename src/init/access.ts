@@ -55,7 +55,8 @@ const DESCRIPTION =
   'Code index of this repository: find where classes, functions and components are defined, who calls them, what they call, ' +
   'file outlines, an architecture overview and the impact of uncommitted changes, by running `.devctx/bin/devctx code <tool>`. ' +
   'Use it before grepping or opening many files, and whenever you need to know where something is defined or used, how code ' +
-  'is connected, or what a change can break. (코드 탐색: 정의, 사용처, 호출 관계, 파일 구조, 변경 영향)';
+  'is connected, or what a change can break. Also earlier work in this repository (search_history: past requests, what was tried ' +
+  'and how it ended, replaced decisions and why). (코드 탐색: 정의, 사용처, 호출 관계, 파일 구조, 변경 영향, 이전 작업)';
 
 export function renderSkill(lang: Language, claude: boolean): string {
   const front = [

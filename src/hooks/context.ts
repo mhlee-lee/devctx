@@ -3,10 +3,11 @@ import { isExpired, itemLine, planTiers } from '../compile/tiers.ts';
 import type { DevctxConfig } from '../config.ts';
 import { scoreAll, type ScoreParts } from '../knowledge/retrieve.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
+import { canonical } from '../memory/dedupe.ts';
 import type { Language } from '../types.ts';
 import { approxTokens } from '../util/text.ts';
 
-const TEXT: Record<Language, { rules: string; personal: string; conflict: string; related: string; fresh: string; conflictMark: string }> = {
+const TEXT: Record<Language, { rules: string; personal: string; conflict: string; related: string; fresh: string; conflictMark: string; recent: (day: string) => string }> = {
   ko: {
     rules: '[devctx] 프로젝트 규칙 (이 저장소의 결정. 이 세션 동안 따른다):',
     personal: '[devctx] 이 사용자의 개인 설정:',
@@ -14,6 +15,7 @@ const TEXT: Record<Language, { rules: string; personal: string; conflict: string
     related: '[devctx] 이 요청과 관련된 프로젝트 결정 (자동 제공):',
     fresh: '[devctx] 이번 세션에서 새로 기록된 프로젝트 결정:',
     conflictMark: ' (충돌: 사용자 확인 필요)',
+    recent: (day) => `[devctx] 최근 ${RECENT_CHANGE_DAYS}일 동안 바뀐 결정 (오늘 ${day}). 코드에 이전 방식이 남아 있어도 새 결정을 따른다:`,
   },
   en: {
     rules: '[devctx] Project rules (decisions of this repository; follow them for this session):',
@@ -22,8 +24,39 @@ const TEXT: Record<Language, { rules: string; personal: string; conflict: string
     related: '[devctx] Project decisions relevant to this request (auto-provided):',
     fresh: '[devctx] Project decisions recorded during this session:',
     conflictMark: ' (conflict: ask the user)',
+    recent: (day) => `[devctx] Decisions changed in the last ${RECENT_CHANGE_DAYS} days (today is ${day}). Follow the new one even where the code still shows the old way:`,
   },
 };
+
+/** Days a decision that replaced another one is pointed out at session start. */
+export const RECENT_CHANGE_DAYS = 7;
+const RECENT_CHANGE_LIMIT = 5;
+
+export interface RecentChange {
+  item: KnowledgeItem;
+  replaced: KnowledgeItem;
+}
+
+/**
+ * Decisions that replaced a different rule in the last week, newest first. The code still shows
+ * the old way for a while (tests in Jest, the old error format), and an agent copying nearby code
+ * would follow it, so the session is told which one is current. Carrying the same rule forward (a
+ * new end date, a confirmed proposal) is not a change. Computed from the decision files alone.
+ */
+export function recentChanges(team: readonly KnowledgeItem[], now: Date = new Date()): RecentChange[] {
+  const since = new Date(now.getTime() - RECENT_CHANGE_DAYS * 86_400_000).toISOString();
+  const byId = new Map(team.map((i) => [i.id, i]));
+  const out: RecentChange[] = [];
+  for (const item of team) {
+    if (item.status !== 'active' || item.audience !== 'team' || item.held || isExpired(item)) continue;
+    if (item.supersedes.length === 0 || item.source.captured_at < since) continue;
+    const replaced = item.supersedes
+      .map((id) => byId.get(id))
+      .find((o): o is KnowledgeItem => Boolean(o && !o.held && canonical(o.summary) !== canonical(item.summary)));
+    if (replaced) out.push({ item, replaced });
+  }
+  return out.sort((a, b) => (a.item.source.captured_at < b.item.source.captured_at ? 1 : -1)).slice(0, RECENT_CHANGE_LIMIT);
+}
 
 /** Relevance hits below this score are not injected. */
 export const PROMPT_MIN_SCORE = 0.12;
@@ -73,14 +106,16 @@ const NOTICE: Record<Language, string> = {
 /**
  * Injected once per session, and the same for the whole session (tools keep their prompt cache):
  * the project rules (always-apply rules, and path rules when they are few), devctx health notices
- * (the agent passes them on), personal preferences and unresolved conflicts. AGENTS.md only points
- * here, so recording a decision never changes a file the tools load with every request.
+ * (the agent passes them on), personal preferences, unresolved conflicts and decisions that
+ * replaced another one this week. AGENTS.md only points here, so recording a decision never
+ * changes a file the tools load with every request.
  */
 export function sessionContext(
   team: readonly KnowledgeItem[],
   personal: readonly KnowledgeItem[],
   cfg: DevctxConfig,
   notices: readonly string[] = [],
+  now: Date = new Date(),
 ): InjectedContext {
   const t = TEXT[cfg.language];
   let budget = cfg.inject.session_budget_tokens;
@@ -107,13 +142,18 @@ export function sessionContext(
     ids.push(...fitted.map((f) => f.id));
     budget -= approxTokens(header) + fitted.reduce((n, f) => n + approxTokens(f.line), 0);
   };
-  addBlock(t.personal, personal.filter((i) => i.status === 'active' && !isExpired(i) && !i.local), (i) => `- ${i.summary}`);
+  addBlock(t.personal, personal.filter((i) => i.status === 'active' && !isExpired(i) && !i.local && !i.held), (i) => `- ${i.summary}`);
   addBlock(t.conflict, openConflicts(team), (i) => `- ${i.summary} [${i.id}]`);
+  const changes = new Map(recentChanges(team, now).map((c) => [c.item.id, c]));
+  addBlock(t.recent(now.toISOString().slice(0, 10)), [...changes.values()].map((c) => c.item), (i) => {
+    const c = changes.get(i.id) as RecentChange;
+    return `- ${i.source.captured_at.slice(0, 10)}: ${c.replaced.summary} → ${i.summary}`;
+  });
   return { text: parts.length > 0 ? parts.join('\n') : null, ids };
 }
 
 function openConflicts(team: readonly KnowledgeItem[]): KnowledgeItem[] {
-  return team.filter((i) => i.status === 'conflict' && i.audience === 'team' && !isExpired(i));
+  return team.filter((i) => i.status === 'conflict' && i.audience === 'team' && !isExpired(i) && !i.held);
 }
 
 export type TraceOutcome = 'injected' | 'fresh' | 'always loaded' | 'already injected' | 'below threshold' | 'over budget' | 'over limit' | 'skipped prompt';

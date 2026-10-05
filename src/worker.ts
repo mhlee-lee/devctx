@@ -4,6 +4,7 @@ import { compile, type CompileResult } from './compile/compile.ts';
 import { committedPaths } from './init/attributes.ts';
 import { isExpired } from './compile/tiers.ts';
 import { llmOff, loadConfig, type DevctxConfig } from './config.ts';
+import { processCases, pruneCases, type CaseScan } from './history/cases.ts';
 import { processHistory, type HistoryReport } from './history/process.ts';
 import { HISTORY_DIR } from './history/writer.ts';
 import { extractionDue } from './hooks/signals.ts';
@@ -46,6 +47,7 @@ export interface WorkerReport {
   committed: boolean;
   codeIndex?: SyncResult;
   history?: HistoryReport;
+  cases?: CaseScan;
   errors: string[];
 }
 
@@ -100,6 +102,7 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
   if (changed) db.kvSet('expired_seen', JSON.stringify([...seen].slice(-2000)));
   db.pruneEvents(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
   db.pruneHistoryTurns(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
+  pruneCases(db);
   const weekAgo = Date.now() - 7 * 86_400_000;
   for (const { key, value } of db.kvList('sess:')) {
     try {
@@ -128,6 +131,13 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
     const cfg = loadConfig(paths);
     const db = StateDb.open(paths.stateDb);
     try {
+      // Verification cases first: read from the tools' transcripts without an LLM, so they are there
+      // for the next session even while extraction below waits on price lookups and model calls.
+      try {
+        report.cases = processCases(db);
+      } catch (error) {
+        report.errors.push(`cases: ${errorMessage(error)}`);
+      }
       const log = (message: string, extra?: Record<string, unknown>): void => logLine(paths.log, 'info', message, extra);
       const route: RouteOptions | null = opts.allowLlm
         ? { cfg, host: opts.host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
@@ -228,6 +238,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         applied: report.applied.map((a) => `${a.relation}:${a.itemId ?? '-'}`),
         changed: report.compiled.changed,
         history: report.history?.written.length ?? 0,
+        cases: report.cases ? `${report.cases.opened} new, ${report.cases.resolved} resolved` : undefined,
         errors: report.errors.slice(0, 5),
       });
       return report;

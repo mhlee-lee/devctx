@@ -88,6 +88,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | 지금 적용 중인 결정 보기 | `devctx status` |
 | 자동으로 바뀐 내용과 이유 보기 | `devctx log` |
 | 어떤 프롬프트에 어떤 결정이 붙는지 보기 | `devctx why "프롬프트"` |
+| 전에 했던 작업·실패한 접근·바뀐 결정의 이유 찾기 | `devctx recall "단어"` (AI는 스킬의 `search_history`로 같은 검색을 한다) |
 | 잘못 기록된 결정 고치기 | `.devctx/knowledge/decisions/`의 파일에서 `## 규칙` 구간을 고치거나 파일을 지우고 커밋한다. AI에 전달되는 것은 `## 규칙` 구간이다(front matter `summary`와 다르면 `devctx doctor`가 알린다) |
 
 ## 4. 어디에 저장되나
@@ -99,14 +100,14 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | 규칙 목록, 도구별 경로 규칙 파일 | `.devctx/rules.md`, `.github/instructions/devctx-*` 등 | 이 PC만 (결정에서 PC마다 똑같이 만든다, `.gitignore`) |
 | 설정 | `.devctx/config.yaml` | 공유 |
 | hook, 스킬, 명령 허용 설정 | `.claude/`, `.codex/`, `.github/hooks/`, `.cursor/`, `.kiro/`, `.agents/`, `.vscode/settings.json` | 공유 |
-| 대화 기록(프롬프트·AI 마지막 응답, 비밀값은 자리표시자로), 확인 대기, 반복·위반 횟수 | `.devctx/local/state.sqlite` | 이 PC만 |
+| 대화 기록(프롬프트·AI 마지막 응답, 비밀값은 자리표시자로), 확인 대기, 반복·위반 횟수, 검증 사례(실패했다가 통과한 테스트·빌드와 에러 몇 줄) | `.devctx/local/state.sqlite` | 이 PC만 |
 | 코드 인덱스 | `.devctx/local/code.sqlite` | 이 PC만 |
 | 로그 | `.devctx/local/devctx.log` | 이 PC만 |
 | 프롬프트 히스토리 (켰을 때만) | `.devctx/history/` (세션마다 파일 1개, 커밋 뒤 이어지면 새 파일) | 공유 |
 | 히스토리·프롬프트 분석 켜짐/꺼짐 | `~/.local/share/devctx/history.json`, `capture.json` | 이 PC만 |
 | 개인 선호, 모델 평가 결과 | `~/.local/share/devctx/` | 이 PC만 |
 
-`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 다만 hook은 히스토리를 꺼도 프롬프트를 이 PC의 `state.sqlite`에 저장한다(규칙 추출과 세션 이어가기용). 분석이 끝난 것은 90일이 지나면 지우고, 지금 지우려면 `devctx purge`를 실행한다(아직 분석하지 않은 프롬프트 속 규칙은 기록되지 않는다). 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
+`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 다만 hook은 히스토리를 꺼도 프롬프트를 이 PC의 `state.sqlite`에 저장한다(규칙 추출, 세션 이어가기, 이전 작업 검색용). 분석이 끝난 것은 90일이 지나면 지우고, 지금 지우려면 `devctx purge`를 실행한다(아직 분석하지 않은 프롬프트 속 규칙은 기록되지 않는다). 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
 
 ## 5. 비용과 토큰
 
@@ -223,6 +224,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | `devctx status` | 지금 적용 중인 결정 보기 (히스토리·프롬프트 분석 켜짐/꺼짐도) |
 | `devctx log` | 자동으로 무엇이 왜 바뀌었는지 |
 | `devctx why "프롬프트"` | 결정이 안 붙거나 엉뚱한 결정이 붙을 때 |
+| `devctx recall "단어"` | 전에 한 작업, 실패한 접근, 결정이 바뀐 이유를 찾을 때 |
 | `devctx remember "규칙"` | 직접 기록 (바로 확정) |
 | `devctx approve [<ID>]`, `devctx discard <ID>` | 확인 대기 목록 보기, 확정, 버리기 |
 | `devctx resolve <ID>` | 충돌 정리 (고른 규칙만 남김) |

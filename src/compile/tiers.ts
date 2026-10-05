@@ -26,9 +26,12 @@ export function isExpired(item: KnowledgeItem, day: string = today()): boolean {
   return item.valid_until !== null && item.valid_until < day;
 }
 
-/** Live for delivery: active, team-wide and not past its end date (even before the worker retires it). */
+/**
+ * Live for delivery: active, team-wide, not past its end date (even before the worker retires it)
+ * and not held back for text that poses as a chat role or overrides instructions.
+ */
 export function isDeliverable(item: KnowledgeItem, day: string = today()): boolean {
-  return item.status === 'active' && item.audience === 'team' && !isExpired(item, day);
+  return item.status === 'active' && item.audience === 'team' && !isExpired(item, day) && !item.held;
 }
 
 /** A rule the user had to repeat is one the assistant kept missing: give it more weight. */
@@ -50,7 +53,8 @@ export function itemLine(item: KnowledgeItem, lang: Language, withScope: boolean
   const until = item.valid_until && !item.summary.includes(item.valid_until) ? l.until(item.valid_until) : '';
   // What it depended on is gone from the repository: the agent should confirm before relying on it.
   const stale = item.stale ? ` (${item.stale})` : '';
-  return `- ${mark}${item.summary}${until}${scope}${stale}`;
+  // One line whatever a hand-edited file holds (a path with a line break cannot start a new block).
+  return `- ${mark}${item.summary}${until}${scope}${stale}`.replace(/[\r\n\u2028\u2029]+/g, ' ');
 }
 
 /** Possibly outdated (code evidence gone) and not pinned by a person: delivered only on demand. */

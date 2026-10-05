@@ -3,6 +3,7 @@ import { indexNeedsRefresh } from '../codeindex/service.ts';
 import { compile } from '../compile/compile.ts';
 import { isExpired } from '../compile/tiers.ts';
 import { loadConfig } from '../config.ts';
+import { caseHint, casesPending } from '../history/cases.ts';
 import { captureHistory, historyNotice } from '../history/capture.ts';
 import { captureEnabled, historyEnabled } from '../history/toggle.ts';
 import { readLastAssistant } from '../history/transcript.ts';
@@ -18,7 +19,7 @@ import { findProjectRoot, projectPaths, type ProjectPaths } from '../util/paths.
 import { approxTokens, normalizeForMatch, today, truncate } from '../util/text.ts';
 import { spawnWorker } from '../worker-spawn.ts';
 import { promptContext, promptKind, sessionContext } from './context.ts';
-import { continuesSession, renderHandoff } from './handoff.ts';
+import { continuesSession, handoffExtras, renderHandoff } from './handoff.ts';
 import { normalizeHook } from './normalize.ts';
 import { promptInjectable, renderHookOutput } from './output.ts';
 import { detectSignals, extractionDue } from './signals.ts';
@@ -33,6 +34,8 @@ interface SessionState {
   prompts?: number;
   /** The previous session's handoff was already given. */
   handoff?: boolean;
+  /** Error identifiers already pointed out in this session (verification cases). */
+  hinted?: string[];
 }
 
 /** Handoff is considered on the first prompts of a session, for sessions that ended within a week. */
@@ -209,7 +212,7 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
         if (cfg.inject.handoff_budget_tokens > 0 && !state.handoff && state.prompts <= HANDOFF_PROMPTS && promptKind(prompt) !== 'command') {
           const before = state.started < event.ts ? state.started : event.ts;
           const prev = db.previousSession(before, new Date(now.getTime() - HANDOFF_MAX_AGE_MS).toISOString(), event.session);
-          if (prev && continuesSession(prompt, prev)) handoff = renderHandoff(prev, cfg.language, cfg.inject.handoff_budget_tokens, now);
+          if (prev && continuesSession(prompt, prev)) handoff = renderHandoff(prev, cfg.language, cfg.inject.handoff_budget_tokens, now, handoffExtras(root, prev));
           if (handoff) state.handoff = true;
         }
         const code = cfg.code_index.enabled
@@ -223,10 +226,23 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
           codePaths: code.paths,
           violations: boosts,
         });
+        // An error identifier another session ran into: how it went then (one line, once per session).
+        let hint: string | null = null;
+        if (cfg.inject.prompt_budget_tokens > 0 && promptKind(prompt) === 'normal') {
+          try {
+            const found = caseHint(db, prompt, event.session, cfg.language, new Set(state.hinted ?? []), now);
+            if (found) {
+              hint = found.text;
+              state.hinted = [...(state.hinted ?? []), found.signature].slice(-50);
+            }
+          } catch (error) {
+            logLine((paths as ProjectPaths).log, 'warn', 'case hint failed', { error: errorMessage(error) });
+          }
+        }
         state.injected.push(...ctx.ids);
         state.updated = now.toISOString();
         writeSession(db, tool, event.session, state);
-        const text = [handoff, ctx.text, code.text].filter(Boolean).join('\n\n') || null;
+        const text = [handoff, hint, ctx.text, code.text].filter(Boolean).join('\n\n') || null;
         if (fresh) db.recordInjection({ tool, session: event.session, kind, ids: ctx.ids, tokens: text ? approxTokens(text) : 0, handoff: Boolean(handoff) });
         output = renderHookOutput(tool, kind, text) ?? fallback;
       }
@@ -246,7 +262,9 @@ export async function runHook(tool: ToolId, kind: HookKind): Promise<string | nu
       const historyNow = fresh && kind !== 'prompt' && (historyReady || db.hasReadyHistory());
       // Auto-commit happens in the worker at session end, also when this hook has nothing new.
       const commitNow = fresh && kind === 'session_end' && cfg.git.commit_mode === 'auto-commit';
-      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || extractNow || historyNow || commitNow)) spawnWorker(root, kind, event.host);
+      // Verification cases of finished turns are read at session boundaries (not after every turn).
+      const casesNow = fresh && (kind === 'session_start' || kind === 'session_end') && casesPending(db);
+      if (fresh && kind !== 'prompt' && (codeRefresh || expiredLive || extractNow || historyNow || commitNow || casesNow)) spawnWorker(root, kind, event.host);
       return output;
     } finally {
       db.close();

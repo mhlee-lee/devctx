@@ -88,7 +88,7 @@ export interface RenderResult {
 }
 
 export function openConflicts(items: readonly KnowledgeItem[]): KnowledgeItem[] {
-  return items.filter((i) => i.status === 'conflict' && i.audience === 'team' && !isExpired(i));
+  return items.filter((i) => i.status === 'conflict' && i.audience === 'team' && !isExpired(i) && !i.held);
 }
 
 /**

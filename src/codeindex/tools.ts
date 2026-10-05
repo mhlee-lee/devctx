@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { loadConfig, type DevctxConfig } from '../config.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import { applyCachedStale, loadTeam } from '../knowledge/view.ts';
+import { searchHistory } from '../recall.ts';
 import { StateDb } from '../state/db.ts';
 import { errorMessage, logLine } from '../util/log.ts';
 import { git } from '../util/git.ts';
@@ -178,12 +179,16 @@ function decisions(root: string, cfg: DevctxConfig): KnowledgeItem[] {
 export async function runCodeTool(root: string, name: string, args: Args): Promise<string> {
   const paths = projectPaths(root);
   const cfg = loadConfig(paths);
-  if (!cfg.code_index.enabled) return 'The code index is turned off for this repository (code_index.enabled: false in .devctx/config.yaml).';
   const tool = codeTool(name);
+  // Past work needs no code index: it answers also with code_index.enabled: false.
+  if (tool?.name !== 'search_history' && !cfg.code_index.enabled) return 'The code index is turned off for this repository (code_index.enabled: false in .devctx/config.yaml).';
   if (!tool) throw new Error(`unknown tool: ${name}`);
   const missing = tool.args.find((a) => a.required && args[a.name] === undefined);
   if (missing) throw new CodeToolError(`missing <${missing.name}>. usage: ${usageLine(tool, '.devctx/bin/devctx code')}`);
   args = validateToolArgs(tool, args);
+  if (tool.name === 'search_history') {
+    return searchHistory(root, str(args, 'query') ?? '', { ...optional('days', num(args, 'days')), ...optional('limit', num(args, 'limit')) });
+  }
   if (tool.name === 'search_text') {
     return searchText(root, str(args, 'pattern') ?? '', {
       regex: bool(args, 'regex') ?? false,

@@ -26,9 +26,17 @@ export interface PreviousSession {
   tool: string;
   session: string | null;
   endedAt: string;
+  /** The session's first recorded event. */
+  startedAt: string;
   /** Up to the last 3 requests, oldest first. */
   prompts: string[];
+  /** Up to the first 3 requests, oldest first (what the session set out to do). */
+  openingPrompts: string[];
+  /** Requests in the session. */
+  promptCount: number;
   lastAssistant: string | null;
+  /** The tool's transcript of the session, when its hooks reported one. */
+  transcriptPath: string | null;
 }
 
 export interface InjectionRecord {
@@ -139,6 +147,23 @@ create table if not exists history_turns(
 );
 create index if not exists history_state on history_turns(state, prompt_ts);
 create index if not exists history_session on history_turns(skey, prompt_ts);
+create table if not exists cases(
+  id text primary key,
+  session text not null,
+  tool text not null,
+  command text not null,
+  state text not null,
+  inferred integer not null default 0,
+  signature text,
+  error text,
+  failed_at text not null,
+  resolved_at text,
+  fail_prompt text,
+  fix_prompt text,
+  fix_reply text
+);
+create index if not exists cases_open on cases(session, command, state);
+create index if not exists cases_signature on cases(signature, failed_at);
 `;
 
 /**
@@ -164,6 +189,45 @@ export interface HistoryTurn {
   file: string | null;
   error: string | null;
 }
+/**
+ * A check that failed in a session, and whether a later run of the same check in that session
+ * passed (`resolved`) or the session ended without that (`unresolved`). Kept on this PC only.
+ */
+export interface CaseRow {
+  id: string;
+  session: string;
+  tool: string;
+  command: string;
+  state: 'failed' | 'resolved' | 'unresolved';
+  /** The failure or the pass was read from the output, not from an exit status. */
+  inferred: boolean;
+  signature: string | null;
+  error: string | null;
+  failedAt: string;
+  resolvedAt: string | null;
+  failPrompt: string | null;
+  fixPrompt: string | null;
+  fixReply: string | null;
+}
+
+function caseRow(r: Row): CaseRow {
+  return {
+    id: String(r.id),
+    session: String(r.session),
+    tool: String(r.tool),
+    command: String(r.command),
+    state: String(r.state) as CaseRow['state'],
+    inferred: Number(r.inferred) === 1,
+    signature: asString(r.signature),
+    error: asString(r.error),
+    failedAt: String(r.failed_at),
+    resolvedAt: asString(r.resolved_at),
+    failPrompt: asString(r.fail_prompt),
+    fixPrompt: asString(r.fix_prompt),
+    fixReply: asString(r.fix_reply),
+  };
+}
+
 /** How often this PC saw a committed rule again (kept out of git so files never change). */
 export interface ItemStats {
   reinforced: number;
@@ -381,7 +445,173 @@ export class StateDb {
       .prepare(`select last_assistant from events where ${where} and kind = 'turn_end' and last_assistant is not null and ts <= ? order by ts desc limit 1`)
       .get(...args, endedAt) as Row | undefined;
     if (prompts.length === 0 && !reply) return null;
-    return { tool, session, endedAt, prompts, lastAssistant: reply ? asString(reply.last_assistant) : null };
+    const span = this.db
+      .prepare(`select min(ts) as started, sum(case when kind = 'prompt' and prompt is not null then 1 else 0 end) as n from events where ${where} and ts <= ?`)
+      .get(...args, endedAt) as Row | undefined;
+    const opening = (
+      this.db
+        .prepare(`select prompt from events where ${where} and kind = 'prompt' and prompt is not null and ts <= ? order by ts asc limit 3`)
+        .all(...args, endedAt) as Row[]
+    ).map((r) => String(r.prompt));
+    const transcript = this.db
+      .prepare(`select transcript_path from events where ${where} and transcript_path is not null and ts <= ? order by ts desc limit 1`)
+      .get(...args, endedAt) as Row | undefined;
+    return {
+      tool,
+      session,
+      endedAt,
+      startedAt: asString(span?.started) ?? endedAt,
+      prompts,
+      openingPrompts: opening,
+      promptCount: Number(span?.n ?? prompts.length),
+      lastAssistant: reply ? asString(reply.last_assistant) : null,
+      transcriptPath: transcript ? asString(transcript.transcript_path) : null,
+    };
+  }
+
+  /**
+   * Requests and the assistant's reply that followed each, since `sinceIso`, oldest first (hook
+   * events of this worktree; for `devctx recall`). Unprocessed or not, every captured turn counts.
+   */
+  turnsSince(sinceIso: string, limit = 5000): { ts: string; tool: string; session: string | null; prompt: string; reply: string | null }[] {
+    const rows = this.db
+      .prepare(
+        `select ts, tool, session, kind, prompt, last_assistant from events
+         where kind in ('prompt', 'turn_end') and tool not in ('cli', 'file') and ts >= ?
+         order by ts desc limit ?`,
+      )
+      .all(sinceIso, limit) as Row[];
+    rows.reverse(); // the newest `limit` events, read oldest first
+    const turns: { ts: string; tool: string; session: string | null; prompt: string; reply: string | null }[] = [];
+    const open = new Map<string, number>();
+    for (const r of rows) {
+      const session = asString(r.session);
+      const key = session ?? `-${String(r.tool)}`;
+      if (r.kind === 'prompt' && typeof r.prompt === 'string' && r.prompt.trim()) {
+        open.set(key, turns.length);
+        turns.push({ ts: String(r.ts), tool: String(r.tool), session, prompt: r.prompt, reply: null });
+      } else if (r.kind === 'turn_end' && typeof r.last_assistant === 'string') {
+        const at = open.get(key);
+        const turn = at === undefined ? undefined : turns[at];
+        if (turn && turn.reply === null) turn.reply = r.last_assistant;
+      }
+    }
+    return turns;
+  }
+
+  // ---- verification cases (failed check -> passed again) ------------------------------------
+
+  /** Sessions with turn ends after `afterTs` whose transcript is known: what case scanning reads. */
+  sessionsEndedAfter(afterTs: string): { session: string; tool: string; transcript: string; lastEnd: string }[] {
+    const rows = this.db
+      .prepare(
+        `select session, tool, max(ts) as last_end from events
+         where kind = 'turn_end' and session is not null and tool not in ('cli', 'file') and ts > ?
+         group by session, tool order by last_end asc limit 200`,
+      )
+      .all(afterTs) as Row[];
+    const out: { session: string; tool: string; transcript: string; lastEnd: string }[] = [];
+    for (const r of rows) {
+      const t = this.db
+        .prepare("select transcript_path from events where session = ? and transcript_path is not null order by ts desc limit 1")
+        .get(String(r.session)) as Row | undefined;
+      const transcript = t ? asString(t.transcript_path) : null;
+      if (transcript) out.push({ session: String(r.session), tool: String(r.tool), transcript, lastEnd: String(r.last_end) });
+    }
+    return out;
+  }
+
+  /** Any turn end with a transcript after `afterTs` (cheap check for the hooks). */
+  hasTurnsToScan(afterTs: string): boolean {
+    return Boolean(
+      this.db.prepare("select 1 from events where kind = 'turn_end' and session is not null and transcript_path is not null and ts > ? limit 1").get(afterTs),
+    );
+  }
+
+  /** The request of the turn running at `ts` in a session, and the reply that ended it. */
+  turnAt(session: string, ts: string): { prompt: string | null; reply: string | null } {
+    const p = this.db
+      .prepare("select prompt from events where session = ? and kind = 'prompt' and prompt is not null and ts <= ? order by ts desc limit 1")
+      .get(session, ts) as Row | undefined;
+    const r = this.db
+      .prepare("select last_assistant from events where session = ? and kind = 'turn_end' and last_assistant is not null and ts >= ? order by ts asc limit 1")
+      .get(session, ts) as Row | undefined;
+    return { prompt: p ? asString(p.prompt) : null, reply: r ? asString(r.last_assistant) : null };
+  }
+
+  /**
+   * The case a run of `command` in `session` continues: a failed one, or one marked unresolved
+   * while the session was quiet (a session left open overnight goes on with the same id).
+   */
+  openCase(session: string, command: string): CaseRow | null {
+    const r = this.db
+      .prepare("select * from cases where session = ? and command = ? and state in ('failed', 'unresolved') order by failed_at desc limit 1")
+      .get(session, command) as Row | undefined;
+    return r ? caseRow(r) : null;
+  }
+
+  reopenCase(id: string): void {
+    this.db.prepare("update cases set state = 'failed' where id = ? and state = 'unresolved'").run(id);
+  }
+
+  insertCase(c: Omit<CaseRow, 'id' | 'state' | 'resolvedAt' | 'fixPrompt' | 'fixReply'>): string {
+    const id = ulid();
+    this.db
+      .prepare('insert into cases(id, session, tool, command, state, inferred, signature, error, failed_at, fail_prompt) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, c.session, c.tool, c.command, 'failed', c.inferred ? 1 : 0, c.signature, c.error ? redactSecrets(c.error) : null, c.failedAt, c.failPrompt ? redactSecrets(c.failPrompt) : null);
+    return id;
+  }
+
+  /** A later failure of an open case: keep its latest error (that is the one that got fixed). */
+  updateCaseError(id: string, signature: string | null, error: string | null, inferred: boolean): void {
+    this.db
+      .prepare('update cases set signature = coalesce(?, signature), error = coalesce(?, error), inferred = max(inferred, ?) where id = ?')
+      .run(signature, error ? redactSecrets(error) : null, inferred ? 1 : 0, id);
+  }
+
+  resolveCase(id: string, at: string, fix: { prompt: string | null; reply: string | null }, inferred: boolean): void {
+    this.db
+      .prepare("update cases set state = 'resolved', resolved_at = ?, fix_prompt = ?, fix_reply = ?, inferred = max(inferred, ?) where id = ?")
+      .run(at, fix.prompt ? redactSecrets(fix.prompt) : null, fix.reply ? redactSecrets(fix.reply.slice(0, 4000)) : null, inferred ? 1 : 0, id);
+  }
+
+  /** Open cases of sessions with no event since `beforeIso` stay unresolved. */
+  closeStaleCases(beforeIso: string): number {
+    const res = this.db
+      .prepare(
+        `update cases set state = 'unresolved'
+         where state = 'failed' and not exists (select 1 from events e where e.session = cases.session and e.ts >= ?)`,
+      )
+      .run(beforeIso);
+    return Number(res.changes ?? 0);
+  }
+
+  casesSince(sinceIso: string, limit = 2000): CaseRow[] {
+    return (this.db.prepare('select * from cases where failed_at >= ? order by failed_at desc limit ?').all(sinceIso, limit) as Row[]).map(caseRow);
+  }
+
+  /** Error identifiers seen since `sinceIso` outside `excludeSession`, newest case per identifier (resolved first). */
+  caseSignatures(sinceIso: string, excludeSession: string | null): CaseRow[] {
+    const rows = this.db
+      .prepare(
+        `select * from cases where signature is not null and failed_at >= ? and (? is null or session != ?)
+         order by case state when 'resolved' then 0 else 1 end, failed_at desc limit 500`,
+      )
+      .all(sinceIso, excludeSession, excludeSession) as Row[];
+    const seen = new Set<string>();
+    const out: CaseRow[] = [];
+    for (const r of rows) {
+      const c = caseRow(r);
+      if (c.signature && !seen.has(c.signature)) {
+        seen.add(c.signature);
+        out.push(c);
+      }
+    }
+    return out;
+  }
+
+  pruneCases(beforeIso: string): number {
+    return Number(this.db.prepare('delete from cases where failed_at < ?').run(beforeIso).changes ?? 0);
   }
 
   recordOp(op: { eventId: string | null; relation: string; itemId: string | null; targetId: string | null; detail?: string }): void {
@@ -586,6 +816,8 @@ export class StateDb {
     this.db.prepare("update history_turns set prompt = '', last_assistant = null where state = 'done'").run();
     this.db.prepare("update item_stats set evidence = '[]'").run();
     this.db.prepare("delete from kv where key like 'sess:%'").run();
+    // Verification cases hold error output and the requests around it.
+    this.db.prepare('delete from cases').run();
     return { events, turns };
   }
 

@@ -120,6 +120,9 @@ const HELP = `devctx — project decision memory for AI coding tools
                                  켜짐/꺼짐 상태와 최근 기록. 켜고 끄는 것은 이 PC에서 이 저장소에만 적용
                                  off --discard: 켜져 있을 때 보냈지만 아직 쓰지 않은 항목도 버린다
   devctx why "<프롬프트>" [--all]  그 프롬프트에 hook이 어떤 결정을 왜 붙이는지 (점수, 제외 이유, 직전 세션 연결)
+  devctx recall "<단어>" [--days N] [--limit N]
+                                 이전 작업 찾기: 이 PC의 지난 요청·응답, 히스토리, 대체된 결정과 이유 (LLM 없음)
+                                 AI 도구는 스킬로 같은 검색을 쓴다: devctx code search_history "<단어>"
   devctx log [--limit N]         자동으로 바뀐 결정 기록 (추가·보강·대체·충돌·만료와 판정 이유)
   devctx remember "<규칙>"        직접 기록. 명시적으로 남긴 규칙이라 바로 확정된다 (LLM이 없어도)
   devctx approve [<ID>]          이 PC에만 있는 확인 대기 규칙 목록 / 확정 (결정 파일로 저장)
@@ -140,6 +143,12 @@ function describeApplied(a: ApplyResult, ko: boolean): string {
   const id = a.itemId ? a.itemId.slice(-6) : '-';
   const text = a.summary ? `: ${a.summary}` : '';
   if (a.relation === 'dropped') return `${ko ? '기록 안 함' : 'not recorded'} (${a.detail})`;
+  if (a.status === 'proposed' && a.detail.startsWith('held: ')) {
+    const why = a.detail.slice(6);
+    return ko
+      ? `보류 ${id}${text}\n  규칙 문장이 AI의 다른 지시를 무시하게 하거나 역할 태그를 흉내 낸다: ${why}. 이 PC에만 두고 어디에도 전달하지 않는다. 문장을 바꿔 다시 기록한다`
+      : `held ${id}${text}\n  The text ${why}. Kept on this PC only and never delivered; reword it and record it again`;
+  }
   if (a.status === 'active' && a.relation === 'duplicate' && confirmedProposal(a.detail)) {
     return ko
       ? `확정 ${id}${text}\n  이 PC에서 확인 대기였던 규칙이 결정 파일이 되었다 (다음 커밋에 함께 올라간다)`
@@ -266,7 +275,7 @@ async function main(argv: string[]): Promise<number> {
       const root = resolveRoot(args);
       const paths = projectPaths(root);
       const cfg = loadConfig(paths);
-      if (sub !== 'status' && !cfg.code_index.enabled) throw new Error('the code index is off (code_index.enabled: false)');
+      if (sub !== 'status' && sub !== 'search_history' && !cfg.code_index.enabled) throw new Error('the code index is off (code_index.enabled: false)');
       if (sub === 'index' && has(args, 'pass')) {
         // Internal: one memory-capped pass; the parent starts another while this exits 3.
         const res = await indexPass(root, cfg);
@@ -503,8 +512,9 @@ async function main(argv: string[]): Promise<number> {
         const { items, errors } = loadTeam(paths, db, opts);
         applyCachedStale(db, items);
         const groups: [string, (i: KnowledgeItem) => boolean][] = [
-          ['active', (i) => i.status === 'active'],
-          ['conflict (settle: devctx resolve <id>)', (i) => i.status === 'conflict'],
+          ['held (not delivered: the text poses as a chat role or overrides instructions; reword the file)', (i) => Boolean(i.held) && (i.status === 'active' || i.status === 'conflict')],
+          ['active', (i) => i.status === 'active' && !i.held],
+          ['conflict (settle: devctx resolve <id>)', (i) => i.status === 'conflict' && !i.held],
           ['proposed (this PC only; confirm: devctx approve <id>)', (i) => i.status === 'proposed'],
           ['archived (restating makes them active)', (i) => Boolean(i.archived)],
           ['superseded', (i) => i.status === 'superseded'],
@@ -517,6 +527,7 @@ async function main(argv: string[]): Promise<number> {
           for (const i of list) {
             const scope = i.scope.paths.length > 0 ? `  (${i.scope.paths.join(', ')})` : '';
             const extra = [
+              i.held ?? '',
               i.reinforced > 0 ? `x${i.reinforced + 1}` : '',
               i.violations > 0 ? `violations ${i.violations}` : '',
               i.needs_review ? 'review' : '',
@@ -547,6 +558,21 @@ async function main(argv: string[]): Promise<number> {
       if (!prompt) throw new Error('usage: devctx why "<prompt>"');
       const root = resolveRoot(args);
       console.log(explainPrompt(root, prompt, has(args, 'all')));
+      return 0;
+    }
+
+    case 'recall': {
+      const query = args.positional.join(' ').trim();
+      if (!query) throw new Error('usage: devctx recall "<words>" [--days N] [--limit N]');
+      const num = (name: string): number | undefined => {
+        const v = flag(args, name);
+        if (v === null) return undefined;
+        if (!/^\d+$/.test(v)) throw new Error(`--${name} needs a number (got ${JSON.stringify(v)})`);
+        return Number(v);
+      };
+      const root = resolveRoot(args);
+      const { searchHistory } = await import('./recall.ts');
+      console.log(searchHistory(root, query, { days: num('days'), limit: num('limit') }));
       return 0;
     }
 

@@ -89,6 +89,10 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
       if (differs.length > 0) {
         add('warn', 'rule text', `${differs.length} file(s) have a "## 규칙" section that differs from the front matter summary; the section is what agents get (update or remove summary): ${differs.slice(0, 3).map((i) => path.basename(i.file)).join(', ')}`);
       }
+      const held = [...items, ...loadPersonal(kdb, opts).items].filter((i) => i.held && !i.local && (i.status === 'active' || i.status === 'conflict'));
+      if (held.length > 0) {
+        add('warn', 'held rules', `${held.length} rule(s) are not delivered because their text poses as a chat role or tells the agent to ignore its instructions (reword or delete the file; check who added it): ${held.slice(0, 3).map((i) => `${i.file.startsWith(root + path.sep) ? path.relative(root, i.file) : i.file} ${i.held}`).join('; ')}`);
+      }
       const health = readExtractionHealth(kdb);
       if (health.streak > 0) add(health.streak >= 3 ? 'warn' : 'ok', 'extraction', `failed ${health.streak} worker run(s) in a row since ${health.since?.slice(0, 16) ?? '-'}: ${health.lastError ?? ''}`);
       const last = kdb.lastHookEventTs();

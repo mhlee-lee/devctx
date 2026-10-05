@@ -71,7 +71,7 @@ export const DEFAULT_CONFIG: DevctxConfig = {
   language: 'ko',
   targets: [...TOOL_IDS],
   git: { commit_mode: 'ride-along', auto_install_hooks: true },
-  inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400, handoff_budget_tokens: 300 },
+  inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400, handoff_budget_tokens: 400 },
   llm: {
     prefer_host_tool: true,
     providers: [...TOOL_IDS],
@@ -241,7 +241,7 @@ inject:
   scoped_budget_tokens: 800   # 경로별 규칙이 이 이하면 세션 시작 블록에 함께 넣고, 넘으면 도구별 경로 규칙 파일로
   prompt_budget_tokens: 600   # 프롬프트마다 hook으로 추가하는 관련 결정 상한
   session_budget_tokens: 400  # 세션 시작 시 추가하는 개인 설정·충돌 안내 상한
-  handoff_budget_tokens: 300  # 새 세션이 직전 작업을 이어갈 때 한 번 붙이는 직전 세션 정보 상한 (0이면 끔)
+  handoff_budget_tokens: 400  # 새 세션이 직전 작업을 이어갈 때 한 번 붙이는 직전 세션 체크포인트 상한 (0이면 끔)
 
 llm:
   prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출한다 (없으면 providers 순서)

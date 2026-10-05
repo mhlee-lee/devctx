@@ -1,7 +1,7 @@
 import { codeLookup } from './codeindex/hints.ts';
 import { loadConfig } from './config.ts';
 import { PROMPT_MIN_SCORE, selectPromptContext, type TraceEntry } from './hooks/context.ts';
-import { continuesSession, renderHandoff } from './hooks/handoff.ts';
+import { continuesSession, handoffExtras, renderHandoff } from './hooks/handoff.ts';
 import { localTime } from './history/writer.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
@@ -46,13 +46,14 @@ export function explainPrompt(root: string, prompt: string, all: boolean): strin
     out.push(`prompt kind   ${sel.kind}${sel.kind === 'command' ? ' (slash command or shell escape: nothing is added)' : sel.kind === 'ack' ? ' (acknowledgement: no relevance search)' : ''}`);
     if (code.paths.length > 0) out.push(`code files    ${code.paths.slice(0, 6).join(', ')} (symbols named in the prompt)`);
     out.push(`threshold     ${PROMPT_MIN_SCORE} (budget ${cfg.inject.prompt_budget_tokens} tokens)`);
-    return explainRest(db, cfg, prompt, all, sel, code, out);
+    return explainRest(root, db, cfg, prompt, all, sel, code, out);
   } finally {
     db.close();
   }
 }
 
 function explainRest(
+  root: string,
   db: StateDb,
   cfg: ReturnType<typeof loadConfig>,
   prompt: string,
@@ -70,7 +71,7 @@ function explainRest(
       out.push(`handoff       ${linked ? 'yes' : 'no'}: last session ${prev.tool} ended ${prev.endedAt.slice(0, 16).replace('T', ' ')}Z${linked ? '' : ' (the prompt neither says it continues nor names the same code)'}`);
     }
     const text = [
-      prev && sel.kind !== 'command' && continuesSession(prompt, prev) ? renderHandoff(prev, cfg.language, cfg.inject.handoff_budget_tokens) : null,
+      prev && sel.kind !== 'command' && continuesSession(prompt, prev) ? renderHandoff(prev, cfg.language, cfg.inject.handoff_budget_tokens, new Date(), handoffExtras(root, prev)) : null,
       sel.text,
       code.text,
     ]

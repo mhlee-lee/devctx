@@ -1,6 +1,7 @@
 import { isExpired } from '../compile/tiers.ts';
 import type { DevctxConfig } from '../config.ts';
 import { anchorsFor, type RepoContext } from '../knowledge/anchors.ts';
+import { heldReason } from '../knowledge/guard.ts';
 import { searchItems, type Scored } from '../knowledge/retrieve.ts';
 import { newItem, writeItem } from '../knowledge/store.ts';
 import type { Enforcement, Evidence, ItemStatus, KnowledgeItem, SourceKind } from '../knowledge/types.ts';
@@ -12,7 +13,7 @@ import { isoNow, today } from '../util/text.ts';
 import { differsInSubstance, sameRule } from './dedupe.ts';
 import type { Candidate } from './extract.ts';
 import { canOverride, initialStatus } from './policy.ts';
-import { buildJudgePrompt, JUDGE_SCHEMA, parseJudgeResult, type JudgeResult, type Relation } from './prompts.ts';
+import { buildJudgePrompt, JUDGE_SCHEMA, MAX_TOPICS, parseJudgeResult, type JudgeResult, type Relation } from './prompts.ts';
 
 /**
  * Applies extracted candidates to the knowledge base without ever rewriting a knowledge file:
@@ -69,9 +70,12 @@ function union(a: readonly string[], b: readonly string[], max = 8): string[] {
   return [...new Set([...a, ...b])].slice(0, max);
 }
 
-/** Rules a candidate is compared with: live ones, plus archived proposals (they can be revived). */
+/**
+ * Rules a candidate is compared with: live ones, plus archived proposals (they can be revived).
+ * Held text is never a target: confirming or refining it would carry it into a new file.
+ */
 function neighborsOf(c: Candidate, pool: readonly KnowledgeItem[]): Scored[] {
-  const live = pool.filter((i) => (LIVE.has(i.status) || i.archived) && !isExpired(i));
+  const live = pool.filter((i) => (LIVE.has(i.status) || i.archived) && !isExpired(i) && !i.held && !heldReason(i.summary));
   const hits = searchItems(live, `${c.statement} ${c.scope.topics.join(' ')}`, { limit: 6, minScore: 0.15, pathHints: [] });
   return hits
     .map((h) => ({ ...h, score: h.score + (h.item.scope.paths.some((p) => c.scope.paths.includes(p)) ? 0.2 : 0) }))
@@ -241,10 +245,22 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
     ctx.db.recordViolation(id, c.eventId);
   };
 
+  // Text posing as a chat role or overriding the agent's instructions never reaches git: it stays
+  // an unconfirmed proposal on this PC (and is never delivered, even if approved later).
+  const held = heldReason(c.statement);
+  if (held) {
+    const item = propose(createItem(c, ctx, { status: 'proposed' }));
+    const detail = `held: ${held}`;
+    ctx.db.recordOp({ eventId: c.eventId, relation: 'new', itemId: item.id, targetId: null, detail });
+    return { relation: 'new', itemId: item.id, targetId: null, files, detail, status: 'proposed', summary: item.summary };
+  }
+
   const neighbors = neighborsOf(c, pool);
   const verdict = await judge(c, neighbors, ctx);
   const target = verdict.target_id ? (byId(verdict.target_id) ?? null) : null;
   let relation: Relation = target ? verdict.relation : 'new';
+  // A merged statement the judge wrote must pass the same check as what the user said.
+  if (relation === 'refine' && verdict.merged_statement && heldReason(verdict.merged_statement)) relation = 'new';
 
   if (target && !target.local) {
     const userResolvingConflict = target.status === 'conflict' && isUserKind(c.sourceKind);
@@ -277,7 +293,7 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
         ...target,
         summary: merged,
         sections: { ...target.sections, rule: merged, reason: c.reason ?? target.sections.reason },
-        scope: { paths: union(target.scope.paths, c.scope.paths), topics: union(target.scope.topics, c.scope.topics, 6) },
+        scope: { paths: union(target.scope.paths, c.scope.paths), topics: union(target.scope.topics, c.scope.topics, MAX_TOPICS) },
         status: 'active',
         evidence: withQuote(target.evidence, quoteOf(c, ctx)),
         valid_until: c.validUntil ?? target.valid_until,
@@ -336,7 +352,7 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
           successor(t, c, ctx, {
             summary: merged,
             sections: { ...t.sections, rule: merged, reason: c.reason ?? t.sections.reason },
-            scope: { paths: union(t.scope.paths, c.scope.paths), topics: union(t.scope.topics, c.scope.topics, 6) },
+            scope: { paths: union(t.scope.paths, c.scope.paths), topics: union(t.scope.topics, c.scope.topics, MAX_TOPICS) },
             supersedes: settle ? [t.id, ...partners] : [t.id],
             conflict_with: settle ? [] : partners,
             status: partners.length > 0 && !settle ? 'conflict' : 'active',

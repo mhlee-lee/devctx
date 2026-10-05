@@ -1,5 +1,6 @@
 import type { DevctxConfig } from '../config.ts';
 import { anchorsFor, repoContext } from '../knowledge/anchors.ts';
+import { heldReason } from '../knowledge/guard.ts';
 import { newItem, writeItem } from '../knowledge/store.ts';
 import type { KnowledgeItem } from '../knowledge/types.ts';
 import { loadPersonal, loadTeam, localProposals } from '../knowledge/view.ts';
@@ -34,6 +35,9 @@ export function listProposals(db: StateDb): KnowledgeItem[] {
 /** Confirms a proposal: it becomes a decision file (team) or a personal preference. */
 export function approveProposal(paths: ProjectPaths, cfg: DevctxConfig, db: StateDb, id: string): { item: KnowledgeItem; file: string } {
   const found = byPrefix(listProposals(db), id, 'proposal');
+  const held = heldReason(found.summary);
+  // It would never be delivered: a decision file that only the guard keeps quiet does not belong in git.
+  if (held) throw new Error(`${found.id.slice(-6)} is held: the text ${held}. Reword it and record it again (devctx remember "<rule>"), or drop it: devctx discard ${found.id.slice(-6)}`);
   const item: KnowledgeItem = { ...found, status: 'active', file: '' };
   delete item.local;
   delete item.archived;

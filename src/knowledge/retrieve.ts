@@ -83,6 +83,25 @@ export interface SearchOptions {
   codePaths?: readonly string[];
 }
 
+/**
+ * A topic named in the query. Latin-letter topics must stand as words ("PR" is not in "prompt",
+ * "test" not in "latest"); Korean topics match inside a word, since particles attach to them
+ * ("금액은", "테스트를").
+ */
+function namesTopic(lowerQuery: string, topic: string): boolean {
+  if (topic.length < 2) return false;
+  if (!/^[\x20-\x7e]+$/.test(topic)) return lowerQuery.includes(topic);
+  let from = 0;
+  for (;;) {
+    const at = lowerQuery.indexOf(topic, from);
+    if (at < 0) return false;
+    const before = lowerQuery[at - 1] ?? ' ';
+    const after = lowerQuery[at + topic.length] ?? ' ';
+    if (!/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after)) return true;
+    from = at + 1;
+  }
+}
+
 function scoreParts(
   item: KnowledgeItem,
   query: Set<string>,
@@ -94,8 +113,7 @@ function scoreParts(
   const lower = queryText.toLowerCase();
   let topics = 0;
   for (const topic of item.scope.topics) {
-    const t = topic.toLowerCase();
-    if (t.length >= 2 && lower.includes(t)) topics += 0.15;
+    if (namesTopic(lower, topic.toLowerCase())) topics += 0.15;
   }
   const scoped = item.scope.paths.length > 0;
   const path = scoped && pathHints.some((h) => matchAny(h, item.scope.paths)) ? 0.5 : 0;

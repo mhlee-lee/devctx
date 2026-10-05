@@ -26,10 +26,16 @@ import type { Language } from '../types.ts';
  * case mirrors something devctx needs in production and uses the production prompt builders, so
  * a pass means "this model handles our real requests", not "this model is smart".
  *
- * Bump SUITE_VERSION whenever a case, a pass rule or a production prompt changes: every cached
- * verdict is then re-evaluated.
+ * Bump a task's version whenever one of its cases, a pass rule or its production prompt changes:
+ * cached verdicts for that task are then re-evaluated, the other tasks' verdicts stay. (All tasks
+ * shared one version up to 5, so 5 keeps verdicts cached before the split valid.)
  */
-export const SUITE_VERSION = 5;
+export const SUITE_VERSIONS: Readonly<Record<SuiteTask, number>> = { extract: 6, judge: 5, summarize: 5 };
+
+/** A cached verdict was made with the task's current suite. */
+export function suiteCurrent(task: SuiteTask, suite: number | undefined): boolean {
+  return suite === SUITE_VERSIONS[task];
+}
 
 /** Message date the suite's cases are written against (relative end dates resolve from it). */
 const SUITE_DATE = '2026-09-28';
@@ -72,6 +78,8 @@ const kept = (own: readonly ExtractedItem[]): ExtractedItem[] => own.filter((i) 
 const activeTeamRule = (i: ExtractedItem): boolean => i.durability === 'durable' && i.confidence >= 0.6 && i.audience === 'team';
 const says = (i: ExtractedItem, pattern: RegExp): boolean => pattern.test(i.statement);
 const nothingKept: (value: ExtractedItem[]) => boolean = (own) => kept(own).length === 0;
+/** Topics that would match almost any request. */
+const GENERIC_TOPICS = new Set(['data', 'code', 'file', 'files', 'copy', 'fix', 'change', 'rule', 'project', 'type', '데이터', '코드', '파일', '규칙', '수정', '변경']);
 
 const EXTRACT_BATCHES: ExtractCase[][] = [
   [
@@ -79,7 +87,22 @@ const EXTRACT_BATCHES: ExtractCase[][] = [
       tool: 'claude',
       previousAssistant: 'Invoice.price 필드를 Double 타입으로 추가했습니다.',
       message: '아니 금액 계산에 Double 쓰지 말고 BigDecimal 써. 앞으로 금액은 전부 BigDecimal이야.',
-      requires: [['korean correction becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /bigdecimal/i))]],
+      requires: [
+        ['korean correction becomes an active team rule', (own) => own.some((i) => activeTeamRule(i) && says(i, /bigdecimal/i))],
+        [
+          'topics name the subject in Korean and English and the option it replaces',
+          (own) =>
+            own.some(
+              (i) =>
+                says(i, /bigdecimal/i) &&
+                i.scope.topics.length >= 3 &&
+                i.scope.topics.some((t) => /[가-힣]/.test(t)) &&
+                i.scope.topics.some((t) => /[a-z]/i.test(t)) &&
+                i.scope.topics.some((t) => /double|float|부동\s*소수|소수점|정밀|오차|precision|rounding/i.test(t)),
+            ),
+        ],
+        ['no single generic word as a topic', (own) => own.every((i) => i.scope.topics.every((t) => !GENERIC_TOPICS.has(t.trim().toLowerCase())))],
+      ],
     },
     {
       tool: 'codex',
