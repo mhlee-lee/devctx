@@ -12,7 +12,7 @@ import { repoContext, type RepoContext } from './knowledge/anchors.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { deriveStatus, knowledgeDirs, loadPersonal, loadTeam, readKnowledgeFiles } from './knowledge/view.ts';
 import { refreshCommunityPrices } from './llm/catalog.ts';
-import type { RouteOptions } from './llm/router.ts';
+import { workingHost, type RouteOptions } from './llm/router.ts';
 import { consolidate, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
 import { extractCandidates } from './memory/extract.ts';
 import { StateDb } from './state/db.ts';
@@ -139,8 +139,10 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         report.errors.push(`cases: ${errorMessage(error)}`);
       }
       const log = (message: string, extra?: Record<string, unknown>): void => logLine(paths.log, 'info', message, extra);
+      // Git hooks and `devctx remember` start the worker without a host: the tool last worked in here.
+      const host = workingHost(opts.host, db);
       const route: RouteOptions | null = opts.allowLlm
-        ? { cfg, host: opts.host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
+        ? { cfg, host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
         : null;
       // `max_calls_per_hour: 0` or `providers: []` turn calls off: rules fall back to the no-LLM
       // path (explicit markers kept as proposals), history entries to the assistant's reply.

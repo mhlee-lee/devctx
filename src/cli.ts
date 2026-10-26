@@ -14,7 +14,7 @@ import { codeStatus, EXIT_MEMORY_CAPPED, indexPass, refreshIndex } from './codei
 import { NOISY_GRAMMARS } from './codeindex/languages.ts';
 import { CODE_TOOLS, codeTool, parseToolArgs, usageLine } from './codeindex/tools-meta.ts';
 import { agentAccessStatus } from './init/access.ts';
-import { describeRoutes, qualifyProvider, type Qualification } from './llm/router.ts';
+import { describeRoutes, noProviderReason, providerOrder, qualifyProvider, workingHost, type Qualification } from './llm/router.ts';
 import { SUITE_TASKS, type SuiteTask } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
 import { isHookKind, isToolId, TOOL_IDS, type ToolId } from './types.ts';
@@ -411,7 +411,16 @@ async function main(argv: string[]): Promise<number> {
         }
         return 0;
       }
-      const reports = await describeRoutes(cfg, flag(args, 'host'), { refresh: has(args, 'refresh') });
+      const mdb = root ? StateDb.open(projectPaths(root).stateDb) : null;
+      let modelsHost: string | null;
+      try {
+        modelsHost = workingHost(flag(args, 'host'), mdb);
+      } finally {
+        mdb?.close();
+      }
+      const order = providerOrder(cfg, modelsHost);
+      console.log(`llm.host_tool: ${cfg.llm.host_tool}${isToolId(modelsHost) ? ` (working in ${modelsHost})` : cfg.llm.host_tool === 'any' ? '' : ' (no tool running: targets first)'} -> ${order.length > 0 ? order.join(', ') : `none: ${noProviderReason(cfg, modelsHost)}`}`);
+      const reports = await describeRoutes(cfg, modelsHost, { refresh: has(args, 'refresh') });
       const verdict = (q: Qualification | null | undefined): string => (q ? `${q.status} ${q.score}/${q.total}` : '-');
       for (const r of reports) {
         const blocked = r.blocked ? `  [skipped until ${r.blocked.until.slice(0, 16)}Z: ${r.blocked.kind}]` : '';

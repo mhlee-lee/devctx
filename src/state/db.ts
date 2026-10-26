@@ -956,6 +956,12 @@ export class StateDb {
     return row ? asString(row.ts) : null;
   }
 
+  /** Tool that ran the latest hook here (null: hooks never ran here). */
+  lastHookHost(): string | null {
+    const row = this.db.prepare("select host from events where tool not in ('cli', 'file') order by ts desc limit 1").get() as Row | undefined;
+    return row ? asString(row.host) : null;
+  }
+
   kvGet(key: string): string | null {
     const row = this.db.prepare('select value from kv where key = ?').get(key) as Row | undefined;
     return row ? String(row.value) : null;

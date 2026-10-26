@@ -131,12 +131,13 @@ compile(worker, git hook)할 때 `git ls-files`로 본 파일과 비교해서 �
 
 [![추출 모델 고르기](diagrams/model-routing.png)](diagrams/model-routing.html)
 
-- 작업 중인 도구의 CLI를 먼저 쓴다(같은 계정, 같은 데이터 정책). IDE 플러그인은 같은 계정의 CLI를 쓴다: VS Code Copilot은 `copilot`, Codex 앱은 `codex`, Cursor는 `cursor-agent`, Kiro는 `kiro-cli`.
+- 작업 중인 도구의 CLI만 쓴다(`llm.host_tool: only`, 기본. 같은 계정, 같은 데이터 정책). Codex에서 일하면 Codex, 같은 저장소를 Claude Code로 열면 Claude, Copilot에서 열면 Copilot이다. IDE 플러그인은 같은 계정의 CLI를 쓴다: VS Code Copilot은 `copilot`, Codex 앱은 `codex`, Cursor는 `cursor-agent`, Kiro는 `kiro-cli`. 도구 밖에서 worker가 돌 때(git hook, 터미널의 `devctx remember`)는 이 저장소에서 마지막으로 hook을 보낸 도구, 그것도 없으면 `targets`의 도구를 쓴다.
+- `llm.providers`는 어느 모드에서든 허용 목록이다. 작업 중인 도구가 거기 없으면 다른 도구를 대신 부르지 않고 LLM 없이 처리한다(`devctx doctor`가 알린다). `prefer`는 작업 중인 도구를 먼저 쓰고 안 되면 providers의 다른 도구를, `any`는 providers 순서를 쓴다. 예전 설정 `prefer_host_tool: false`는 `any`로 읽는다.
 - 후보는 CLI가 알려주는 모델 × reasoning effort다. 새 모델이 나오면 자동으로 후보가 된다.
 - 후보를 호출당 예상 비용 순으로 세우고, 싼 것부터 요구사항 평가를 돌린다. 2회 연속 하나도 틀리지 않은 첫 후보를 쓴다. 요구사항을 다 채우는 모델 중 가장 싼 모델이 선택되는 구조다.
 - 추출·판정·요약(프롬프트 히스토리)은 따로 평가하고 따로 고른다.
 - 평가 결과는 30일 동안 CLI 버전별로 보관한다. 평가 버전은 작업마다 따로라서, 한 작업의 프롬프트나 평가 사례가 바뀌면 그 작업만 다시 평가하고 다른 작업의 결과는 그대로 쓴다. 실제로 쓰다가 요구사항을 두 번 연속 어기면(예: 근거 인용이 원문에 없음) 강등하고 다음 후보로 넘어간다.
-- 로그인 만료는 30분, 쿼터 소진은 6시간 동안 그 도구를 건너뛰고 다른 도구 CLI를 쓴다. 모델 실패로 치지 않는다.
+- 로그인 만료는 30분, 쿼터 소진은 6시간 동안 그 도구를 건너뛴다. 모델 실패로 치지 않는다. 기본 `only`에서는 그동안 LLM 없이 처리하고(명시 표현만 확인 대기), `prefer`·`any`에서는 다른 도구 CLI를 쓴다.
 
 요구사항 평가는 실제 작업과 같은 프롬프트로 검사한다.
 

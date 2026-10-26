@@ -5,6 +5,13 @@ import type { Tier } from './llm/types.ts';
 import { isToolId, TOOL_IDS, type Language, type ToolId } from './types.ts';
 
 export type CommitMode = 'ride-along' | 'auto-commit' | 'manual';
+/**
+ * Whose CLI does the LLM work. `only`: the tool being worked in and nothing else (Codex while
+ * working in Codex, Claude when the same repository is opened in Claude Code; each on its own
+ * account). `prefer`: that tool first, then the other providers. `any`: the providers order.
+ */
+export type HostToolPolicy = 'only' | 'prefer' | 'any';
+export const HOST_TOOL_POLICIES: readonly HostToolPolicy[] = ['only', 'prefer', 'any'];
 
 export interface DevctxConfig {
   version: number;
@@ -20,7 +27,8 @@ export interface DevctxConfig {
     handoff_budget_tokens: number;
   };
   llm: {
-    prefer_host_tool: boolean;
+    host_tool: HostToolPolicy;
+    /** Tools whose CLI may be called, an allowlist in every `host_tool` mode; `[]` turns LLM calls off. */
     providers: ToolId[];
     qualify: boolean;
     /** Repetitions of the requirement suite a model must pass without a single miss. */
@@ -73,7 +81,7 @@ export const DEFAULT_CONFIG: DevctxConfig = {
   git: { commit_mode: 'ride-along', auto_install_hooks: true },
   inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400, handoff_budget_tokens: 400 },
   llm: {
-    prefer_host_tool: true,
+    host_tool: 'only',
     providers: [...TOOL_IDS],
     qualify: true,
     qualify_runs: 2,
@@ -114,6 +122,13 @@ function tools(value: unknown, fallback: ToolId[]): ToolId[] {
   return out.length > 0 ? [...new Set(out)] : fallback;
 }
 
+function hostTool(llm: Obj, fallback: HostToolPolicy): HostToolPolicy {
+  const v = llm.host_tool;
+  if (typeof v === 'string' && (HOST_TOOL_POLICIES as readonly string[]).includes(v)) return v as HostToolPolicy;
+  // Before `host_tool`, `prefer_host_tool: false` meant the providers order; `true` was the default.
+  return llm.prefer_host_tool === false ? 'any' : fallback;
+}
+
 export function normalizeConfig(raw: unknown): DevctxConfig {
   const r = obj(raw);
   const d = DEFAULT_CONFIG;
@@ -145,7 +160,7 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       handoff_budget_tokens: num(inj.handoff_budget_tokens, d.inject.handoff_budget_tokens, 0, 2_000),
     },
     llm: {
-      prefer_host_tool: bool(llm.prefer_host_tool, d.llm.prefer_host_tool),
+      host_tool: hostTool(llm, d.llm.host_tool),
       // An explicit empty list turns LLM calls off (it does not mean "all of them").
       providers: Array.isArray(llm.providers) && llm.providers.length === 0 ? [] : tools(llm.providers, d.llm.providers),
       qualify: bool(llm.qualify, d.llm.qualify),
@@ -214,6 +229,7 @@ export function configProblems(paths: ProjectPaths): string[] {
     out.push(`git.commit_mode: ${JSON.stringify(commit)} is not one of ride-along | auto-commit | manual; manual is used until it is fixed`);
   }
   check('llm.max_tier', obj(r.llm).max_tier, ['small', 'medium', 'large']);
+  check('llm.host_tool', obj(r.llm).host_tool, HOST_TOOL_POLICIES);
   for (const [where, value] of [['targets', r.targets], ['llm.providers', obj(r.llm).providers]] as const) {
     if (value === undefined) continue;
     const bad = Array.isArray(value) ? value.filter((v) => !isToolId(v)) : [value];
@@ -244,8 +260,8 @@ inject:
   handoff_budget_tokens: 400  # 새 세션이 직전 작업을 이어갈 때 한 번 붙이는 직전 세션 체크포인트 상한 (0이면 끔)
 
 llm:
-  prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출한다 (없으면 providers 순서)
-  providers: [claude, codex, copilot, cursor, kiro]   # []이면 LLM을 부르지 않는다
+  host_tool: only             # only: 작업 중인 도구의 CLI만 쓴다 (도구마다 자기 계정) | prefer: 그 도구 먼저, 안 되면 providers의 다른 도구 | any: providers 순서
+  providers: [claude, codex, copilot, cursor, kiro]   # 부를 수 있는 도구 (허용 목록). 작업 중인 도구가 여기 없으면 부르지 않는다. []이면 LLM을 부르지 않는다
   qualify: true               # 작업(추출/판정)별 요구사항 평가를 전부 통과한 모델 중 가장 싼 것만 사용
   qualify_runs: 2             # 평가를 몇 번 반복해 한 번도 틀리지 않아야 통과로 볼지
   max_tier: large             # 자동으로 고를 수 있는 가장 큰 모델 등급: small | medium | large

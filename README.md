@@ -291,7 +291,7 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 
 ## 추출 모델
 
-무조건 싼 모델이 아니라, 요구사항을 전부 통과한 모델 중 가장 싼 모델을 쓴다.
+무조건 싼 모델이 아니라, 요구사항을 전부 통과한 모델 중 가장 싼 모델을 쓴다. 부르는 CLI는 작업 중인 도구의 것뿐이다(`llm.host_tool: only`, 기본): Codex에서 일하면 Codex로, 같은 저장소를 Claude Code로 열면 Claude로, Copilot에서 열면 Copilot으로 처리한다. 도구마다 자기 계정을 쓰고 모델도 따로 고른다. 도구 밖에서 worker가 돌 때(git hook, 터미널의 `devctx remember`)는 이 저장소에서 마지막으로 hook을 보낸 도구를 쓴다.
 
 1. 작업 중인 도구의 CLI에서 모델 목록을 가져온다. 모델 × reasoning effort가 각각 후보다.
 2. 호출당 예상 비용이 싼 후보부터 요구사항 평가를 돌린다. 추출 44개, 판정 12개, 요약 10개 항목을 2회 연속 하나도 틀리지 않아야 통과다.
@@ -313,7 +313,8 @@ inject:
   prompt_budget_tokens: 600   # 프롬프트마다 붙이는 관련 결정 상한
   handoff_budget_tokens: 400  # 새 세션이 직전 작업을 이어갈 때 붙이는 직전 세션 체크포인트 상한 (0이면 끔)
 llm:
-  prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출
+  host_tool: only             # only: 작업 중인 도구의 CLI만 (기본) | prefer: 그 도구 먼저, 안 되면 providers의 다른 도구 | any: providers 순서
+  providers: [claude, codex, copilot, cursor, kiro]   # 부를 수 있는 도구(허용 목록). []이면 LLM을 부르지 않는다
   qualify_runs: 2             # 요구사항 평가 반복 횟수
   max_tier: large             # 자동 선택 상한: small | medium | large
   max_calls_per_hour: 30      # 0이면 LLM을 부르지 않는다 (providers: []도 같다)
@@ -341,7 +342,7 @@ history:
 - 로그: `.devctx/local/devctx.log`
 - 결정이 쌓이지 않으면 도구에서 프로젝트 hook을 승인했는지 확인한다. 기록됐는데 적용되지 않으면 `devctx log`에서 판정 이유를 본다(확인 대기 `proposed`로 남았는지 등).
 - 관련 결정이 안 붙거나 엉뚱한 결정이 붙으면 `devctx why "그 프롬프트"`로 점수와 빠진 이유를 본다. 결정의 `scope.topics`에 사람들이 실제로 쓰는 단어(한국어·영어 이름, 동의어, 이 규칙이 막는 문제)를 넣으면 잘 붙는다. 대화에서 기록되는 새 결정은 추출할 때 이런 주제어를 3~8개 뽑는다. 영문 주제어는 단어 단위로 맞춘다(`PR`은 "prompt"에 걸리지 않는다).
-- 로그인이 만료되거나 쿼터가 끝난 도구는 잠시 건너뛰고 다른 도구 CLI로 처리한다. 로그인 만료는 해당 CLI를 실행해 다시 로그인하면 된다.
+- 로그인이 만료되거나 쿼터가 끝난 도구는 잠시 건너뛴다(로그인 30분, 쿼터 6시간). 기본 `llm.host_tool: only`에서는 그동안 다른 도구를 부르지 않고 LLM 없이 처리한다(명시 표현만 확인 대기로 남김. `devctx doctor`의 `llm <도구>` 경고로 보인다). `prefer`나 `any`면 다른 도구 CLI로 처리한다. 로그인 만료는 해당 CLI를 실행해 다시 로그인하면 된다.
 - `.vscode/settings.json`처럼 주석이 있는 JSON 설정 파일은 주석이 지워지지 않게 devctx가 고치지 않는다. 이때 `devctx doctor`와 `devctx code status`가 직접 넣을 항목을 그대로 보여준다(`devctx init`을 다시 해도 해결되지 않는다).
 - AI가 코드 인덱스를 안 쓰면 `devctx code status`로 스킬 파일과 허용 설정이 있는지 본다. 도구의 스킬 목록(`/skills` 등)에 `devctx-code`가 보여야 한다. `devctx code index`로 바로 색인할 수 있다.
 - 스킬 명령에 승인 창이 뜨면 명령에 파이프나 `&&`가 붙었는지 본다. 붙으면 미리 허용한 명령으로 인식되지 않는다. `.devctx/bin/devctx`에 실행 권한이 있어야 한다(`devctx doctor`가 확인한다).

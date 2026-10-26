@@ -14,9 +14,10 @@ import { getProvider } from './llm/providers/index.ts';
 import { codeStatus } from './codeindex/service.ts';
 import { NOISY_GRAMMARS } from './codeindex/languages.ts';
 import { agentAccessStatus } from './init/access.ts';
-import { cachedSelection, providerBlocks, providerOrder } from './llm/router.ts';
+import { cachedSelection, noProviderReason, providerBlocks, providerOrder, workingHost } from './llm/router.ts';
 import { SUITE_TASKS } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
+import { isToolId } from './types.ts';
 import { readText } from './util/fsx.ts';
 import { projectPaths } from './util/paths.ts';
 
@@ -67,10 +68,13 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   const cfg = loadConfig(paths);
   for (const problem of configProblems(paths)) add(problem.includes('not valid YAML') ? 'fail' : 'warn', 'config', problem);
   add(nodeOk() ? 'ok' : 'fail', 'node', `v${process.versions.node} (needs 22.13+, 23.4+ or 24+ for node:sqlite)`);
+  // The tool whose CLI the worker calls: `--host`, else the one whose hook last ran here.
+  let llmHost = host;
 
   {
     const kdb = StateDb.open(paths.stateDb);
     try {
+      llmHost = workingHost(host, kdb);
       const opts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
       const { items, errors } = loadTeam(paths, kdb, opts);
       applyCachedStale(kdb, items);
@@ -282,7 +286,8 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
 
   const available: string[] = [];
   const blocks = providerBlocks();
-  for (const pid of providerOrder(cfg, host)) {
+  const order = providerOrder(cfg, llmHost);
+  for (const pid of order) {
     const bin = await getProvider(pid).resolveBinary();
     available.push(`${pid}${bin ? '' : ' (not installed)'}${blocks[pid] ? ` (skipped: ${blocks[pid].kind})` : ''}`);
   }
@@ -290,13 +295,19 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
     const off = llmOff(cfg, work);
     if (off) add('ok', `llm (${work})`, `off by configuration (${off}): ${work === 'decisions' ? 'only explicit markers are kept, as proposals on this PC' : 'entries use the start of the assistant reply instead of a summary'}`);
   }
-  // Found on PATH only: login and quota show up in "llm usage" once a call is made.
-  add(available.some((a) => !a.includes('(')) ? 'ok' : 'warn', 'llm CLIs', `${available.join(', ')} (installed; login is not checked here, see llm usage)`);
-  const selection = cachedSelection(cfg, host);
+  const policy = `llm.host_tool: ${cfg.llm.host_tool}${isToolId(llmHost) ? `, working in ${llmHost}` : cfg.llm.host_tool === 'any' ? '' : ', no tool running: targets first'}`;
+  if (order.length === 0 && !llmOff(cfg, 'decisions')) {
+    add('warn', 'llm CLIs', `none may be called: ${noProviderReason(cfg, llmHost)}; no model is used (only explicit markers are kept, as proposals) until llm.providers includes it or llm.host_tool is prefer`);
+  } else {
+    // Found on PATH only: login and quota show up in "llm usage" once a call is made.
+    add(available.some((a) => !a.includes('(')) ? 'ok' : 'warn', 'llm CLIs', `${available.join(', ')} (installed; login is not checked here, see llm usage; ${policy})`);
+  }
+  const selection = cachedSelection(cfg, llmHost);
   const routing = SUITE_TASKS.map((task) => `${task}: ${selection.find((s) => s.task === task && s.key)?.key ?? 'not evaluated yet'}`);
   add('ok', 'llm routing', `${routing.join('; ')} (details: devctx models)`);
   for (const [pid, b] of Object.entries(blocks)) {
-    const hint = b.kind === 'auth' ? `log in again by running "${pid}"` : 'usage limit reached; other installed tools are used meanwhile';
+    const meanwhile = cfg.llm.host_tool === 'only' ? 'no other tool is called (llm.host_tool: only), so only explicit markers are kept meanwhile' : 'other installed tools are used meanwhile';
+    const hint = b.kind === 'auth' ? `log in again by running "${pid}"; ${meanwhile}` : `usage limit reached; ${meanwhile}`;
     add('warn', `llm ${pid}`, `${hint} (retry after ${b.until.slice(0, 16)}Z)`);
   }
   for (const e of recentErrors(paths.log, 3)) add('warn', 'recent error', e);

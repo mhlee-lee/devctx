@@ -79,7 +79,7 @@ interface RouterCache {
 
 export interface RouteOptions {
   cfg: DevctxConfig;
-  /** Tool the user is working in; its CLI is tried first (same account, same data policy). */
+  /** Tool the user is working in; with `llm.host_tool: only` (default) its CLI is the only one called. */
   host: string | null;
   db: StateDb | null;
   /** Evaluations spend calls, so only the background worker allows them. */
@@ -152,12 +152,42 @@ export function providerBlocks(): Record<string, ProviderBlock> {
   return out;
 }
 
+/**
+ * CLIs a call may use, in order. `llm.providers` is an allowlist in every mode. `host_tool: only`
+ * (default): the tool being worked in and nothing else, so work done in Codex runs on the Codex
+ * account and the same repository opened in Claude Code runs on Claude; when no tool is running
+ * (a worker started by a git hook, `devctx remember` in a terminal) the project's `targets`, in
+ * the providers order. `prefer`: the tool being worked in first (targets first when none is
+ * running), then the other providers. `any`: the providers order.
+ */
 export function providerOrder(cfg: DevctxConfig, host: string | null): ProviderId[] {
   if (process.env.DEVCTX_FAKE_LLM) return ['fake'];
-  const order: ProviderId[] = [];
-  if (cfg.llm.prefer_host_tool && isToolId(host)) order.push(host);
-  for (const p of cfg.llm.providers) if (!order.includes(p)) order.push(p);
-  return order;
+  const allowed = cfg.llm.providers;
+  const policy = cfg.llm.host_tool;
+  if (policy === 'any') return [...allowed];
+  if (isToolId(host)) {
+    if (!allowed.includes(host)) return policy === 'only' ? [] : [...allowed];
+    return policy === 'only' ? [host] : [host, ...allowed.filter((p) => p !== host)];
+  }
+  // No tool is running: the tools this project is set up for, in the providers order.
+  const targets = allowed.filter((p) => cfg.targets.includes(p));
+  return policy === 'only' ? targets : [...targets, ...allowed.filter((p) => !targets.includes(p))];
+}
+
+/** Why `providerOrder` is empty (only with `host_tool: only`), for logs and `devctx doctor`. */
+export function noProviderReason(cfg: DevctxConfig, host: string | null): string {
+  return isToolId(host)
+    ? `${host} is not in llm.providers, and llm.host_tool: only calls no other tool`
+    : 'no tool of targets is in llm.providers (llm.host_tool: only, no tool running)';
+}
+
+/**
+ * The tool being worked in: what the hook reported, else the tool whose hook last ran in this
+ * repository (a worker started by a git hook or `devctx remember` in a terminal gets no host).
+ */
+export function workingHost(host: string | null, db: StateDb | null): string | null {
+  if (isToolId(host)) return host;
+  return db?.lastHookHost() ?? host;
 }
 
 async function discover(
@@ -295,17 +325,19 @@ export function callsLeft(cfg: DevctxConfig, db: StateDb | null, task: SuiteTask
 }
 
 /**
- * Sends one structured request to the cheapest model that meets every requirement of the task:
- * host tool first, then the configured provider order. Inside a provider, candidates (model x
- * reasoning effort) are tried in expected-cost order and a candidate is only used after it passes
- * the task's requirement suite in every run. New models show up through each CLI's own discovery;
- * a qualified model that later breaks requirements at runtime is demoted. Login or quota problems
- * skip the provider for a while instead of failing the model.
+ * Sends one structured request to the cheapest model that meets every requirement of the task,
+ * asking the CLIs `providerOrder` allows (by default only the tool being worked in). Inside a
+ * provider, candidates (model x reasoning effort) are tried in expected-cost order and a candidate
+ * is only used after it passes the task's requirement suite in every run. New models show up
+ * through each CLI's own discovery; a qualified model that later breaks requirements at runtime is
+ * demoted. Login or quota problems skip the provider for a while instead of failing the model.
  */
 export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T | null, opts: RouteOptions): Promise<RouteResult<T>> {
   const { cfg, db } = opts;
   const task = taskOf(req);
   const attempts: string[] = [];
+  const order = providerOrder(cfg, opts.host);
+  if (order.length === 0) return { ok: false, error: 'no provider allowed', attempts: [noProviderReason(cfg, opts.host)] };
   const limit = task === 'summarize' ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour;
   if (callsLeft(cfg, db, task) <= 0) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
   // An evaluation runs the whole suite. It must fit the hour's remaining calls; one that is larger
@@ -315,7 +347,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
-    providers: for (const pid of providerOrder(cfg, opts.host)) {
+    providers: for (const pid of order) {
       const blocked = activeBlock(cache, pid);
       if (blocked) {
         attempts.push(`${pid}: skipped (${blocked.kind} until ${blocked.until.slice(11, 16)}Z)`);

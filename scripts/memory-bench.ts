@@ -55,7 +55,7 @@ import { approveProposal, discardProposal, listProposals, resolveConflict } from
 import { agentAccessStatus, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
-import { callsLeft, RATE_LIMIT_ERROR, routeCall } from '../src/llm/router.ts';
+import { callsLeft, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
 import type { ToolId } from '../src/types.ts';
 import { anchorsFor, positiveTerms, repoContext, staleReason } from '../src/knowledge/anchors.ts';
 import { heldReason } from '../src/knowledge/guard.ts';
@@ -1063,6 +1063,48 @@ let paraphraseLine = '';
     check('git', 're-running init without --source keeps the install location', lock?.source === 'github:team/devctx#v0.2.0', lock?.source);
   } finally {
     fs.rmSync(initRoot, { recursive: true, force: true });
+  }
+
+  // Which CLI the worker calls: by default only the tool being worked in, and `llm.providers` is an
+  // allowlist in every mode (a host outside it is not called). No DEVCTX_FAKE_LLM here: the fake
+  // provider replaces the order.
+  {
+    const fakeSaved = process.env.DEVCTX_FAKE_LLM;
+    delete process.env.DEVCTX_FAKE_LLM;
+    try {
+      const all = normalizeConfig({ targets: ['copilot', 'claude'] });
+      const order = (c: DevctxConfig, host: string | null): string => providerOrder(c, host).join(',');
+      check('llm', 'host_tool defaults to only: the tool being worked in is the only provider', all.llm.host_tool === 'only' && order(all, 'codex') === 'codex' && order(all, 'claude') === 'claude' && order(all, 'copilot') === 'copilot');
+      check('llm', 'without a running tool, only mode falls back to the project targets (providers order)', order(all, null) === 'claude,copilot' && order(all, 'cli') === 'claude,copilot');
+      const allow = normalizeConfig({ targets: ['codex'], llm: { providers: ['copilot'] } });
+      check('llm', 'providers is an allowlist: a host outside it gets no provider in only mode', order(allow, 'codex') === '' && order(allow, 'copilot') === 'copilot' && order(allow, null) === '');
+      const prefer = normalizeConfig({ targets: ['codex'], llm: { host_tool: 'prefer', providers: ['copilot', 'codex'] } });
+      check('llm', 'prefer puts the host first and never adds a host outside providers', order(prefer, 'codex') === 'codex,copilot' && order(prefer, 'claude') === 'copilot,codex' && order(prefer, null) === 'codex,copilot');
+      const any = normalizeConfig({ llm: { host_tool: 'any', providers: ['copilot', 'codex'] } });
+      check('llm', 'any keeps the providers order whatever the host', order(any, 'codex') === 'copilot,codex');
+      check('llm', 'the former prefer_host_tool: false reads as any; true (the old default) carries no intent', normalizeConfig({ llm: { prefer_host_tool: false } }).llm.host_tool === 'any' && normalizeConfig({ llm: { prefer_host_tool: true } }).llm.host_tool === 'only' && normalizeConfig({ llm: { host_tool: 'bogus' } }).llm.host_tool === 'only');
+      const res = await routeCall({ task: 'extract', prompt: 'x', schema: {}, timeoutMs: 1000 }, (d) => d, { cfg: allow, host: 'codex', db: null, allowQualify: false });
+      check('llm', 'a call with no allowed provider fails at once and says why', !res.ok && res.error === 'no provider allowed' && res.attempts[0]?.includes('codex is not in llm.providers'), res.ok ? 'ok?' : res.attempts.join(' | '));
+      const tmpHost = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-host-'));
+      try {
+        const hdb = StateDb.open(path.join(tmpHost, 'state.sqlite'));
+        try {
+          check('llm', 'workingHost keeps a known host and is null before any hook ran', workingHost('claude', hdb) === 'claude' && workingHost(null, hdb) === null);
+          const base = { kind: 'prompt' as const, session: 's', cwd: tmpHost, prompt: 'x', lastAssistant: null, transcriptPath: null, model: null, flags: [], candidate: false };
+          hdb.insertEvent({ ...base, ts: '2026-10-01T00:00:00.000Z', tool: 'claude', host: 'claude' });
+          hdb.insertEvent({ ...base, ts: '2026-10-02T00:00:00.000Z', tool: 'codex', host: 'codex' });
+          hdb.insertEvent({ ...base, ts: '2026-10-03T00:00:00.000Z', tool: 'cli', host: 'cli' });
+          check('llm', 'a worker started without a host (git hook, terminal) uses the tool whose hook last ran', workingHost(null, hdb) === 'codex' && workingHost('cli', hdb) === 'codex');
+        } finally {
+          hdb.close();
+        }
+      } finally {
+        fs.rmSync(tmpHost, { recursive: true, force: true });
+      }
+    } finally {
+      if (fakeSaved === undefined) delete process.env.DEVCTX_FAKE_LLM;
+      else process.env.DEVCTX_FAKE_LLM = fakeSaved;
+    }
   }
 
   // The hourly limit holds across retries inside one request.
