@@ -369,9 +369,11 @@ npm run typecheck
 npm run build
 npm run dev -- status   # 빌드 없이 소스로 실행
 npm run bench:memory    # 메모리 벤치마크 (LLM 없이: 추출 대상 고르기, 관련 결정 고르기, 만료·대체, 중복 판정, 세션 이어가기 체크포인트, 최근 바뀐 결정, 이전 작업 검색, 검증 사례, 바꿔 말한 질의, 규칙 문장 보류, 두 브랜치 병합, 코드 근거, 프롬프트 히스토리, 안전장치)
-npm run bench:codeindex # 언어별 추출 확인 (39개 언어마다 파싱 오류 없음·선언·호출, 파일 사이 해석)
+npm run bench:codeindex # 언어별 추출 확인 (39개 언어마다 파싱 오류 없음·선언·호출, 파일 사이 해석, 크기 한도 변경과 성장에 따른 캐시 갱신)
 node scripts/vendor-grammars.mjs --build   # vendor/grammars/ 다시 만들기 (tree-sitter CLI 필요, 관리자용)
 ```
+
+같은 세 가지(typecheck, bench:memory, bench:codeindex)를 GitHub Actions(`.github/workflows/ci.yml`)가 push와 PR마다 Ubuntu·macOS에서 돌린다. 실제 AI CLI는 부르지 않는다.
 
 외부 코드와 문법의 라이선스는 [THIRD_PARTY.md](THIRD_PARTY.md)에 있다.
 
