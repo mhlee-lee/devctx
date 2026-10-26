@@ -628,6 +628,23 @@ const cand = (statement: string, durable: boolean): Candidate => ({
       const again = await consolidate({ ...cand('로그는 JSON 한 줄 형식으로 남기면 좋겠다.', true), eventId: 'E2' }, { ...base, team: pool });
       const now = loadTeam(paths, db, TTL).items;
       check('proposals', 'saying it again months later makes it active at once', again.files.length === 1 && now.length === 1 && now[0]?.status === 'active' && now[0]?.id === first.itemId && db.proposals().length === 0, again.detail);
+
+      // One message, the same words for two directories and once for oneself: three rules, not
+      // one. The replay guard (same event, same words) must also ask for the same paths and audience.
+      const team = loadTeam(paths, db, TTL).items;
+      const personal: KnowledgeItem[] = [];
+      const scoped = (paths_: string[], audience: 'team' | 'personal' = 'team'): Candidate => ({ ...cand('테스트 픽스처는 이 디렉터리의 fixtures/ 아래에 둔다.', true), eventId: 'E3', audience, scope: { paths: paths_, topics: ['fixtures', '테스트'] } });
+      const ctx3 = { ...base, cfg: normalizeConfig({ memory: { personal: true } }), team, personal };
+      const a = await consolidate(scoped(['src/billing/**']), ctx3);
+      const b = await consolidate(scoped(['src/web/**']), ctx3);
+      const mine = await consolidate(scoped([], 'personal'), ctx3);
+      const replayA = await consolidate(scoped(['src/billing/**']), ctx3);
+      check(
+        'proposals',
+        'the replay guard keeps apart same-worded rules for other paths or for oneself, and still catches the real replay',
+        a.relation === 'new' && b.relation === 'new' && a.itemId !== b.itemId && mine.relation === 'new' && personal.length === 1 && replayA.relation === 'duplicate' && replayA.itemId === a.itemId && replayA.detail.includes('already stored'),
+        JSON.stringify([a, b, mine, replayA].map((r) => `${r.relation}:${r.itemId?.slice(-6)}:${r.detail.slice(0, 30)}`)),
+      );
     } finally {
       db.close();
     }
