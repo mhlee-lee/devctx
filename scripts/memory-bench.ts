@@ -55,7 +55,7 @@ import { approveProposal, discardProposal, listProposals, resolveConflict } from
 import { agentAccessStatus, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
-import { callsLeft, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
+import { callsLeft, evaluationCallsLeft, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
 import type { ToolId } from '../src/types.ts';
 import { anchorsFor, positiveTerms, repoContext, staleReason } from '../src/knowledge/anchors.ts';
 import { heldReason } from '../src/knowledge/guard.ts';
@@ -1138,7 +1138,13 @@ let paraphraseLine = '';
       check('llm', 'a retry on another model does not exceed the hourly limit', calls === 1 && !res.ok && res.error === RATE_LIMIT_ERROR, `${calls} call(s)`);
       const cfgH = normalizeConfig({});
       db.recordLlmCall({ provider: 'fake', model: 'm', task: 'qualify:summarize', ok: true, ms: 1 });
-      check('llm', 'summary evaluations count against the history budget', callsLeft(cfgH, db, 'summarize') === cfgH.history.max_calls_per_hour - 1 && callsLeft(cfgH, db, 'extract') === cfgH.llm.max_calls_per_hour - 1);
+      check('llm', 'evaluations have their own budget: none of the real-call budgets pays for them', evaluationCallsLeft(cfgH, db) === cfgH.llm.qualify_calls_per_hour - 1 && callsLeft(cfgH, db, 'summarize') === cfgH.history.max_calls_per_hour && callsLeft(cfgH, db, 'extract') === cfgH.llm.max_calls_per_hour - 1);
+      // The first hour: the extract evaluation (12 calls) and one extraction must leave room for the
+      // judge evaluation (11 cases x 2 runs), or every judge falls back until the hour turns.
+      for (let i = 0; i < 12; i++) db.recordLlmCall({ provider: 'fake', model: 'm', task: 'qualify:extract', ok: true, ms: 1 });
+      db.recordLlmCall({ provider: 'fake', model: 'm', task: 'extract', ok: true, ms: 1 });
+      const judgeEvaluation = suiteCalls('judge', 'ko').length * cfgH.llm.qualify_runs;
+      check('llm', 'after the extract evaluation and an extraction, the judge evaluation still fits the hour', evaluationCallsLeft(cfgH, db) >= judgeEvaluation && callsLeft(cfgH, db, 'judge') === cfgH.llm.max_calls_per_hour - 2, `${evaluationCallsLeft(cfgH, db)} evaluation call(s) left, judge needs ${judgeEvaluation}`);
     } finally {
       db.close();
     }

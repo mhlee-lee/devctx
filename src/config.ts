@@ -36,6 +36,12 @@ export interface DevctxConfig {
     /** Largest model tier the router may pick automatically (it still tries cheaper ones first). */
     max_tier: Tier;
     max_calls_per_hour: number;
+    /**
+     * Hourly cap of model-evaluation calls (the requirement suites), counted apart from
+     * `max_calls_per_hour` so a first evaluation never starves the hour's real calls, or the
+     * other way round. 0: evaluations never start (pin a model or set `qualify: false`).
+     */
+    qualify_calls_per_hour: number;
     timeout_seconds: number;
     pricing_refresh_days: number;
     pin: Partial<Record<ToolId, string>>;
@@ -87,6 +93,7 @@ export const DEFAULT_CONFIG: DevctxConfig = {
     qualify_runs: 2,
     max_tier: 'large',
     max_calls_per_hour: 30,
+    qualify_calls_per_hour: 60,
     timeout_seconds: 120,
     pricing_refresh_days: 7,
     pin: {},
@@ -167,6 +174,7 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       qualify_runs: Math.round(num(llm.qualify_runs, d.llm.qualify_runs, 1, 5)),
       max_tier: llm.max_tier === 'small' || llm.max_tier === 'medium' ? llm.max_tier : 'large',
       max_calls_per_hour: num(llm.max_calls_per_hour, d.llm.max_calls_per_hour, 0, 1_000),
+      qualify_calls_per_hour: num(llm.qualify_calls_per_hour, d.llm.qualify_calls_per_hour, 0, 1_000),
       timeout_seconds: num(llm.timeout_seconds, d.llm.timeout_seconds, 10, 900),
       pricing_refresh_days: num(llm.pricing_refresh_days, d.llm.pricing_refresh_days, 0, 365),
       pin,
@@ -266,6 +274,7 @@ llm:
   qualify_runs: 2             # 평가를 몇 번 반복해 한 번도 틀리지 않아야 통과로 볼지
   max_tier: large             # 자동으로 고를 수 있는 가장 큰 모델 등급: small | medium | large
   max_calls_per_hour: 30      # 결정 추출·판정 호출 상한. 0이면 부르지 않는다(명시 표현만 확인 대기로 남김)
+  qualify_calls_per_hour: 60  # 모델 요구사항 평가 호출 상한 (위와 따로 센다. 한 시간 최대 합계 = 둘의 합). 0이면 평가를 시작하지 않는다
   timeout_seconds: 120
   pricing_refresh_days: 7     # 공개 가격표 갱신 주기. 0이면 번들 가격표만 사용
   pin: {}                     # 특정 모델 고정. 예: { codex: gpt-6-luna }

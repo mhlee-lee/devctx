@@ -308,20 +308,28 @@ async function runQualification(
   return res;
 }
 
-/** History summaries (and their model evaluations) have their own hourly budget. */
-const HISTORY_TASKS = ['summarize', 'qualify:summarize'];
+/** History summaries have their own hourly budget; evaluations (`qualify:<task>`) another. */
+const HISTORY_TASKS = ['summarize'];
+const QUALIFY_TASKS = SUITE_TASKS.map((t) => `qualify:${t}`);
 
 /**
  * Calls left this hour for the task's budget: `history.max_calls_per_hour` for summaries,
  * `llm.max_calls_per_hour` for everything else. Counted from recorded calls, so it holds across
- * worker runs; checked before every call, retries and model evaluations included.
+ * worker runs; checked before every call, retries included. Model evaluations have their own
+ * budget (`evaluationCallsLeft`).
  */
 export function callsLeft(cfg: DevctxConfig, db: StateDb | null, task: SuiteTask): number {
   if (!db) return Number.POSITIVE_INFINITY;
   const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
   const history = task === 'summarize';
-  const used = db.llmCallsSince(hourAgo, history ? { tasks: HISTORY_TASKS } : { excludeTasks: HISTORY_TASKS });
+  const used = db.llmCallsSince(hourAgo, history ? { tasks: HISTORY_TASKS } : { excludeTasks: [...HISTORY_TASKS, ...QUALIFY_TASKS] });
   return (history ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour) - used;
+}
+
+/** Evaluation calls left this hour (`llm.qualify_calls_per_hour`), whichever task they are for. */
+export function evaluationCallsLeft(cfg: DevctxConfig, db: StateDb | null): number {
+  if (!db) return Number.POSITIVE_INFINITY;
+  return cfg.llm.qualify_calls_per_hour - db.llmCallsSince(new Date(Date.now() - 3_600_000).toISOString(), { tasks: QUALIFY_TASKS });
 }
 
 /**
@@ -338,11 +346,11 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const attempts: string[] = [];
   const order = providerOrder(cfg, opts.host);
   if (order.length === 0) return { ok: false, error: 'no provider allowed', attempts: [noProviderReason(cfg, opts.host)] };
-  const limit = task === 'summarize' ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour;
   if (callsLeft(cfg, db, task) <= 0) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
-  // An evaluation runs the whole suite. It must fit the hour's remaining calls; one that is larger
-  // than the whole hourly limit may only start in an hour with no calls yet.
+  // An evaluation runs the whole suite out of its own hourly budget. It must fit the budget's
+  // remaining calls; one larger than the whole budget may only start in an hour with none spent.
   const evaluationCalls = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
+  const evaluationLimit = cfg.llm.qualify_calls_per_hour;
   let limited = false;
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
@@ -375,7 +383,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           if (q && q.status !== 'pass') continue; // failed, or its evaluation errored recently
           if (!q) {
             if (!opts.allowQualify || budget.remaining <= 0) continue;
-            if (callsLeft(cfg, db, task) < Math.min(evaluationCalls, limit)) {
+            if (evaluationLimit <= 0 || evaluationCallsLeft(cfg, db) < Math.min(evaluationCalls, evaluationLimit)) {
               limited = true;
               break providers;
             }
