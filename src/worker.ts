@@ -125,12 +125,15 @@ async function qualifyAhead(cfg: DevctxConfig, db: StateDb, host: string | null,
   if (!pid || pid === 'fake') return errors;
   for (const task of ['extract', 'judge'] as const) {
     const needed = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
-    if (evaluationCallsLeft(cfg, db) < Math.min(needed, cfg.llm.qualify_calls_per_hour) || cfg.llm.qualify_calls_per_hour <= 0) {
+    const cap = cfg.llm.qualify_calls_per_hour;
+    // Asked before every evaluation: an evaluation must fit the budget's remaining calls.
+    const fits = (): boolean => cap > 0 && evaluationCallsLeft(cfg, db) >= Math.min(needed, cap);
+    if (!fits()) {
       errors.push(`${task}: ${RATE_LIMIT_ERROR} (evaluations)`);
       break;
     }
     try {
-      const results = await qualifyProvider(cfg, pid, task, QUALIFICATIONS_PER_RUN, db, (r) => log('qualification', { model: r.key, task, pass: r.pass, score: r.score, blocked: r.blocked }));
+      const results = await qualifyProvider(cfg, pid, task, QUALIFICATIONS_PER_RUN, db, (r) => log('qualification', { model: r.key, task, pass: r.pass, score: r.score, blocked: r.blocked }), fits);
       if (results.some((r) => r.blocked)) break;
     } catch (error) {
       errors.push(`${task} evaluation: ${errorMessage(error)}`);

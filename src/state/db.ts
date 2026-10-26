@@ -922,6 +922,11 @@ export class StateDb {
     return this.db.prepare('select 1 as x from ops where event_id = ? and item_id = ? limit 1').get(eventId, itemId) !== undefined;
   }
 
+  /** Items this event's earlier operations created or changed (a run cut short is replayed). */
+  opItemsForEvent(eventId: string): string[] {
+    return (this.db.prepare('select distinct item_id from ops where event_id = ? and item_id is not null').all(eventId) as Row[]).map((r) => String(r.item_id));
+  }
+
   /**
    * Proposals nobody confirmed within the TTL are archived, not deleted: if the same rule comes up
    * months later it becomes active right away instead of starting over.

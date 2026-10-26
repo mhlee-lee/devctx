@@ -290,6 +290,16 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext, opts: C
   }
 
   const neighbors = neighborsOf(c, pending ? pool.filter((i) => i !== pending) : pool);
+  // A run cut short by the hourly limit replays the whole event: what an earlier run already
+  // stored from this candidate (same wording) is recognized, not stored, confirmed or settled a
+  // second time. Reinforcements of an existing rule are guarded in their branch.
+  if (!pending) {
+    const earlier = new Set(ctx.db.opItemsForEvent(c.eventId));
+    const stored = earlier.size > 0 ? [...ctx.team, ...ctx.personal].find((i) => earlier.has(i.id) && sameRule(c.statement, i.summary)) : undefined;
+    if (stored) {
+      return { relation: 'duplicate', itemId: stored.id, targetId: stored.id, files, detail: 'already stored from this event by a run the hourly limit cut short', status: stored.status, summary: stored.summary };
+    }
+  }
   const verdict = await judge(c, neighbors, ctx);
   if ('deferred' in verdict) {
     return { relation: 'deferred', itemId: null, targetId: null, files, detail: verdict.why, status: null, summary: null };

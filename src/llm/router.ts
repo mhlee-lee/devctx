@@ -357,6 +357,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const evaluationLimit = cfg.llm.qualify_calls_per_hour;
   let limited = false;
   let unevaluated = 0;
+  let asked = false; // a model was actually run or evaluated
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
@@ -396,6 +397,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
               break providers;
             }
             budget.remaining--;
+            asked = true;
             const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
             opts.log?.('qualification', { model: key, task, pass: res.pass, score: `${res.score}/${res.total}`, blocked: res.blocked });
             attempts.push(`${key}: ${task} evaluation ${res.blocked ? `could not run (${res.blocked})` : res.pass ? 'passed' : 'failed'} ${res.score}/${res.total}`);
@@ -411,6 +413,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           limited = true;
           break providers;
         }
+        asked = true;
         const raw = await provider.run(bin, model, req);
         const value = raw.ok ? pickAnswer(raw.data, raw.text, parse) : null;
         const ok = value !== null;
@@ -433,8 +436,9 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
     // Out of calls for this hour: callers keep the work for later instead of falling back.
     if (limited) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
     // Nothing was asked because no candidate is evaluated and this caller may not evaluate (the
-    // background worker does): callers know the answer is not a model's refusal.
-    if (unevaluated > 0 && attempts.length === 0) return { ok: false, error: NO_QUALIFIED_MODEL_ERROR, attempts: [`${unevaluated} candidate(s) wait for the background worker's evaluation`] };
+    // background worker does): callers know the answer is not a model's refusal. Providers that
+    // are not installed, skipped or without models do not change that.
+    if (unevaluated > 0 && !asked) return { ok: false, error: NO_QUALIFIED_MODEL_ERROR, attempts: [...attempts, `${unevaluated} candidate(s) wait for the background worker's evaluation`] };
     return { ok: false, error: 'no provider produced a valid answer', attempts };
   } finally {
     saveCache(cache);
@@ -563,6 +567,7 @@ export interface QualifyReport {
  * `devctx models --qualify <provider>`: walks the candidates of one provider in cost order and
  * evaluates them until one passes the task's suite (or `limit` evaluations ran). Candidates with a
  * current verdict are skipped; an existing pass ends the walk because nothing cheaper is left.
+ * `canStart` is asked before each evaluation (the background worker keeps to the hourly budget).
  */
 export async function qualifyProvider(
   cfg: DevctxConfig,
@@ -571,6 +576,7 @@ export async function qualifyProvider(
   limit: number,
   db: StateDb | null,
   onResult?: (r: QualifyReport) => void,
+  canStart: () => boolean = () => true,
 ): Promise<QualifyReport[]> {
   const cache = loadCache();
   const provider = getProvider(pid);
@@ -585,6 +591,7 @@ export async function qualifyProvider(
       const q = qualificationFor(cache, key, task, version);
       if (q?.status === 'pass') break;
       if (q) continue;
+      if (!canStart()) break;
       const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
       saveCache(cache);
       const report: QualifyReport = { key, task, pass: res.pass, score: `${res.score}/${res.total}`, details: res.details, blocked: res.blocked, avgCostUsd: res.avgCostUsd };

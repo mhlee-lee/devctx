@@ -624,7 +624,8 @@ const cand = (statement: string, durable: boolean): Candidate => ({
       db.archiveProposals(new Date(Date.now() + 86_400_000).toISOString(), new Set());
       const pool = loadTeam(paths, db, { ...TTL, local: true }).items;
       check('proposals', 'after the TTL it is archived, not deleted', pool.length === 1 && pool[0]?.archived === true && db.proposals()[0]?.status === 'archived');
-      const again = await consolidate(cand('로그는 JSON 한 줄 형식으로 남기면 좋겠다.', true), { ...base, team: pool });
+      // Months later means another event: the same id would be a replay of the first run.
+      const again = await consolidate({ ...cand('로그는 JSON 한 줄 형식으로 남기면 좋겠다.', true), eventId: 'E2' }, { ...base, team: pool });
       const now = loadTeam(paths, db, TTL).items;
       check('proposals', 'saying it again months later makes it active at once', again.files.length === 1 && now.length === 1 && now[0]?.status === 'active' && now[0]?.id === first.itemId && db.proposals().length === 0, again.detail);
     } finally {
@@ -1723,6 +1724,22 @@ let paraphraseLine = '';
       const later = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
       const t2 = teamOf(paths);
       check('judge', 'the next run with calls left judges the kept event: the old rule is replaced', later.applied.some((a) => a.relation === 'supersede') && t2.find((i) => i.summary.includes('Vitest'))?.status === 'active' && t2.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'superseded' && t2[0]?.pending === 0, JSON.stringify({ applied: later.applied.map((a) => a.relation), team: t2 }));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    {
+      // Two rules in one event: the first is stored, the judge of the second hits the limit. The
+      // replay must not take the first one's own file for a confirmation of it.
+      const { root, paths } = judgeRepo('judge-replay', 1);
+      const pino = { message: 1, title: 'pino', statement: '로그는 pino로 남긴다.', type: 'rule', enforcement: 'should', durability: 'unclear', audience: 'team', scope: { paths: [], topics: ['로그', 'pino'] }, evidence_quote: '앞으로 테스트는 Jest 대신 Vitest로 작성해', reason: null, valid_until: null, confidence: 0.4 };
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-replay.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [pino, vitest] }, { items: [pino, vitest] }], judge: [supersede] }));
+      const first = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 1 /, 'max_calls_per_hour: 30 '));
+      const replay = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      const pinoAfter = t2.find((i) => i.summary === '로그는 pino로 남긴다.');
+      check('judge', 'a replayed event does not confirm the proposal it stored before the limit; only the deferred rule is judged', first.applied.length === 1 && first.applied[0]?.status === 'proposed' && t1[0]?.pending === 1 && pinoAfter?.status === 'proposed' && pinoAfter.local && replay.applied.some((a) => a.relation === 'supersede') && replay.applied.filter((a) => a.summary === '로그는 pino로 남긴다.').every((a) => a.detail.includes('already stored')) && t2[0]?.pending === 0, JSON.stringify({ first: first.applied.map((a) => `${a.relation}:${a.status}`), replay: replay.applied.map((a) => `${a.relation}:${a.status}:${a.detail.slice(0, 40)}`), team: t2 }));
       delete process.env.DEVCTX_FAKE_LLM;
     }
     {
