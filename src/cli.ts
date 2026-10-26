@@ -440,8 +440,9 @@ async function main(argv: string[]): Promise<number> {
         for (const m of shown) {
           const est = m.estimate.unit === 'usd' ? `$${m.estimate.cost.toFixed(4)}` : `x${m.estimate.cost.toFixed(4)}`;
           const real = m.measuredUsd === null ? '-' : `$${m.measuredUsd.toFixed(4)}`;
+          const pinned = m.pinned && !SUITE_TASKS.every((t) => m.qualification[t]?.status === 'pass') ? '  [pinned: used without the requirement suite; pin only a model that passed it]' : m.pinned ? '  [pinned]' : '';
           console.log(
-            `  ${`${est}${m.estimate.known ? '' : '~'}`.padStart(9)}  ${real.padStart(9)}  ${m.estimate.tier.padEnd(6)}  ${SUITE_TASKS.map((t) => verdict(m.qualification[t]).padEnd(12)).join(' ')} ${m.key}`,
+            `  ${`${est}${m.estimate.known ? '' : '~'}`.padStart(9)}  ${real.padStart(9)}  ${m.estimate.tier.padEnd(6)}  ${SUITE_TASKS.map((t) => verdict(m.qualification[t]).padEnd(12)).join(' ')} ${m.key}${pinned}`,
           );
         }
         if (allowed.length > shown.length) console.log(`  ... ${allowed.length - shown.length} more candidates (pricier)`);

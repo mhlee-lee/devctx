@@ -319,7 +319,7 @@ llm:
   max_tier: large             # 자동 선택 상한: small | medium | large
   max_calls_per_hour: 30      # 0이면 LLM을 부르지 않는다 (providers: []도 같다)
   qualify_calls_per_hour: 60  # 모델 평가 호출 상한 (위와 따로 센다)
-  pin: {}                     # 모델 고정 (평가 생략). 예: { codex: gpt-6-luna }
+  pin: {}                     # 모델 고정 (평가 생략: 평가를 통과한 모델만 고정할 것). 예: { codex: gpt-6-luna }
 memory:
   personal: true              # 개인 선호는 저장소 밖에 저장
   implicit_rules: true        # "앞으로" 같은 표현이 없는 프롬프트도 5개씩 묶어 LLM이 판단 (false면 명시 표현만)

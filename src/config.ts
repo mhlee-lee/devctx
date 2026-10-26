@@ -277,7 +277,7 @@ llm:
   qualify_calls_per_hour: 60  # 모델 요구사항 평가 호출 상한 (위와 따로 센다. 한 시간 최대 합계 = 둘의 합). 0이면 평가를 시작하지 않는다
   timeout_seconds: 120
   pricing_refresh_days: 7     # 공개 가격표 갱신 주기. 0이면 번들 가격표만 사용
-  pin: {}                     # 특정 모델 고정. 예: { codex: gpt-6-luna }
+  pin: {}                     # 특정 모델 고정. 요구사항 평가를 건너뛰므로 평가를 통과한 모델만 고정할 것 (devctx models). 예: { codex: gpt-6-luna }
 
 memory:
   store_evidence_quote: true  # 사용자 발화 일부(200자 이하)를 근거로 저장

@@ -478,6 +478,8 @@ export interface ModelReport {
   measuredUsd: number | null;
   /** Allowed under `max_tier` (or pinned). */
   auto: boolean;
+  /** Pinned in `llm.pin`: used without the requirement suite (pin only a model that passed it). */
+  pinned: boolean;
 }
 
 export interface RouteReport {
@@ -523,7 +525,7 @@ export async function describeRoutes(cfg: DevctxConfig, host: string | null, opt
         const key = candidateKey(model);
         const qualification: ModelReport['qualification'] = {};
         for (const task of SUITE_TASKS) qualification[task] = qualificationFor(cache, key, task, version);
-        return { key, estimate, qualification, stats: cache.stats[key] ?? null, measuredUsd: measured(cache.stats[key]), auto: eligibleKeys.has(key) };
+        return { key, estimate, qualification, stats: cache.stats[key] ?? null, measuredUsd: measured(cache.stats[key]), auto: eligibleKeys.has(key), pinned: model.source === 'pinned' };
       }),
     });
   }

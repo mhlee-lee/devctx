@@ -312,6 +312,8 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   const selection = cachedSelection(cfg, llmHost);
   const routing = SUITE_TASKS.map((task) => `${task}: ${selection.find((s) => s.task === task && s.key)?.key ?? 'not evaluated yet'}`);
   add('ok', 'llm routing', `${routing.join('; ')} (details: devctx models)`);
+  const pins = Object.entries(cfg.llm.pin);
+  if (pins.length > 0) add('ok', 'llm pin', `${pins.map(([t, m]) => `${t}: ${m}`).join(', ')} (a pinned model is used without the requirement suite; pin only one that passed it, see devctx models)`);
   for (const [pid, b] of Object.entries(blocks)) {
     const meanwhile = cfg.llm.host_tool === 'only' ? 'no other tool is called (llm.host_tool: only), so only explicit markers are kept meanwhile' : 'other installed tools are used meanwhile';
     const hint = b.kind === 'auth' ? `log in again by running "${pid}"; ${meanwhile}` : `usage limit reached; ${meanwhile}`;
