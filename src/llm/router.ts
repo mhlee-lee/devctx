@@ -21,6 +21,8 @@ import {
 } from './types.ts';
 
 export const RATE_LIMIT_ERROR = 'hourly LLM call limit reached';
+/** No candidate has passed the task's evaluation and this call may not start one. */
+export const NO_QUALIFIED_MODEL_ERROR = 'no model has passed the evaluation yet';
 
 const DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000;
 const QUALIFICATION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -229,7 +231,9 @@ function candidates(models: readonly ModelCandidate[], maxTier: Tier): { model: 
 
 /** Pinned models, the test provider and `qualify: false` skip the requirement suite. */
 function trusted(cfg: DevctxConfig, model: ModelCandidate): boolean {
-  return model.source === 'pinned' || model.provider === 'fake' || !cfg.llm.qualify;
+  if (model.source === 'pinned' || !cfg.llm.qualify) return true;
+  // The test provider skips the suite unless a test asks for it (DEVCTX_FAKE_QUALIFY=1).
+  return model.provider === 'fake' && !process.env.DEVCTX_FAKE_QUALIFY;
 }
 
 function qualificationFor(cache: RouterCache, key: string, task: SuiteTask, version: string | null): Qualification | null {
@@ -352,6 +356,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const evaluationCalls = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
   const evaluationLimit = cfg.llm.qualify_calls_per_hour;
   let limited = false;
+  let unevaluated = 0;
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
@@ -382,7 +387,10 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           const q = qualificationFor(cache, key, task, version);
           if (q && q.status !== 'pass') continue; // failed, or its evaluation errored recently
           if (!q) {
-            if (!opts.allowQualify || budget.remaining <= 0) continue;
+            if (!opts.allowQualify || budget.remaining <= 0) {
+              unevaluated++;
+              continue;
+            }
             if (evaluationLimit <= 0 || evaluationCallsLeft(cfg, db) < Math.min(evaluationCalls, evaluationLimit)) {
               limited = true;
               break providers;
@@ -424,6 +432,9 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
     }
     // Out of calls for this hour: callers keep the work for later instead of falling back.
     if (limited) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
+    // Nothing was asked because no candidate is evaluated and this caller may not evaluate (the
+    // background worker does): callers know the answer is not a model's refusal.
+    if (unevaluated > 0 && attempts.length === 0) return { ok: false, error: NO_QUALIFIED_MODEL_ERROR, attempts: [`${unevaluated} candidate(s) wait for the background worker's evaluation`] };
     return { ok: false, error: 'no provider produced a valid answer', attempts };
   } finally {
     saveCache(cache);

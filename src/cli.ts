@@ -15,13 +15,14 @@ import { codeStatus, EXIT_MEMORY_CAPPED, indexPass, refreshIndex } from './codei
 import { NOISY_GRAMMARS } from './codeindex/languages.ts';
 import { CODE_TOOLS, codeTool, parseToolArgs, usageLine } from './codeindex/tools-meta.ts';
 import { agentAccessStatus } from './init/access.ts';
-import { describeRoutes, noProviderReason, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type Qualification } from './llm/router.ts';
+import { describeRoutes, NO_QUALIFIED_MODEL_ERROR, noProviderReason, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type Qualification } from './llm/router.ts';
 import { SUITE_TASKS, type SuiteTask } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
 import { isHookKind, isToolId, TOOL_IDS, type ToolId } from './types.ts';
 import { gitToplevel } from './util/git.ts';
 import { findProjectRoot, projectPaths } from './util/paths.ts';
 import { runWorker } from './worker.ts';
+import { spawnWorker } from './worker-spawn.ts';
 import { explainPrompt, memoryLog } from './explain.ts';
 import { historyState, setHistoryEnabled, setSwitch, switchState } from './history/toggle.ts';
 import { approveProposal, discardProposal, listProposals, resolveConflict } from './memory/manual.ts';
@@ -629,13 +630,20 @@ async function main(argv: string[]): Promise<number> {
       } finally {
         db.close();
       }
-      const report = await runWorker({ root, host: flag(args, 'host'), reason: 'remember', allowLlm: !has(args, 'no-llm') });
+      // Never waits for a model evaluation (minutes, the first time): an evaluated model answers,
+      // otherwise the text itself is the rule now and a background worker evaluates models for next time.
+      const report = await runWorker({ root, host: flag(args, 'host'), reason: 'remember', allowLlm: !has(args, 'no-llm'), allowQualify: false });
       for (const a of report.applied) console.log(describeApplied(a, ko));
       if (report.skipped) console.log(ko ? `지금은 처리하지 못했다 (${report.skipped}). 다음 실행 때 기록된다.` : `Not processed now (${report.skipped}); the next run records it.`);
       else if (report.applied.length === 0 && report.errors.some((e) => e.includes(RATE_LIMIT_ERROR))) {
         console.log(ko ? '시간당 LLM 호출 한도에 걸려 지금은 기록하지 못했다. 이벤트는 보관되며 다음 worker 실행(hook 또는 devctx worker) 때 기록된다.' : 'The hourly LLM call limit is reached; the event is kept and the next worker run (a hook, or devctx worker) records it.');
       } else if (report.applied.length === 0) console.log(ko ? '기록할 규칙을 찾지 못했다.' : 'No rule found to record.');
-      for (const e of report.errors) console.log(`error ${e}`);
+      const unevaluated = report.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR));
+      if (unevaluated && !report.skipped) {
+        spawnWorker(root, 'qualify', flag(args, 'host'));
+        console.log(ko ? '아직 평가를 통과한 모델이 없어 문장을 그대로 기록했다. 모델 평가는 백그라운드에서 진행한다 (devctx models로 확인).' : 'No model has passed the evaluation yet, so the text was recorded as written. Models are being evaluated in the background (see devctx models).');
+      }
+      for (const e of report.errors) if (!e.startsWith(NO_QUALIFIED_MODEL_ERROR)) console.log(`error ${e}`);
       return 0;
     }
 

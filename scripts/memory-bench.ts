@@ -55,7 +55,7 @@ import { approveProposal, discardProposal, listProposals, resolveConflict } from
 import { agentAccessStatus, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
-import { callsLeft, evaluationCallsLeft, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
+import { callsLeft, evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
 import type { ToolId } from '../src/types.ts';
 import { anchorsFor, positiveTerms, repoContext, staleReason } from '../src/knowledge/anchors.ts';
 import { heldReason } from '../src/knowledge/guard.ts';
@@ -65,7 +65,7 @@ import { newItem, writeItem } from '../src/knowledge/store.ts';
 import type { KnowledgeItem } from '../src/knowledge/types.ts';
 import { applyStats, deriveStatus, knowledgeDirs, loadTeam, readKnowledgeFiles } from '../src/knowledge/view.ts';
 import { consolidate, fastVerdict } from '../src/memory/consolidate.ts';
-import { recordExtractionHealth } from '../src/state/health.ts';
+import { readExtractionHealth, recordExtractionHealth } from '../src/state/health.ts';
 import { healthNotices, noteCommit } from '../src/upkeep.ts';
 import { git } from '../src/util/git.ts';
 import { readText, sha256 } from '../src/util/fsx.ts';
@@ -1145,6 +1145,12 @@ let paraphraseLine = '';
       db.recordLlmCall({ provider: 'fake', model: 'm', task: 'extract', ok: true, ms: 1 });
       const judgeEvaluation = suiteCalls('judge', 'ko').length * cfgH.llm.qualify_runs;
       check('llm', 'after the extract evaluation and an extraction, the judge evaluation still fits the hour', evaluationCallsLeft(cfgH, db) >= judgeEvaluation && callsLeft(cfgH, db, 'judge') === cfgH.llm.max_calls_per_hour - 2, `${evaluationCallsLeft(cfgH, db)} evaluation call(s) left, judge needs ${judgeEvaluation}`);
+      // `devctx remember` may not wait for an evaluation: it gets a distinct answer and no call is made.
+      process.env.DEVCTX_FAKE_QUALIFY = '1';
+      const before = (readText(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) ?? '').length;
+      const noModel = await routeCall({ task: 'extract', prompt: 'y', schema: {}, timeoutMs: 1000 }, (d) => d, { cfg: cfgH, host: null, db, allowQualify: false });
+      delete process.env.DEVCTX_FAKE_QUALIFY;
+      check('llm', 'a caller that may not evaluate a model is told so, without a call', !noModel.ok && noModel.error === NO_QUALIFIED_MODEL_ERROR && (readText(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) ?? '').length === before, noModel.ok ? 'ok?' : noModel.error);
     } finally {
       db.close();
     }
@@ -1343,6 +1349,23 @@ let paraphraseLine = '';
     insert('앞으로 PR 제목은 영어로 작성해', ['remember', 'durable', 'remember-cmd']);
     const marked = await runWorker({ root: repo, host: null, reason: 'remember', allowLlm: false });
     check('remember', 'its rules are active right away, not proposals of this PC', marked.applied[0]?.status === 'active' && marked.applied[0]?.relation === 'new', JSON.stringify(marked.applied));
+    // With a model configured but none evaluated yet, `remember` does not wait for an evaluation
+    // (minutes): the text is the rule now, no call is made, and no extraction failure is counted.
+    {
+      const savedFake = process.env.DEVCTX_FAKE_LLM;
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-remember.json');
+      process.env.DEVCTX_FAKE_QUALIFY = '1';
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [] }] }));
+      insert('앞으로 설정값은 환경 변수로만 읽어', ['remember', 'durable', 'remember-cmd']);
+      const quick = await runWorker({ root: repo, host: null, reason: 'remember', allowLlm: true, allowQualify: false });
+      const hdb = StateDb.open(paths.stateDb);
+      const streak = readExtractionHealth(hdb).streak;
+      hdb.close();
+      check('remember', 'without an evaluated model remember records the text at once, calls nothing and counts no failure', quick.applied[0]?.status === 'active' && quick.applied[0]?.summary === '앞으로 설정값은 환경 변수로만 읽어' && quick.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR)) && !fs.existsSync(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) && streak === 0, JSON.stringify({ applied: quick.applied.map((a) => `${a.relation}:${a.status}`), errors: quick.errors, streak }));
+      delete process.env.DEVCTX_FAKE_QUALIFY;
+      if (savedFake === undefined) delete process.env.DEVCTX_FAKE_LLM;
+      else process.env.DEVCTX_FAKE_LLM = savedFake;
+    }
 
     insert('앞으로 로그는 pino로 남겨', ['durable']);
     insert('앞으로 날짜는 dayjs로 다뤄', ['durable']);

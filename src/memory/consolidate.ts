@@ -64,6 +64,12 @@ export interface ConsolidateOptions {
 
 /** Runs after which a candidate nobody could compare stays a plain proposal. */
 export const MAX_JUDGE_ATTEMPTS = 5;
+/**
+ * Neighbour score from which a rule is held back (deferred or proposed) when no judge answers:
+ * the same bar the word-overlap verdict uses for "the same rule" (a shared word scores about 0.5,
+ * "Jest" against "Jest 대신 Vitest" above 1).
+ */
+const HOLD_MIN_SCORE = 0.75;
 
 /** A verdict, or why there is none: the hour's calls are spent (try later) or the judge failed. */
 type Verdict = JudgeResult | { deferred: true; why: string } | { unavailable: true; why: string };
@@ -159,7 +165,9 @@ async function judge(c: Candidate, neighbors: readonly Scored[], ctx: Consolidat
   if (res.ok) return res.value;
   // Without a verdict a rule must not go live next to one it may duplicate or contradict (both
   // would be delivered, and nothing comes back to settle it): the hourly limit means try later,
-  // anything else means keep it as a proposal and compare it again in a later run.
+  // anything else means keep it as a proposal and compare it again in a later run. A weak match
+  // (a shared word, not a shared subject) is not worth holding the rule for.
+  if ((neighbors[0]?.score ?? 0) < HOLD_MIN_SCORE) return heuristicVerdict(c, neighbors, `judge unavailable (${res.error}); no close match`);
   if (res.error === RATE_LIMIT_ERROR) return { deferred: true, why: res.error };
   return { unavailable: true, why: `judge unavailable: ${res.error}` };
 }

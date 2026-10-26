@@ -12,7 +12,8 @@ import { repoContext, type RepoContext } from './knowledge/anchors.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { deriveStatus, knowledgeDirs, loadPersonal, loadTeam, readKnowledgeFiles } from './knowledge/view.ts';
 import { refreshCommunityPrices } from './llm/catalog.ts';
-import { RATE_LIMIT_ERROR, workingHost, type RouteOptions } from './llm/router.ts';
+import { evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type RouteOptions } from './llm/router.ts';
+import { suiteCalls } from './llm/suite.ts';
 import { consolidate, rejudgePending, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
 import { extractCandidates } from './memory/extract.ts';
 import { StateDb } from './state/db.ts';
@@ -35,6 +36,8 @@ export interface WorkerOptions {
   host: string | null;
   reason: string;
   allowLlm: boolean;
+  /** False: use models already evaluated, never start an evaluation here (`devctx remember`). */
+  allowQualify?: boolean;
 }
 
 export interface WorkerReport {
@@ -115,6 +118,30 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
 }
 
 /**
+ * Evaluates candidates of the first allowed provider for extraction and judging, cheapest first,
+ * until one passes each (or the evaluation budget of the hour runs out). Errors are returned.
+ */
+async function qualifyAhead(cfg: DevctxConfig, db: StateDb, host: string | null, log: (message: string, extra?: Record<string, unknown>) => void): Promise<string[]> {
+  const errors: string[] = [];
+  const pid = providerOrder(cfg, host)[0];
+  if (!pid || pid === 'fake') return errors;
+  for (const task of ['extract', 'judge'] as const) {
+    const needed = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
+    if (evaluationCallsLeft(cfg, db) < Math.min(needed, cfg.llm.qualify_calls_per_hour) || cfg.llm.qualify_calls_per_hour <= 0) {
+      errors.push(`${task}: ${RATE_LIMIT_ERROR} (evaluations)`);
+      break;
+    }
+    try {
+      const results = await qualifyProvider(cfg, pid, task, QUALIFICATIONS_PER_RUN, db, (r) => log('qualification', { model: r.key, task, pass: r.pass, score: r.score, blocked: r.blocked }));
+      if (results.some((r) => r.blocked)) break;
+    } catch (error) {
+      errors.push(`${task} evaluation: ${errorMessage(error)}`);
+    }
+  }
+  return errors;
+}
+
+/**
  * Background processing: extract rule candidates from pending events, consolidate them into
  * `.devctx/knowledge/`, regenerate instruction files and (optionally) commit. Safe to run
  * repeatedly; a lock keeps one worker per worktree.
@@ -142,12 +169,19 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       // Git hooks and `devctx remember` start the worker without a host: the tool last worked in here.
       const host = workingHost(opts.host, db);
       const route: RouteOptions | null = opts.allowLlm
-        ? { cfg, host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
+        ? { cfg, host, db, allowQualify: opts.allowQualify ?? true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
         : null;
       // `max_calls_per_hour: 0` or `providers: []` turn calls off: rules fall back to the no-LLM
       // path (explicit markers kept as proposals), history entries to the assistant's reply.
       const decisionRoute = route && !llmOff(cfg, 'decisions') ? route : null;
       const historyRoute = route && !llmOff(cfg, 'history') ? route : null;
+      if (opts.reason === 'qualify') {
+        // Started by `devctx remember` when no evaluated model answered it: evaluate candidates
+        // now, in the background, so the next call has a model (within the evaluation budget).
+        if (decisionRoute) report.errors.push(...(await qualifyAhead(cfg, db, host, log)));
+        log('qualify finished', { errors: report.errors });
+        return report;
+      }
       if (decisionRoute || historyRoute) await refreshCommunityPrices(cfg.llm.pricing_refresh_days);
       const viewOpts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
       let repo: RepoContext | null | undefined;
@@ -174,7 +208,10 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         if (events.length === 0) break;
         const candidates = events.filter((e) => e.candidate && e.prompt);
         const outcome = await extractCandidates(candidates, db, decisionRoute);
-        if (decisionRoute && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length) {
+        // Health counts runs a model could have answered: not those cut short by the hourly limit,
+        // nor those that may not evaluate a model (`devctx remember` leaves that to this worker).
+        const unevaluated = !outcome.usedLlm && outcome.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR));
+        if (decisionRoute && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length && !unevaluated) {
           attempted++;
           if (outcome.usedLlm) succeeded++;
           else lastError = outcome.errors[outcome.errors.length - 1] ?? 'no model answered';
