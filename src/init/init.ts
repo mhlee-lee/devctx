@@ -6,7 +6,7 @@ import { loadConfig, renderConfigYaml } from '../config.ts';
 import { StateDb } from '../state/db.ts';
 import type { Language, ToolId } from '../types.ts';
 import { readText, writeFileAtomic } from '../util/fsx.ts';
-import { projectPaths } from '../util/paths.ts';
+import { projectPaths, type ProjectPaths } from '../util/paths.ts';
 import { ensureGitAttributes, ensureGitIgnore, untrackGenerated } from './attributes.ts';
 import { git } from '../util/git.ts';
 import { ensureGitHooks, type GitHookResult } from './githooks.ts';
@@ -23,6 +23,11 @@ export interface InitOptions {
   force: boolean;
   /** Built-in code index for a new config (default on). */
   codeIndex?: boolean;
+  /**
+   * Write the pre-approval entries in the user's home directory (Copilot CLI, Kiro). The choice
+   * is kept per PC (the daily check follows it); undefined keeps the earlier choice, default on.
+   */
+  homePermissions?: boolean;
 }
 
 export interface InitReport {
@@ -43,6 +48,21 @@ function writeIfMissing(file: string, content: string, written: string[], root: 
   writeFileAtomic(file, content, mode);
   written.push(path.relative(root, file));
   return true;
+}
+
+/** Per-PC switch for the home-directory permission files (kept in the local state database). */
+export const HOME_PERMISSIONS_KEY = 'home_permissions';
+
+/** Records an explicit choice and returns whether this PC's home directory may be edited. */
+function homePermissionsChoice(paths: ProjectPaths, wanted: boolean | undefined): boolean {
+  const db = StateDb.open(paths.stateDb);
+  try {
+    if (wanted === false) db.kvSet(HOME_PERMISSIONS_KEY, 'off');
+    else if (wanted === true) db.kvDelete(HOME_PERMISSIONS_KEY);
+    return db.kvGet(HOME_PERMISSIONS_KEY) !== 'off';
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -118,14 +138,16 @@ export function runInit(opts: InitOptions): InitReport {
 
   const codeCfg = loadConfig(paths);
   const codeIndex = codeCfg.code_index.enabled;
+  const machine = homePermissionsChoice(paths, opts.homePermissions);
   const accessFiles = [
     ...removeLegacyMcp(opts.root),
-    ...installAgentAccess(opts.root, opts.tools, { enabled: codeIndex, preapprove: codeCfg.code_index.preapprove, language: codeCfg.language }),
+    ...installAgentAccess(opts.root, opts.tools, { enabled: codeIndex, preapprove: codeCfg.code_index.preapprove, language: codeCfg.language, machine }),
   ];
   for (const a of accessFiles) if (a.note) notes.push(`${a.file}: ${a.note}`);
   if (codeIndex) {
     notes.push('code index: agents use it through the "devctx-code" skill (.devctx/bin/devctx code …); each clone indexes in the background at its first session.');
     if (codeCfg.code_index.preapprove) notes.push('code index: the skill command is pre-approved per tool (turn off with code_index.preapprove: false).');
+    if (codeCfg.code_index.preapprove && !machine && opts.tools.some((t) => t === 'copilot' || t === 'kiro')) notes.push('home directory: left alone on this PC (--no-home-permissions); Copilot CLI and Kiro will ask before running the skill command. Re-enable with devctx init --home-permissions.');
   }
   if (opts.tools.includes('codex')) notes.push('Codex: approve the project hooks once with /hooks (Codex asks to trust new hooks).');
   if (opts.tools.includes('cursor')) notes.push('Cursor: hooks run only in a trusted workspace.');

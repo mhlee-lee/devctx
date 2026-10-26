@@ -44,11 +44,15 @@ export interface FileRow {
   lang: LangId;
   size: number;
   mtime: number;
+  /** Content hash; `SKIPPED` for a file above the size limit, '' when it must be looked at again. */
   hash: string;
   error: string | null;
   /** Parsed, but the parser recovered from syntax errors. */
   syntax?: boolean;
 }
+
+/** `hash` of a file listed but not parsed because it is larger than `code_index.max_file_kb`. */
+export const SKIPPED = 'skipped';
 
 type Row = Record<string, unknown>;
 
@@ -149,6 +153,14 @@ export class CodeStore {
 
   touch(file: string, size: number, mtime: number): void {
     this.db.prepare('update files set size = ?, mtime = ? where path = ?').run(size, mtime, file);
+  }
+
+  /**
+   * After `code_index.max_file_kb` changed: files skipped for size, and parsed files now above the
+   * limit, lose their hash so the next sync looks at them again.
+   */
+  forgetForLimit(maxBytes: number): void {
+    this.db.prepare("update files set hash = '' where hash = ? or (error is null and size > ?)").run(SKIPPED, maxBytes);
   }
 
   remove(file: string): void {

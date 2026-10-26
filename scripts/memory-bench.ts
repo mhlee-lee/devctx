@@ -52,10 +52,10 @@ import { recentChanges, sessionContext } from '../src/hooks/context.ts';
 import { runInit } from '../src/init/init.ts';
 import { installKey, readToolsLock, renderShim, renderToolsLock, shimStatus } from '../src/init/shim.ts';
 import { approveProposal, discardProposal, listProposals, resolveConflict } from '../src/memory/manual.ts';
-import { agentAccessStatus, renderSkill } from '../src/init/access.ts';
+import { agentAccessStatus, BACKUP_SUFFIX, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
-import { callsLeft, RATE_LIMIT_ERROR, routeCall } from '../src/llm/router.ts';
+import { callsLeft, evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
 import type { ToolId } from '../src/types.ts';
 import { anchorsFor, positiveTerms, repoContext, staleReason } from '../src/knowledge/anchors.ts';
 import { heldReason } from '../src/knowledge/guard.ts';
@@ -65,8 +65,8 @@ import { newItem, writeItem } from '../src/knowledge/store.ts';
 import type { KnowledgeItem } from '../src/knowledge/types.ts';
 import { applyStats, deriveStatus, knowledgeDirs, loadTeam, readKnowledgeFiles } from '../src/knowledge/view.ts';
 import { consolidate, fastVerdict } from '../src/memory/consolidate.ts';
-import { recordExtractionHealth } from '../src/state/health.ts';
-import { healthNotices, noteCommit } from '../src/upkeep.ts';
+import { readExtractionHealth, recordExtractionHealth } from '../src/state/health.ts';
+import { dailyUpkeep, healthNotices, noteCommit } from '../src/upkeep.ts';
 import { git } from '../src/util/git.ts';
 import { readText, sha256 } from '../src/util/fsx.ts';
 import { sameRule } from '../src/memory/dedupe.ts';
@@ -75,7 +75,8 @@ import type { Candidate } from '../src/memory/extract.ts';
 import { heuristicCandidates } from '../src/memory/extract.ts';
 import { parseExtractResult, parseJudgeResult } from '../src/memory/prompts.ts';
 import { StateDb } from '../src/state/db.ts';
-import { projectPaths } from '../src/util/paths.ts';
+import { projectPaths, type ProjectPaths } from '../src/util/paths.ts';
+import { overlappingRules } from '../src/knowledge/overlap.ts';
 import { runWorker } from '../src/worker.ts';
 import { approxTokens, today } from '../src/util/text.ts';
 
@@ -210,6 +211,16 @@ for (const c of RETRIEVAL) {
   const since = new Date(Date.now() - 3_600_000).toISOString();
   const sel = selectPromptContext([...ITEMS, fresh], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set() });
   check('session', 'a rule recorded during the session reaches the next prompt', sel.ids.includes('FRESH'), `got [${sel.ids}]`);
+  // Approved (or confirmed again) during the session: its captured_at is older than the session,
+  // yet the session-start block never had it. Delivered once, like a rule recorded just now.
+  const approved = rule('APPROVED', '마이그레이션 파일은 손으로 고치지 않는다.', ['migration'], {
+    tier: 'core',
+    source: { kind: 'user-instruction', actor: null, tool: 'codex', captured_at: new Date(Date.now() - 7 * 86_400_000).toISOString() },
+  });
+  const startBlock = sessionContext(ITEMS, [], cfg).ids;
+  const late = selectPromptContext([...ITEMS, approved], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set(startBlock) });
+  const given = selectPromptContext([...ITEMS, approved], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set([...startBlock, 'APPROVED']) });
+  check('session', 'a core rule approved mid-session reaches the current session, once', late.ids.includes('APPROVED') && late.trace.find((t) => t.item.id === 'APPROVED')?.outcome === 'fresh' && !given.ids.includes('APPROVED') && late.ids.every((id) => id === 'APPROVED' || !startBlock.includes(id)), `late [${late.ids}] given [${given.ids}]`);
 }
 
 // Packing: a rule that does not fit is skipped and packing continues (never stop at the first miss).
@@ -613,9 +624,27 @@ const cand = (statement: string, durable: boolean): Candidate => ({
       db.archiveProposals(new Date(Date.now() + 86_400_000).toISOString(), new Set());
       const pool = loadTeam(paths, db, { ...TTL, local: true }).items;
       check('proposals', 'after the TTL it is archived, not deleted', pool.length === 1 && pool[0]?.archived === true && db.proposals()[0]?.status === 'archived');
-      const again = await consolidate(cand('로그는 JSON 한 줄 형식으로 남기면 좋겠다.', true), { ...base, team: pool });
+      // Months later means another event: the same id would be a replay of the first run.
+      const again = await consolidate({ ...cand('로그는 JSON 한 줄 형식으로 남기면 좋겠다.', true), eventId: 'E2' }, { ...base, team: pool });
       const now = loadTeam(paths, db, TTL).items;
       check('proposals', 'saying it again months later makes it active at once', again.files.length === 1 && now.length === 1 && now[0]?.status === 'active' && now[0]?.id === first.itemId && db.proposals().length === 0, again.detail);
+
+      // One message, the same words for two directories and once for oneself: three rules, not
+      // one. The replay guard (same event, same words) must also ask for the same paths and audience.
+      const team = loadTeam(paths, db, TTL).items;
+      const personal: KnowledgeItem[] = [];
+      const scoped = (paths_: string[], audience: 'team' | 'personal' = 'team'): Candidate => ({ ...cand('테스트 픽스처는 이 디렉터리의 fixtures/ 아래에 둔다.', true), eventId: 'E3', audience, scope: { paths: paths_, topics: ['fixtures', '테스트'] } });
+      const ctx3 = { ...base, cfg: normalizeConfig({ memory: { personal: true } }), team, personal };
+      const a = await consolidate(scoped(['src/billing/**']), ctx3);
+      const b = await consolidate(scoped(['src/web/**']), ctx3);
+      const mine = await consolidate(scoped([], 'personal'), ctx3);
+      const replayA = await consolidate(scoped(['src/billing/**']), ctx3);
+      check(
+        'proposals',
+        'the replay guard keeps apart same-worded rules for other paths or for oneself, and still catches the real replay',
+        a.relation === 'new' && b.relation === 'new' && a.itemId !== b.itemId && mine.relation === 'new' && personal.length === 1 && replayA.relation === 'duplicate' && replayA.itemId === a.itemId && replayA.detail.includes('already stored'),
+        JSON.stringify([a, b, mine, replayA].map((r) => `${r.relation}:${r.itemId?.slice(-6)}:${r.detail.slice(0, 30)}`)),
+      );
     } finally {
       db.close();
     }
@@ -640,6 +669,12 @@ const cand = (statement: string, durable: boolean): Candidate => ({
       const removed = db.pruneEvents(ago(90));
       const pending = db.pendingEvents(10).map((e) => e.id);
       check('events', 'only processed events older than 90 days are deleted', removed === 1 && pending.includes(oldPending));
+      // A prompt never analyzed is kept longer, not forever: the unprocessed cap drops it.
+      const veryOld = ev(ago(200));
+      const counts = db.eventCounts();
+      const dropped = db.pruneEvents(ago(90), ago(180));
+      const left = db.pendingEvents(10).map((e) => e.id);
+      check('events', 'unanalyzed prompts are dropped only past their own, longer retention', counts.pending === 2 && counts.oldestPending?.slice(0, 10) === ago(200).slice(0, 10) && dropped === 1 && !left.includes(veryOld) && left.includes(oldPending), JSON.stringify({ counts, dropped, left }));
     } finally {
       db.close();
     }
@@ -1065,6 +1100,48 @@ let paraphraseLine = '';
     fs.rmSync(initRoot, { recursive: true, force: true });
   }
 
+  // Which CLI the worker calls: by default only the tool being worked in, and `llm.providers` is an
+  // allowlist in every mode (a host outside it is not called). No DEVCTX_FAKE_LLM here: the fake
+  // provider replaces the order.
+  {
+    const fakeSaved = process.env.DEVCTX_FAKE_LLM;
+    delete process.env.DEVCTX_FAKE_LLM;
+    try {
+      const all = normalizeConfig({ targets: ['copilot', 'claude'] });
+      const order = (c: DevctxConfig, host: string | null): string => providerOrder(c, host).join(',');
+      check('llm', 'host_tool defaults to only: the tool being worked in is the only provider', all.llm.host_tool === 'only' && order(all, 'codex') === 'codex' && order(all, 'claude') === 'claude' && order(all, 'copilot') === 'copilot');
+      check('llm', 'without a running tool, only mode falls back to the project targets (providers order)', order(all, null) === 'claude,copilot' && order(all, 'cli') === 'claude,copilot');
+      const allow = normalizeConfig({ targets: ['codex'], llm: { providers: ['copilot'] } });
+      check('llm', 'providers is an allowlist: a host outside it gets no provider in only mode', order(allow, 'codex') === '' && order(allow, 'copilot') === 'copilot' && order(allow, null) === '');
+      const prefer = normalizeConfig({ targets: ['codex'], llm: { host_tool: 'prefer', providers: ['copilot', 'codex'] } });
+      check('llm', 'prefer puts the host first and never adds a host outside providers', order(prefer, 'codex') === 'codex,copilot' && order(prefer, 'claude') === 'copilot,codex' && order(prefer, null) === 'codex,copilot');
+      const any = normalizeConfig({ llm: { host_tool: 'any', providers: ['copilot', 'codex'] } });
+      check('llm', 'any keeps the providers order whatever the host', order(any, 'codex') === 'copilot,codex');
+      check('llm', 'the former prefer_host_tool: false reads as any; true (the old default) carries no intent', normalizeConfig({ llm: { prefer_host_tool: false } }).llm.host_tool === 'any' && normalizeConfig({ llm: { prefer_host_tool: true } }).llm.host_tool === 'only' && normalizeConfig({ llm: { host_tool: 'bogus' } }).llm.host_tool === 'only');
+      const res = await routeCall({ task: 'extract', prompt: 'x', schema: {}, timeoutMs: 1000 }, (d) => d, { cfg: allow, host: 'codex', db: null, allowQualify: false });
+      check('llm', 'a call with no allowed provider fails at once and says why', !res.ok && res.error === 'no provider allowed' && res.attempts[0]?.includes('codex is not in llm.providers'), res.ok ? 'ok?' : res.attempts.join(' | '));
+      const tmpHost = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-host-'));
+      try {
+        const hdb = StateDb.open(path.join(tmpHost, 'state.sqlite'));
+        try {
+          check('llm', 'workingHost keeps a known host and is null before any hook ran', workingHost('claude', hdb) === 'claude' && workingHost(null, hdb) === null);
+          const base = { kind: 'prompt' as const, session: 's', cwd: tmpHost, prompt: 'x', lastAssistant: null, transcriptPath: null, model: null, flags: [], candidate: false };
+          hdb.insertEvent({ ...base, ts: '2026-10-01T00:00:00.000Z', tool: 'claude', host: 'claude' });
+          hdb.insertEvent({ ...base, ts: '2026-10-02T00:00:00.000Z', tool: 'codex', host: 'codex' });
+          hdb.insertEvent({ ...base, ts: '2026-10-03T00:00:00.000Z', tool: 'cli', host: 'cli' });
+          check('llm', 'a worker started without a host (git hook, terminal) uses the tool whose hook last ran', workingHost(null, hdb) === 'codex' && workingHost('cli', hdb) === 'codex');
+        } finally {
+          hdb.close();
+        }
+      } finally {
+        fs.rmSync(tmpHost, { recursive: true, force: true });
+      }
+    } finally {
+      if (fakeSaved === undefined) delete process.env.DEVCTX_FAKE_LLM;
+      else process.env.DEVCTX_FAKE_LLM = fakeSaved;
+    }
+  }
+
   // The hourly limit holds across retries inside one request.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-limit-'));
   const saved = { home: process.env.DEVCTX_HOME, fake: process.env.DEVCTX_FAKE_LLM, models: process.env.DEVCTX_FAKE_MODELS };
@@ -1085,7 +1162,19 @@ let paraphraseLine = '';
       check('llm', 'a retry on another model does not exceed the hourly limit', calls === 1 && !res.ok && res.error === RATE_LIMIT_ERROR, `${calls} call(s)`);
       const cfgH = normalizeConfig({});
       db.recordLlmCall({ provider: 'fake', model: 'm', task: 'qualify:summarize', ok: true, ms: 1 });
-      check('llm', 'summary evaluations count against the history budget', callsLeft(cfgH, db, 'summarize') === cfgH.history.max_calls_per_hour - 1 && callsLeft(cfgH, db, 'extract') === cfgH.llm.max_calls_per_hour - 1);
+      check('llm', 'evaluations have their own budget: none of the real-call budgets pays for them', evaluationCallsLeft(cfgH, db) === cfgH.llm.qualify_calls_per_hour - 1 && callsLeft(cfgH, db, 'summarize') === cfgH.history.max_calls_per_hour && callsLeft(cfgH, db, 'extract') === cfgH.llm.max_calls_per_hour - 1);
+      // The first hour: the extract evaluation (12 calls) and one extraction must leave room for the
+      // judge evaluation (11 cases x 2 runs), or every judge falls back until the hour turns.
+      for (let i = 0; i < 12; i++) db.recordLlmCall({ provider: 'fake', model: 'm', task: 'qualify:extract', ok: true, ms: 1 });
+      db.recordLlmCall({ provider: 'fake', model: 'm', task: 'extract', ok: true, ms: 1 });
+      const judgeEvaluation = suiteCalls('judge', 'ko').length * cfgH.llm.qualify_runs;
+      check('llm', 'after the extract evaluation and an extraction, the judge evaluation still fits the hour', evaluationCallsLeft(cfgH, db) >= judgeEvaluation && callsLeft(cfgH, db, 'judge') === cfgH.llm.max_calls_per_hour - 2, `${evaluationCallsLeft(cfgH, db)} evaluation call(s) left, judge needs ${judgeEvaluation}`);
+      // `devctx remember` may not wait for an evaluation: it gets a distinct answer and no call is made.
+      process.env.DEVCTX_FAKE_QUALIFY = '1';
+      const before = (readText(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) ?? '').length;
+      const noModel = await routeCall({ task: 'extract', prompt: 'y', schema: {}, timeoutMs: 1000 }, (d) => d, { cfg: cfgH, host: null, db, allowQualify: false });
+      delete process.env.DEVCTX_FAKE_QUALIFY;
+      check('llm', 'a caller that may not evaluate a model is told so, without a call', !noModel.ok && noModel.error === NO_QUALIFIED_MODEL_ERROR && (readText(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) ?? '').length === before, noModel.ok ? 'ok?' : noModel.error);
     } finally {
       db.close();
     }
@@ -1284,6 +1373,23 @@ let paraphraseLine = '';
     insert('앞으로 PR 제목은 영어로 작성해', ['remember', 'durable', 'remember-cmd']);
     const marked = await runWorker({ root: repo, host: null, reason: 'remember', allowLlm: false });
     check('remember', 'its rules are active right away, not proposals of this PC', marked.applied[0]?.status === 'active' && marked.applied[0]?.relation === 'new', JSON.stringify(marked.applied));
+    // With a model configured but none evaluated yet, `remember` does not wait for an evaluation
+    // (minutes): the text is the rule now, no call is made, and no extraction failure is counted.
+    {
+      const savedFake = process.env.DEVCTX_FAKE_LLM;
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-remember.json');
+      process.env.DEVCTX_FAKE_QUALIFY = '1';
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [] }] }));
+      insert('앞으로 설정값은 환경 변수로만 읽어', ['remember', 'durable', 'remember-cmd']);
+      const quick = await runWorker({ root: repo, host: null, reason: 'remember', allowLlm: true, allowQualify: false });
+      const hdb = StateDb.open(paths.stateDb);
+      const streak = readExtractionHealth(hdb).streak;
+      hdb.close();
+      check('remember', 'without an evaluated model remember records the text at once, calls nothing and counts no failure', quick.applied[0]?.status === 'active' && quick.applied[0]?.summary === '앞으로 설정값은 환경 변수로만 읽어' && quick.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR)) && !fs.existsSync(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) && streak === 0, JSON.stringify({ applied: quick.applied.map((a) => `${a.relation}:${a.status}`), errors: quick.errors, streak }));
+      delete process.env.DEVCTX_FAKE_QUALIFY;
+      if (savedFake === undefined) delete process.env.DEVCTX_FAKE_LLM;
+      else process.env.DEVCTX_FAKE_LLM = savedFake;
+    }
 
     insert('앞으로 로그는 pino로 남겨', ['durable']);
     insert('앞으로 날짜는 dayjs로 다뤄', ['durable']);
@@ -1400,6 +1506,35 @@ let paraphraseLine = '';
     fs.writeFileSync(path.join(repo, '.vscode/settings.json'), '{\n  // team settings\n  "editor.tabSize": 2,\n}\n');
     const access = agentAccessStatus(repo, ['copilot'], { enabled: true, preapprove: true, language: 'ko' }).find((x) => x.file === '.vscode/settings.json');
     check('access', 'a settings file with comments gets the exact entry to add by hand', access?.ok === false && access.hint?.includes('chat.tools.terminal.autoApprove') === true && !access.hint.includes('run "devctx init"'), access?.hint);
+
+    // The Copilot CLI approval lives in the user's home directory: the file is copied before the
+    // first edit, the change is named, and a PC can opt out (the daily check follows the choice).
+    {
+      const copilotHome = path.join(tmp, 'copilot-home');
+      fs.mkdirSync(copilotHome);
+      const permFile = path.join(copilotHome, 'permissions-config.json');
+      fs.writeFileSync(permFile, '{\n  "locations": {\n    "/elsewhere": { "tool_approvals": [{ "kind": "commands", "commandIdentifiers": ["ls:*"] }] }\n  }\n}\n');
+      const savedCopilot = process.env.COPILOT_HOME;
+      process.env.COPILOT_HOME = copilotHome;
+      try {
+        const home = path.join(tmp, 'home-perms');
+        fs.mkdirSync(home);
+        git(['init', '-q'], home);
+        const optOut = runInit({ root: home, tools: ['copilot'], language: 'ko', gitHooks: false, force: false, codeIndex: true, source: null, homePermissions: false });
+        const untouched = readText(permFile)?.includes('ls:*') && !readText(permFile)?.includes('devctx') && !fs.existsSync(`${permFile}${BACKUP_SUFFIX}`);
+        const upkeepDb = StateDb.open(projectPaths(home).stateDb);
+        const daily = dailyUpkeep(home, loadConfig(projectPaths(home)), upkeepDb);
+        upkeepDb.close();
+        check('access', '--no-home-permissions leaves the home directory alone, also at the daily check', Boolean(untouched) && !optOut.accessFiles.some((a) => a.machine && a.action !== 'unchanged') && optOut.notes.some((n) => n.includes('--no-home-permissions')) && !daily.some((d) => d.includes('permissions-config')) && !readText(permFile)?.includes('devctx'), JSON.stringify({ daily, notes: optOut.notes.filter((n) => n.includes('home')) }));
+        const optIn = runInit({ root: home, tools: ['copilot'], language: 'ko', gitHooks: false, force: false, codeIndex: true, source: null, homePermissions: true });
+        const edited = optIn.accessFiles.find((a) => a.machine && a.file === permFile);
+        const backup = readText(`${permFile}${BACKUP_SUFFIX}`);
+        check('access', 'editing the home file keeps a copy of it from before devctx and says what was added', edited?.action === 'updated' && edited.note?.includes('approves') === true && edited.note.includes(BACKUP_SUFFIX) && backup?.includes('ls:*') === true && !backup.includes('devctx') && readText(permFile)?.includes('.devctx/bin/devctx code:*') === true && readText(permFile)?.includes('ls:*') === true, JSON.stringify(edited));
+      } finally {
+        if (savedCopilot === undefined) delete process.env.COPILOT_HOME;
+        else process.env.COPILOT_HOME = savedCopilot;
+      }
+    }
 
     const unknown = runCli(['statsu'], repo);
     check('cli', 'an unknown command is an error, not just the help text', unknown.status === 1 && unknown.stderr.includes('statsu') && !unknown.stdout.includes('사용법'), unknown.stderr);
@@ -1568,6 +1703,83 @@ let paraphraseLine = '';
     const offRun = await runWorker({ root: off, host: 'claude', reason: 'manual', allowLlm: true });
     check('config', 'with max_calls_per_hour: 0 no model is called; explicit rules become proposals', !fs.existsSync(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) && offRun.applied.some((a) => a.status === 'proposed'), JSON.stringify(offRun.applied.map((a) => a.status)));
     delete process.env.DEVCTX_FAKE_LLM;
+
+    // The judge must not fall back to word overlap: a rule would go live next to one it replaces
+    // or contradicts, both delivered, nothing to settle it. At the hourly limit the event waits for
+    // a later run; when the judge fails otherwise the rule is a proposal compared again later.
+    const vitest = { message: 1, title: 'Vitest', statement: '테스트는 Jest 대신 Vitest로 작성한다.', type: 'rule', enforcement: 'should', durability: 'durable', audience: 'team', scope: { paths: [], topics: ['테스트', 'test', 'vitest', 'jest'] }, evidence_quote: '앞으로 테스트는 Jest 대신 Vitest로 작성해', reason: null, valid_until: null, confidence: 0.9 };
+    const supersede = { relation: 'supersede', target_id: '1', merged_statement: null, cascade_ids: [], why: 'Vitest replaces Jest', confidence: 0.9 };
+    const judgeRepo = (name: string, limit: number): { root: string; paths: ProjectPaths } => {
+      const root = repo(name);
+      runInit({ root, tools: ['claude'], language: 'ko', gitHooks: false, force: false, codeIndex: false, source: null });
+      const paths = projectPaths(root);
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 30 /, `max_calls_per_hour: ${limit} `));
+      writeItem(paths, newItem({ id: `01JUDGEJEST${name.length}00000000000000`.slice(0, 26), summary: '테스트는 Jest로 작성한다.', scope: { paths: [], topics: ['테스트', 'test', 'jest'] } }), 'ko');
+      const db = StateDb.open(paths.stateDb);
+      db.insertEvent({ ts: new Date().toISOString(), tool: 'claude', host: 'claude', kind: 'prompt', session: 's', cwd: root, prompt: '앞으로 테스트는 Jest 대신 Vitest로 작성해', lastAssistant: null, transcriptPath: null, model: null, flags: ['durable'], candidate: true });
+      db.close();
+      return { root, paths };
+    };
+    const teamOf = (paths: ProjectPaths): { summary: string; status: string; local: boolean; pending: number; proposals: number }[] => {
+      const db = StateDb.open(paths.stateDb);
+      try {
+        const pending = db.pendingEvents(10).length;
+        const proposals = db.judgePending().length;
+        return loadTeam(paths, db, { proposedTtlDays: 30, local: true }).items.map((i) => ({ summary: i.summary, status: i.status, local: Boolean(i.local), pending, proposals }));
+      } finally {
+        db.close();
+      }
+    };
+    {
+      const { root, paths } = judgeRepo('judge-limit', 1); // the extract call spends the hour's only call
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-limit.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [vitest] }, { items: [vitest] }], judge: [supersede] }));
+      const limited = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      check('judge', 'at the hourly limit the judge defers: nothing is written, the event stays pending', limited.applied.length === 0 && limited.errors.some((e) => e.includes(RATE_LIMIT_ERROR)) && t1.length === 1 && t1[0]?.status === 'active' && t1[0]?.pending === 1, JSON.stringify({ applied: limited.applied.map((a) => a.relation), errors: limited.errors, team: t1 }));
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 1 /, 'max_calls_per_hour: 30 '));
+      const later = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      check('judge', 'the next run with calls left judges the kept event: the old rule is replaced', later.applied.some((a) => a.relation === 'supersede') && t2.find((i) => i.summary.includes('Vitest'))?.status === 'active' && t2.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'superseded' && t2[0]?.pending === 0, JSON.stringify({ applied: later.applied.map((a) => a.relation), team: t2 }));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    {
+      // Two rules in one event: the first is stored, the judge of the second hits the limit. The
+      // replay must not take the first one's own file for a confirmation of it.
+      const { root, paths } = judgeRepo('judge-replay', 1);
+      const pino = { message: 1, title: 'pino', statement: '로그는 pino로 남긴다.', type: 'rule', enforcement: 'should', durability: 'unclear', audience: 'team', scope: { paths: [], topics: ['로그', 'pino'] }, evidence_quote: '앞으로 테스트는 Jest 대신 Vitest로 작성해', reason: null, valid_until: null, confidence: 0.4 };
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-replay.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [pino, vitest] }, { items: [pino, vitest] }], judge: [supersede] }));
+      const first = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 1 /, 'max_calls_per_hour: 30 '));
+      const replay = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      const pinoAfter = t2.find((i) => i.summary === '로그는 pino로 남긴다.');
+      check('judge', 'a replayed event does not confirm the proposal it stored before the limit; only the deferred rule is judged', first.applied.length === 1 && first.applied[0]?.status === 'proposed' && t1[0]?.pending === 1 && pinoAfter?.status === 'proposed' && pinoAfter.local && replay.applied.some((a) => a.relation === 'supersede') && replay.applied.filter((a) => a.summary === '로그는 pino로 남긴다.').every((a) => a.detail.includes('already stored')) && t2[0]?.pending === 0, JSON.stringify({ first: first.applied.map((a) => `${a.relation}:${a.status}`), replay: replay.applied.map((a) => `${a.relation}:${a.status}:${a.detail.slice(0, 40)}`), team: t2 }));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    {
+      const { root, paths } = judgeRepo('judge-down', 30);
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-down.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [vitest] }], judge: [{ __error: 'boom' }, supersede] }));
+      const down = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      check('judge', 'when the judge fails the rule is a proposal on this PC, kept for a later comparison', down.applied.length === 1 && down.applied[0]?.status === 'proposed' && down.applied[0]?.detail.startsWith('judge unavailable') && t1.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'active' && t1.find((i) => i.summary.includes('Vitest'))?.local === true && t1[0]?.proposals === 1 && t1[0]?.pending === 0, JSON.stringify({ applied: down.applied.map((a) => `${a.relation}:${a.status}:${a.detail}`), team: t1 }));
+      const again = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      check('judge', 'a later run judges the kept proposal: the old rule is replaced and the proposal goes', again.applied.some((a) => a.relation === 'supersede') && t2.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'superseded' && t2.find((i) => i.summary.includes('Vitest'))?.status === 'active' && t2.every((i) => !i.local) && t2[0]?.proposals === 0, JSON.stringify({ applied: again.applied.map((a) => `${a.relation}:${a.status}`), team: t2 }));
+      const jdb = StateDb.open(paths.stateDb);
+      const pairs = overlappingRules(loadTeam(paths, jdb, { proposedTtlDays: 30, local: true }).items);
+      jdb.close();
+      check('judge', 'rules a model compared are not listed as overlapping', pairs.length === 0, pairs.map((p) => `${p.a.summary} | ${p.b.summary}`).join('; '));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    check(
+      'judge',
+      'two live rules worded alike that name different tools are listed for people to check',
+      overlappingRules([rule('OV1', '테스트는 Jest로 작성한다.', ['테스트', 'test', 'jest'], { status: 'active' }), rule('OV2', '테스트는 Jest 대신 Vitest로 작성한다.', ['테스트', 'test', 'vitest', 'jest'], { status: 'active' }), rule('OV3', '금액 계산에는 BigDecimal을 사용한다.', ['금액', 'BigDecimal'], { status: 'active' })]).map((p) => `${p.a.id}-${p.b.id}`).join(',') === 'OV1-OV2',
+    );
 
     // Uninstall: devctx's parts go, people's content stays.
     const un = repo('uninstall');

@@ -216,7 +216,7 @@ devctx history off --discard   # 끄면서, 켜져 있을 때 보냈지만 아�
 hook은 프롬프트와 AI의 마지막 응답을 이 PC의 `.devctx/local/state.sqlite`에 저장한다(Git에 올라가지 않는다). 규칙 추출, "응"만 한 수락 판단, 세션 이어가기, 이전 작업 검색(`devctx recall`, `search_history`), 프롬프트 히스토리에 쓴다. 도구의 대화 기록 파일에서 읽은 검증 사례(실패한 테스트·빌드와 에러 몇 줄, 그것을 통과시킨 턴)도 여기에 둔다.
 
 - 저장할 때 비밀값을 자리표시자(`{password}`, `{token}` 등)로 바꾼다. 원래 값은 디스크에 쓰지 않는다.
-- 분석이 끝난 프롬프트는 90일이 지나면 지운다. 아직 분석하지 않은 것은 분석될 때까지 남는다. 히스토리 항목의 원문도 파일에 쓴 뒤 90일이 지나면 지운다.
+- 분석이 끝난 프롬프트는 90일이 지나면 지운다(`memory.event_retention_days`). 아직 분석하지 않은 것은 분석될 때까지 남기되 180일이 지나면 분석 없이 지운다(`memory.unprocessed_retention_days`). 히스토리 항목의 원문도 파일에 쓴 뒤 같은 기간이 지나면 지운다. 지금 몇 건이 남아 있는지는 `devctx doctor`의 `stored prompts`로 본다.
 - 히스토리를 꺼도(`devctx history off`), 프롬프트 분석을 꺼도(`devctx capture off`) 이 저장은 계속된다. 세션 이어가기에 쓰기 때문이다.
 - 지금 바로 지우려면 `devctx purge`. 프롬프트·응답 원문, 쓰기 전 히스토리 항목, 세션 이어가기 정보를 지운다. 아직 정리하지 않은 프롬프트 속 규칙은 기록되지 않는다. 결정 파일과 확인 대기 규칙은 남는다.
 
@@ -257,7 +257,7 @@ AI 도구는 스킬 `devctx-code`로 쓴다. 스킬은 저장소 파일이라 cl
 | Cursor | `.agents/skills/devctx-code/` | `.cursor/permissions.json`의 Auto-review 안내 (터미널 허용 목록이 이미 파일로 관리될 때만 거기에도 추가) |
 | Kiro | `.kiro/skills/devctx-code/` | `~/.kiro/workspace-roots/<저장소>/permissions.yaml`의 shell 허용 규칙 |
 
-Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자 폴더에 이 저장소 전용 항목을 쓴다. `devctx init`과 하루 한 번 세션 시작 hook이 확인하므로 팀원 PC에도 따로 할 일이 없다. 허용되는 것은 `.devctx/bin/devctx code`로 시작하는 명령 하나뿐이고, 같은 스크립트를 hook이 이미 자동으로 실행한다.
+Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자 폴더에 이 저장소 전용 항목을 쓴다(`~/.copilot/permissions-config.json`, `~/.kiro/workspace-roots/…/permissions.yaml`. `DEVCTX_HOME`을 바꿔도 이 파일들의 위치는 바뀌지 않는다. `COPILOT_HOME`, `KIRO_HOME`을 따른다). `devctx init`과 하루 한 번 세션 시작 hook이 확인하므로 팀원 PC에도 따로 할 일이 없다. 허용되는 것은 `.devctx/bin/devctx code`로 시작하는 명령 하나뿐이고, 같은 스크립트를 hook이 이미 자동으로 실행한다. 처음 고치기 전에 파일을 `*.devctx-backup`으로 복사해 두고, `init` 출력에 `home` 줄로 무엇을 넣었는지 보여준다. 이 PC에서는 건드리지 않게 하려면 `devctx init --no-home-permissions`(PC별로 기억하고 세션 시작 점검도 따른다. 그 도구는 스킬 명령마다 승인을 묻는다. 되돌리기: `--home-permissions`). 팀 전체에서 끄려면 `code_index.preapprove: false`.
 
 `devctx code status`로 색인 상태와 스킬·허용 설치 상태를 본다.
 
@@ -291,7 +291,7 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 
 ## 추출 모델
 
-무조건 싼 모델이 아니라, 요구사항을 전부 통과한 모델 중 가장 싼 모델을 쓴다.
+무조건 싼 모델이 아니라, 요구사항을 전부 통과한 모델 중 가장 싼 모델을 쓴다. 부르는 CLI는 작업 중인 도구의 것뿐이다(`llm.host_tool: only`, 기본): Codex에서 일하면 Codex로, 같은 저장소를 Claude Code로 열면 Claude로, Copilot에서 열면 Copilot으로 처리한다. 도구마다 자기 계정을 쓰고 모델도 따로 고른다. 도구 밖에서 worker가 돌 때(git hook, 터미널의 `devctx remember`)는 이 저장소에서 마지막으로 hook을 보낸 도구를 쓴다.
 
 1. 작업 중인 도구의 CLI에서 모델 목록을 가져온다. 모델 × reasoning effort가 각각 후보다.
 2. 호출당 예상 비용이 싼 후보부터 요구사항 평가를 돌린다. 추출 44개, 판정 12개, 요약 10개 항목을 2회 연속 하나도 틀리지 않아야 통과다.
@@ -313,11 +313,13 @@ inject:
   prompt_budget_tokens: 600   # 프롬프트마다 붙이는 관련 결정 상한
   handoff_budget_tokens: 400  # 새 세션이 직전 작업을 이어갈 때 붙이는 직전 세션 체크포인트 상한 (0이면 끔)
 llm:
-  prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출
+  host_tool: only             # only: 작업 중인 도구의 CLI만 (기본) | prefer: 그 도구 먼저, 안 되면 providers의 다른 도구 | any: providers 순서
+  providers: [claude, codex, copilot, cursor, kiro]   # 부를 수 있는 도구(허용 목록). []이면 LLM을 부르지 않는다
   qualify_runs: 2             # 요구사항 평가 반복 횟수
   max_tier: large             # 자동 선택 상한: small | medium | large
   max_calls_per_hour: 30      # 0이면 LLM을 부르지 않는다 (providers: []도 같다)
-  pin: {}                     # 모델 고정 (평가 생략). 예: { codex: gpt-6-luna }
+  qualify_calls_per_hour: 60  # 모델 평가 호출 상한 (위와 따로 센다)
+  pin: {}                     # 모델 고정 (평가 생략: 평가를 통과한 모델만 고정할 것). 예: { codex: gpt-6-luna }
 memory:
   personal: true              # 개인 선호는 저장소 밖에 저장
   implicit_rules: true        # "앞으로" 같은 표현이 없는 프롬프트도 5개씩 묶어 LLM이 판단 (false면 명시 표현만)
@@ -340,8 +342,9 @@ history:
 - 팀원 PC에서 아무것도 기록되지 않으면 `devctx doctor`의 `hook runtime`을 본다. 설치 실패 로그가 나오면 `devctx_source`(커밋 SHA나 정확한 npm 버전인지, 접근 권한이 있는지)를 확인하고 `.devctx/bin/devctx version`으로 바로 설치해 본다.
 - 로그: `.devctx/local/devctx.log`
 - 결정이 쌓이지 않으면 도구에서 프로젝트 hook을 승인했는지 확인한다. 기록됐는데 적용되지 않으면 `devctx log`에서 판정 이유를 본다(확인 대기 `proposed`로 남았는지 등).
+- `devctx status`의 `[check]`(doctor의 `similar rules`)는 단어가 거의 같은데 도구·숫자·부정이 다른 살아 있는 규칙 쌍이다. 비교할 모델이 없을 때 남은 것일 수 있고 둘 다 전달되므로, 맞는 쪽을 `devctx remember`로 다시 말하거나(모델이 다른 쪽을 대체한다) 틀린 쪽 파일을 지운다.
 - 관련 결정이 안 붙거나 엉뚱한 결정이 붙으면 `devctx why "그 프롬프트"`로 점수와 빠진 이유를 본다. 결정의 `scope.topics`에 사람들이 실제로 쓰는 단어(한국어·영어 이름, 동의어, 이 규칙이 막는 문제)를 넣으면 잘 붙는다. 대화에서 기록되는 새 결정은 추출할 때 이런 주제어를 3~8개 뽑는다. 영문 주제어는 단어 단위로 맞춘다(`PR`은 "prompt"에 걸리지 않는다).
-- 로그인이 만료되거나 쿼터가 끝난 도구는 잠시 건너뛰고 다른 도구 CLI로 처리한다. 로그인 만료는 해당 CLI를 실행해 다시 로그인하면 된다.
+- 로그인이 만료되거나 쿼터가 끝난 도구는 잠시 건너뛴다(로그인 30분, 쿼터 6시간). 기본 `llm.host_tool: only`에서는 그동안 다른 도구를 부르지 않고 LLM 없이 처리한다(명시 표현만 확인 대기로 남김. `devctx doctor`의 `llm <도구>` 경고로 보인다). `prefer`나 `any`면 다른 도구 CLI로 처리한다. 로그인 만료는 해당 CLI를 실행해 다시 로그인하면 된다.
 - `.vscode/settings.json`처럼 주석이 있는 JSON 설정 파일은 주석이 지워지지 않게 devctx가 고치지 않는다. 이때 `devctx doctor`와 `devctx code status`가 직접 넣을 항목을 그대로 보여준다(`devctx init`을 다시 해도 해결되지 않는다).
 - AI가 코드 인덱스를 안 쓰면 `devctx code status`로 스킬 파일과 허용 설정이 있는지 본다. 도구의 스킬 목록(`/skills` 등)에 `devctx-code`가 보여야 한다. `devctx code index`로 바로 색인할 수 있다.
 - 스킬 명령에 승인 창이 뜨면 명령에 파이프나 `&&`가 붙었는지 본다. 붙으면 미리 허용한 명령으로 인식되지 않는다. `.devctx/bin/devctx`에 실행 권한이 있어야 한다(`devctx doctor`가 확인한다).
@@ -366,9 +369,11 @@ npm run typecheck
 npm run build
 npm run dev -- status   # 빌드 없이 소스로 실행
 npm run bench:memory    # 메모리 벤치마크 (LLM 없이: 추출 대상 고르기, 관련 결정 고르기, 만료·대체, 중복 판정, 세션 이어가기 체크포인트, 최근 바뀐 결정, 이전 작업 검색, 검증 사례, 바꿔 말한 질의, 규칙 문장 보류, 두 브랜치 병합, 코드 근거, 프롬프트 히스토리, 안전장치)
-npm run bench:codeindex # 언어별 추출 확인 (39개 언어마다 파싱 오류 없음·선언·호출, 파일 사이 해석)
+npm run bench:codeindex # 언어별 추출 확인 (39개 언어마다 파싱 오류 없음·선언·호출, 파일 사이 해석, 크기 한도 변경과 성장에 따른 캐시 갱신)
 node scripts/vendor-grammars.mjs --build   # vendor/grammars/ 다시 만들기 (tree-sitter CLI 필요, 관리자용)
 ```
+
+같은 세 가지(typecheck, bench:memory, bench:codeindex)를 GitHub Actions(`.github/workflows/ci.yml`)가 push와 PR마다 Ubuntu·macOS에서 돌린다. 실제 AI CLI는 부르지 않는다.
 
 외부 코드와 문법의 라이선스는 [THIRD_PARTY.md](THIRD_PARTY.md)에 있다.
 

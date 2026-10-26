@@ -21,6 +21,8 @@ import {
 } from './types.ts';
 
 export const RATE_LIMIT_ERROR = 'hourly LLM call limit reached';
+/** No candidate has passed the task's evaluation and this call may not start one. */
+export const NO_QUALIFIED_MODEL_ERROR = 'no model has passed the evaluation yet';
 
 const DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000;
 const QUALIFICATION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -79,7 +81,7 @@ interface RouterCache {
 
 export interface RouteOptions {
   cfg: DevctxConfig;
-  /** Tool the user is working in; its CLI is tried first (same account, same data policy). */
+  /** Tool the user is working in; with `llm.host_tool: only` (default) its CLI is the only one called. */
   host: string | null;
   db: StateDb | null;
   /** Evaluations spend calls, so only the background worker allows them. */
@@ -152,12 +154,42 @@ export function providerBlocks(): Record<string, ProviderBlock> {
   return out;
 }
 
+/**
+ * CLIs a call may use, in order. `llm.providers` is an allowlist in every mode. `host_tool: only`
+ * (default): the tool being worked in and nothing else, so work done in Codex runs on the Codex
+ * account and the same repository opened in Claude Code runs on Claude; when no tool is running
+ * (a worker started by a git hook, `devctx remember` in a terminal) the project's `targets`, in
+ * the providers order. `prefer`: the tool being worked in first (targets first when none is
+ * running), then the other providers. `any`: the providers order.
+ */
 export function providerOrder(cfg: DevctxConfig, host: string | null): ProviderId[] {
   if (process.env.DEVCTX_FAKE_LLM) return ['fake'];
-  const order: ProviderId[] = [];
-  if (cfg.llm.prefer_host_tool && isToolId(host)) order.push(host);
-  for (const p of cfg.llm.providers) if (!order.includes(p)) order.push(p);
-  return order;
+  const allowed = cfg.llm.providers;
+  const policy = cfg.llm.host_tool;
+  if (policy === 'any') return [...allowed];
+  if (isToolId(host)) {
+    if (!allowed.includes(host)) return policy === 'only' ? [] : [...allowed];
+    return policy === 'only' ? [host] : [host, ...allowed.filter((p) => p !== host)];
+  }
+  // No tool is running: the tools this project is set up for, in the providers order.
+  const targets = allowed.filter((p) => cfg.targets.includes(p));
+  return policy === 'only' ? targets : [...targets, ...allowed.filter((p) => !targets.includes(p))];
+}
+
+/** Why `providerOrder` is empty (only with `host_tool: only`), for logs and `devctx doctor`. */
+export function noProviderReason(cfg: DevctxConfig, host: string | null): string {
+  return isToolId(host)
+    ? `${host} is not in llm.providers, and llm.host_tool: only calls no other tool`
+    : 'no tool of targets is in llm.providers (llm.host_tool: only, no tool running)';
+}
+
+/**
+ * The tool being worked in: what the hook reported, else the tool whose hook last ran in this
+ * repository (a worker started by a git hook or `devctx remember` in a terminal gets no host).
+ */
+export function workingHost(host: string | null, db: StateDb | null): string | null {
+  if (isToolId(host)) return host;
+  return db?.lastHookHost() ?? host;
 }
 
 async function discover(
@@ -199,7 +231,9 @@ function candidates(models: readonly ModelCandidate[], maxTier: Tier): { model: 
 
 /** Pinned models, the test provider and `qualify: false` skip the requirement suite. */
 function trusted(cfg: DevctxConfig, model: ModelCandidate): boolean {
-  return model.source === 'pinned' || model.provider === 'fake' || !cfg.llm.qualify;
+  if (model.source === 'pinned' || !cfg.llm.qualify) return true;
+  // The test provider skips the suite unless a test asks for it (DEVCTX_FAKE_QUALIFY=1).
+  return model.provider === 'fake' && !process.env.DEVCTX_FAKE_QUALIFY;
 }
 
 function qualificationFor(cache: RouterCache, key: string, task: SuiteTask, version: string | null): Qualification | null {
@@ -278,44 +312,56 @@ async function runQualification(
   return res;
 }
 
-/** History summaries (and their model evaluations) have their own hourly budget. */
-const HISTORY_TASKS = ['summarize', 'qualify:summarize'];
+/** History summaries have their own hourly budget; evaluations (`qualify:<task>`) another. */
+const HISTORY_TASKS = ['summarize'];
+const QUALIFY_TASKS = SUITE_TASKS.map((t) => `qualify:${t}`);
 
 /**
  * Calls left this hour for the task's budget: `history.max_calls_per_hour` for summaries,
  * `llm.max_calls_per_hour` for everything else. Counted from recorded calls, so it holds across
- * worker runs; checked before every call, retries and model evaluations included.
+ * worker runs; checked before every call, retries included. Model evaluations have their own
+ * budget (`evaluationCallsLeft`).
  */
 export function callsLeft(cfg: DevctxConfig, db: StateDb | null, task: SuiteTask): number {
   if (!db) return Number.POSITIVE_INFINITY;
   const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
   const history = task === 'summarize';
-  const used = db.llmCallsSince(hourAgo, history ? { tasks: HISTORY_TASKS } : { excludeTasks: HISTORY_TASKS });
+  const used = db.llmCallsSince(hourAgo, history ? { tasks: HISTORY_TASKS } : { excludeTasks: [...HISTORY_TASKS, ...QUALIFY_TASKS] });
   return (history ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour) - used;
 }
 
+/** Evaluation calls left this hour (`llm.qualify_calls_per_hour`), whichever task they are for. */
+export function evaluationCallsLeft(cfg: DevctxConfig, db: StateDb | null): number {
+  if (!db) return Number.POSITIVE_INFINITY;
+  return cfg.llm.qualify_calls_per_hour - db.llmCallsSince(new Date(Date.now() - 3_600_000).toISOString(), { tasks: QUALIFY_TASKS });
+}
+
 /**
- * Sends one structured request to the cheapest model that meets every requirement of the task:
- * host tool first, then the configured provider order. Inside a provider, candidates (model x
- * reasoning effort) are tried in expected-cost order and a candidate is only used after it passes
- * the task's requirement suite in every run. New models show up through each CLI's own discovery;
- * a qualified model that later breaks requirements at runtime is demoted. Login or quota problems
- * skip the provider for a while instead of failing the model.
+ * Sends one structured request to the cheapest model that meets every requirement of the task,
+ * asking the CLIs `providerOrder` allows (by default only the tool being worked in). Inside a
+ * provider, candidates (model x reasoning effort) are tried in expected-cost order and a candidate
+ * is only used after it passes the task's requirement suite in every run. New models show up
+ * through each CLI's own discovery; a qualified model that later breaks requirements at runtime is
+ * demoted. Login or quota problems skip the provider for a while instead of failing the model.
  */
 export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T | null, opts: RouteOptions): Promise<RouteResult<T>> {
   const { cfg, db } = opts;
   const task = taskOf(req);
   const attempts: string[] = [];
-  const limit = task === 'summarize' ? cfg.history.max_calls_per_hour : cfg.llm.max_calls_per_hour;
+  const order = providerOrder(cfg, opts.host);
+  if (order.length === 0) return { ok: false, error: 'no provider allowed', attempts: [noProviderReason(cfg, opts.host)] };
   if (callsLeft(cfg, db, task) <= 0) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
-  // An evaluation runs the whole suite. It must fit the hour's remaining calls; one that is larger
-  // than the whole hourly limit may only start in an hour with no calls yet.
+  // An evaluation runs the whole suite out of its own hourly budget. It must fit the budget's
+  // remaining calls; one larger than the whole budget may only start in an hour with none spent.
   const evaluationCalls = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
+  const evaluationLimit = cfg.llm.qualify_calls_per_hour;
   let limited = false;
+  let unevaluated = 0;
+  let asked = false; // a model was actually run or evaluated
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
-    providers: for (const pid of providerOrder(cfg, opts.host)) {
+    providers: for (const pid of order) {
       const blocked = activeBlock(cache, pid);
       if (blocked) {
         attempts.push(`${pid}: skipped (${blocked.kind} until ${blocked.until.slice(11, 16)}Z)`);
@@ -342,12 +388,16 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           const q = qualificationFor(cache, key, task, version);
           if (q && q.status !== 'pass') continue; // failed, or its evaluation errored recently
           if (!q) {
-            if (!opts.allowQualify || budget.remaining <= 0) continue;
-            if (callsLeft(cfg, db, task) < Math.min(evaluationCalls, limit)) {
+            if (!opts.allowQualify || budget.remaining <= 0) {
+              unevaluated++;
+              continue;
+            }
+            if (evaluationLimit <= 0 || evaluationCallsLeft(cfg, db) < Math.min(evaluationCalls, evaluationLimit)) {
               limited = true;
               break providers;
             }
             budget.remaining--;
+            asked = true;
             const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
             opts.log?.('qualification', { model: key, task, pass: res.pass, score: `${res.score}/${res.total}`, blocked: res.blocked });
             attempts.push(`${key}: ${task} evaluation ${res.blocked ? `could not run (${res.blocked})` : res.pass ? 'passed' : 'failed'} ${res.score}/${res.total}`);
@@ -363,6 +413,7 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           limited = true;
           break providers;
         }
+        asked = true;
         const raw = await provider.run(bin, model, req);
         const value = raw.ok ? pickAnswer(raw.data, raw.text, parse) : null;
         const ok = value !== null;
@@ -384,6 +435,10 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
     }
     // Out of calls for this hour: callers keep the work for later instead of falling back.
     if (limited) return { ok: false, error: RATE_LIMIT_ERROR, attempts };
+    // Nothing was asked because no candidate is evaluated and this caller may not evaluate (the
+    // background worker does): callers know the answer is not a model's refusal. Providers that
+    // are not installed, skipped or without models do not change that.
+    if (unevaluated > 0 && !asked) return { ok: false, error: NO_QUALIFIED_MODEL_ERROR, attempts: [...attempts, `${unevaluated} candidate(s) wait for the background worker's evaluation`] };
     return { ok: false, error: 'no provider produced a valid answer', attempts };
   } finally {
     saveCache(cache);
@@ -427,6 +482,8 @@ export interface ModelReport {
   measuredUsd: number | null;
   /** Allowed under `max_tier` (or pinned). */
   auto: boolean;
+  /** Pinned in `llm.pin`: used without the requirement suite (pin only a model that passed it). */
+  pinned: boolean;
 }
 
 export interface RouteReport {
@@ -472,7 +529,7 @@ export async function describeRoutes(cfg: DevctxConfig, host: string | null, opt
         const key = candidateKey(model);
         const qualification: ModelReport['qualification'] = {};
         for (const task of SUITE_TASKS) qualification[task] = qualificationFor(cache, key, task, version);
-        return { key, estimate, qualification, stats: cache.stats[key] ?? null, measuredUsd: measured(cache.stats[key]), auto: eligibleKeys.has(key) };
+        return { key, estimate, qualification, stats: cache.stats[key] ?? null, measuredUsd: measured(cache.stats[key]), auto: eligibleKeys.has(key), pinned: model.source === 'pinned' };
       }),
     });
   }
@@ -510,6 +567,7 @@ export interface QualifyReport {
  * `devctx models --qualify <provider>`: walks the candidates of one provider in cost order and
  * evaluates them until one passes the task's suite (or `limit` evaluations ran). Candidates with a
  * current verdict are skipped; an existing pass ends the walk because nothing cheaper is left.
+ * `canStart` is asked before each evaluation (the background worker keeps to the hourly budget).
  */
 export async function qualifyProvider(
   cfg: DevctxConfig,
@@ -518,6 +576,7 @@ export async function qualifyProvider(
   limit: number,
   db: StateDb | null,
   onResult?: (r: QualifyReport) => void,
+  canStart: () => boolean = () => true,
 ): Promise<QualifyReport[]> {
   const cache = loadCache();
   const provider = getProvider(pid);
@@ -532,6 +591,7 @@ export async function qualifyProvider(
       const q = qualificationFor(cache, key, task, version);
       if (q?.status === 'pass') break;
       if (q) continue;
+      if (!canStart()) break;
       const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
       saveCache(cache);
       const report: QualifyReport = { key, task, pass: res.pass, score: `${res.score}/${res.total}`, details: res.details, blocked: res.blocked, avgCostUsd: res.avgCostUsd };

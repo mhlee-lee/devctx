@@ -188,7 +188,9 @@ const VIOLATION_BOOST = 0.1;
 
 /**
  * Injected per prompt. Two sources, never repeating an id already injected in this session:
- * 1. items recorded during this session (the session started before they existed)
+ * 1. items this session has not been given yet: recorded during the session (it started before
+ *    they existed), or session-start rules it did not receive at the start (approved, confirmed
+ *    again or pulled from a teammate meanwhile, or no session-start hook ran)
  * 2. items not delivered at session start that match the prompt, the files it mentions or
  *    the files declaring the code symbols it mentions
  */
@@ -220,9 +222,11 @@ export function selectPromptContext(team: readonly KnowledgeItem[], prompt: stri
 
   if (opts.sessionStartedAt) {
     const since = opts.sessionStartedAt;
+    // `captured_at` alone misses rules approved or confirmed during the session: their time is
+    // when they were first said, before the session started. The injected set is what counts.
     const fresh = plan.core
       .concat(plan.scoped, plan.onDemand)
-      .filter((i) => i.source.captured_at >= since && !skip.has(i.id))
+      .filter((i) => !skip.has(i.id) && (i.source.captured_at >= since || alwaysLoaded.has(i.id)))
       .sort((a, b) => (a.source.captured_at < b.source.captured_at ? -1 : 1));
     const fitted = fitBudget(
       fresh.map((i) => ({ id: i.id, line: itemLine(i, lang, true) })),

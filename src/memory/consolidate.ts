@@ -5,7 +5,7 @@ import { heldReason } from '../knowledge/guard.ts';
 import { searchItems, type Scored } from '../knowledge/retrieve.ts';
 import { newItem, writeItem } from '../knowledge/store.ts';
 import type { Enforcement, Evidence, ItemStatus, KnowledgeItem, SourceKind } from '../knowledge/types.ts';
-import { routeCall, type RouteOptions } from '../llm/router.ts';
+import { RATE_LIMIT_ERROR, routeCall, type RouteOptions } from '../llm/router.ts';
 import type { StateDb } from '../state/db.ts';
 import type { Language } from '../types.ts';
 import type { ProjectPaths } from '../util/paths.ts';
@@ -36,10 +36,13 @@ export interface ConsolidateContext {
   route: RouteOptions | null;
   /** Repository facts for code-evidence anchors (computed once per run, on first use). */
   repo?: () => RepoContext | null;
+  /** Set when a judge call failed in this run: no more comparisons are retried in it. */
+  judgeFailed?: boolean;
 }
 
 export interface ApplyResult {
-  relation: Relation | 'dropped';
+  /** `deferred`: the judge hit the hourly limit; the event stays pending for a later run. */
+  relation: Relation | 'dropped' | 'deferred';
   itemId: string | null;
   targetId: string | null;
   files: string[];
@@ -48,6 +51,28 @@ export interface ApplyResult {
   status: ItemStatus | null;
   summary: string | null;
 }
+
+export interface ConsolidateOptions {
+  /**
+   * Re-judging a proposal kept because no model could compare it with similar rules: it is left
+   * out of its own neighbours and dropped once a verdict is applied.
+   */
+  pendingId?: string;
+  /** Earlier attempts to judge it (for the retry cap). */
+  attempts?: number;
+}
+
+/** Runs after which a candidate nobody could compare stays a plain proposal. */
+export const MAX_JUDGE_ATTEMPTS = 5;
+/**
+ * Neighbour score from which a rule is held back (deferred or proposed) when no judge answers:
+ * the same bar the word-overlap verdict uses for "the same rule" (a shared word scores about 0.5,
+ * "Jest" against "Jest 대신 Vitest" above 1).
+ */
+const HOLD_MIN_SCORE = 0.75;
+
+/** A verdict, or why there is none: the hour's calls are spent (try later) or the judge failed. */
+type Verdict = JudgeResult | { deferred: true; why: string } | { unavailable: true; why: string };
 
 const LIVE = new Set(['active', 'proposed', 'conflict']);
 
@@ -104,12 +129,13 @@ export function fastVerdict(c: Candidate, neighbors: readonly Scored[]): JudgeRe
   return { relation: 'duplicate', target_id: same.item.id, merged_statement: null, cascade_ids: [], why: 'same wording as the existing rule (no LLM call)', confidence: 1 };
 }
 
-async function judge(c: Candidate, neighbors: readonly Scored[], ctx: ConsolidateContext): Promise<JudgeResult> {
+async function judge(c: Candidate, neighbors: readonly Scored[], ctx: ConsolidateContext): Promise<Verdict> {
   if (neighbors.length === 0) {
     return { relation: 'new', target_id: null, merged_statement: null, cascade_ids: [], why: 'no similar item', confidence: 1 };
   }
   const fast = fastVerdict(c, neighbors);
   if (fast) return fast;
+  // LLM off by configuration: word overlap is all there is (explicit markers end up as proposals).
   if (!ctx.route) return heuristicVerdict(c, neighbors, 'lexical similarity (no LLM available)');
   const ids = neighbors.map((n) => n.item.id);
   const res = await routeCall(
@@ -136,7 +162,14 @@ async function judge(c: Candidate, neighbors: readonly Scored[], ctx: Consolidat
     (d) => parseJudgeResult(d, ids),
     ctx.route,
   );
-  return res.ok ? res.value : heuristicVerdict(c, neighbors, `judge unavailable: ${res.error}`);
+  if (res.ok) return res.value;
+  // Without a verdict a rule must not go live next to one it may duplicate or contradict (both
+  // would be delivered, and nothing comes back to settle it): the hourly limit means try later,
+  // anything else means keep it as a proposal and compare it again in a later run. A weak match
+  // (a shared word, not a shared subject) is not worth holding the rule for.
+  if ((neighbors[0]?.score ?? 0) < HOLD_MIN_SCORE) return heuristicVerdict(c, neighbors, `judge unavailable (${res.error}); no close match`);
+  if (res.error === RATE_LIMIT_ERROR) return { deferred: true, why: res.error };
+  return { unavailable: true, why: `judge unavailable: ${res.error}` };
 }
 
 function quoteOf(c: Candidate, ctx: ConsolidateContext): Evidence {
@@ -191,7 +224,7 @@ function successor(t: KnowledgeItem, c: Candidate, ctx: ConsolidateContext, over
  * Applies one candidate: reinforce a duplicate, refine or supersede a rule, record a conflict, or
  * add a rule. Returns the new files (never modified ones).
  */
-export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promise<ApplyResult> {
+export async function consolidate(c: Candidate, ctx: ConsolidateContext, opts: ConsolidateOptions = {}): Promise<ApplyResult> {
   const dropped = (detail: string): ApplyResult => ({ relation: 'dropped', itemId: null, targetId: null, files: [], detail, status: null, summary: null });
   if (c.durability === 'one_off') return dropped('one-off instruction');
   const personal = c.audience === 'personal';
@@ -200,6 +233,7 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
   const files: string[] = [];
   const byId = (id: string): KnowledgeItem | undefined => pool.find((i) => i.id === id);
   const now = isoNow();
+  const pending = opts.pendingId ? byId(opts.pendingId) : undefined;
 
   /** Writes a new rule file (the only kind of write to knowledge files). */
   const commit = (item: KnowledgeItem): KnowledgeItem => {
@@ -255,8 +289,35 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
     return { relation: 'new', itemId: item.id, targetId: null, files, detail, status: 'proposed', summary: item.summary };
   }
 
-  const neighbors = neighborsOf(c, pool);
+  const neighbors = neighborsOf(c, pending ? pool.filter((i) => i !== pending) : pool);
+  // A run cut short by the hourly limit replays the whole event: what an earlier run already
+  // stored from this candidate (same wording, same paths, same audience: the same bar as the
+  // no-LLM duplicate shortcut, so one message's rules for two directories or for the team and
+  // for oneself stay apart) is recognized, not stored, confirmed or settled a second time.
+  // Reinforcements of an existing rule are guarded in their branch.
+  if (!pending) {
+    const earlier = new Set(ctx.db.opItemsForEvent(c.eventId));
+    const stored = earlier.size > 0 ? pool.find((i) => earlier.has(i.id) && sameScope(c, i) && sameRule(c.statement, i.summary)) : undefined;
+    if (stored) {
+      return { relation: 'duplicate', itemId: stored.id, targetId: stored.id, files, detail: 'already stored from this event by a run the hourly limit cut short', status: stored.status, summary: stored.summary };
+    }
+  }
   const verdict = await judge(c, neighbors, ctx);
+  if ('deferred' in verdict) {
+    return { relation: 'deferred', itemId: null, targetId: null, files, detail: verdict.why, status: null, summary: null };
+  }
+  if ('unavailable' in verdict) {
+    // Kept on this PC, with what the judge needs, until a later run can compare it.
+    ctx.judgeFailed = true;
+    const attempts = (opts.attempts ?? 0) + 1;
+    const item = pending ?? propose(createItem(c, ctx, { status: 'proposed' }));
+    const gaveUp = attempts >= MAX_JUDGE_ATTEMPTS;
+    if (gaveUp) ctx.db.deleteJudgePending(item.id);
+    else ctx.db.putJudgePending(item.id, c, attempts);
+    const detail = `${verdict.why}; ${gaveUp ? `not compared after ${attempts} runs: compare it with the similar rule(s) yourself` : `kept on this PC until a model compares it with ${neighbors.length} similar rule(s)`}`;
+    ctx.db.recordOp({ eventId: c.eventId, relation: 'new', itemId: item.id, targetId: null, detail });
+    return { relation: 'new', itemId: item.id, targetId: null, files, detail, status: 'proposed', summary: item.summary };
+  }
   const target = verdict.target_id ? (byId(verdict.target_id) ?? null) : null;
   let relation: Relation = target ? verdict.relation : 'new';
   // A merged statement the judge wrote must pass the same check as what the user said.
@@ -335,10 +396,13 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
           itemId = item.id;
           note = `end date ${c.validUntil}`;
         } else {
-          t.reinforced += 1;
-          ctx.db.bumpStats(t.id, { reinforced: 1, quote: ctx.cfg.memory.store_evidence_quote ? c.evidenceQuote : null, at: now });
-          // The rule existed and the assistant still got it wrong.
-          if (t.status === 'active' && c.sourceKind === 'user-correction') countViolation(t.id);
+          // The same event judged again (its run was cut short by the hourly limit) counts once.
+          if (!ctx.db.hasOp(c.eventId, t.id)) {
+            t.reinforced += 1;
+            ctx.db.bumpStats(t.id, { reinforced: 1, quote: ctx.cfg.memory.store_evidence_quote ? c.evidenceQuote : null, at: now });
+            // The rule existed and the assistant still got it wrong.
+            if (t.status === 'active' && c.sourceKind === 'user-correction') countViolation(t.id);
+          }
           itemId = t.id;
         }
         break;
@@ -397,6 +461,35 @@ export async function consolidate(c: Candidate, ctx: ConsolidateContext): Promis
   }
   const detail = [verdict.why, note].filter(Boolean).join('; ');
   ctx.db.recordOp({ eventId: c.eventId, relation, itemId, targetId: target?.id ?? null, detail });
+  // The verdict is applied: the proposal that stood in for it goes.
+  if (pending && pending.id !== itemId) dropLocal(pending);
   const result = itemId ? byId(itemId) : undefined;
   return { relation, itemId, targetId: target?.id ?? null, files, detail, status: result?.status ?? null, summary: result?.summary ?? null };
+}
+
+/**
+ * Proposals kept because no model could compare them with similar rules (`judge-pending`):
+ * judged again in a later run, while the judge answers. Stops at the hourly limit or the first
+ * failure (the rest wait for another run); never in the run whose judge already failed.
+ */
+export async function rejudgePending(ctx: ConsolidateContext): Promise<{ applied: ApplyResult[]; errors: string[] }> {
+  const out = { applied: [] as ApplyResult[], errors: [] as string[] };
+  if (!ctx.route || ctx.judgeFailed) return out;
+  for (const entry of ctx.db.judgePending<Candidate>()) {
+    const item = [...ctx.team, ...ctx.personal].find((i) => i.id === entry.id);
+    // Approved, discarded or archived meanwhile: nothing left to judge.
+    if (!item || !item.local || item.archived) {
+      ctx.db.deleteJudgePending(entry.id);
+      continue;
+    }
+    try {
+      const res = await consolidate(entry.candidate, ctx, { pendingId: entry.id, attempts: entry.attempts });
+      if (res.relation === 'deferred') break;
+      out.applied.push(res);
+      if (ctx.judgeFailed) break;
+    } catch (error) {
+      out.errors.push(`re-judge ${entry.id.slice(-6)}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return out;
 }

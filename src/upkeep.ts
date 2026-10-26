@@ -2,6 +2,7 @@ import type { DevctxConfig } from './config.ts';
 import { ensureGitAttributes, ensureGitIgnore } from './init/attributes.ts';
 import { installAgentAccess, removeLegacyMcp } from './init/access.ts';
 import { hookInstalled, installToolHooks } from './init/hookconfigs.ts';
+import { HOME_PERMISSIONS_KEY } from './init/init.ts';
 import type { StateDb } from './state/db.ts';
 import type { Language } from './types.ts';
 import { readExtractionHealth } from './state/health.ts';
@@ -25,10 +26,11 @@ export function dailyUpkeep(root: string, cfg: DevctxConfig, db: StateDb): strin
   if (ensureGitAttributes(root)) changed.push('updated .gitattributes');
   if (ensureGitIgnore(root)) changed.push('updated .gitignore');
   // The skill and its pre-approvals follow the devctx version and config (a teammate's machine
-  // gets the per-machine entries without running init); the old MCP server entry is removed.
+  // gets the per-machine entries without running init, unless its owner opted out); the old MCP
+  // server entry is removed.
   for (const a of [
     ...removeLegacyMcp(root),
-    ...installAgentAccess(root, cfg.targets, { enabled: cfg.code_index.enabled, preapprove: cfg.code_index.preapprove, language: cfg.language }),
+    ...installAgentAccess(root, cfg.targets, { enabled: cfg.code_index.enabled, preapprove: cfg.code_index.preapprove, language: cfg.language, machine: db.kvGet(HOME_PERMISSIONS_KEY) !== 'off' }),
   ]) {
     if (a.action !== 'unchanged' && a.action !== 'skipped') changed.push(`${a.action} ${a.file}`);
   }

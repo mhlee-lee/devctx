@@ -12,8 +12,9 @@ import { repoContext, type RepoContext } from './knowledge/anchors.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { deriveStatus, knowledgeDirs, loadPersonal, loadTeam, readKnowledgeFiles } from './knowledge/view.ts';
 import { refreshCommunityPrices } from './llm/catalog.ts';
-import type { RouteOptions } from './llm/router.ts';
-import { consolidate, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
+import { evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type RouteOptions } from './llm/router.ts';
+import { suiteCalls } from './llm/suite.ts';
+import { consolidate, rejudgePending, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
 import { extractCandidates } from './memory/extract.ts';
 import { StateDb } from './state/db.ts';
 import { recordExtractionHealth } from './state/health.ts';
@@ -35,6 +36,8 @@ export interface WorkerOptions {
   host: string | null;
   reason: string;
   allowLlm: boolean;
+  /** False: use models already evaluated, never start an evaluation here (`devctx remember`). */
+  allowQualify?: boolean;
 }
 
 export interface WorkerReport {
@@ -53,9 +56,6 @@ export interface WorkerReport {
 
 /** Worker runs that also bring the code index up to date (turn ends leave it to the engine). */
 const CODE_INDEX_REASONS = new Set(['session_start', 'code-index', 'manual']);
-
-/** Processed events older than this are deleted (decisions live in files; unprocessed events stay). */
-const EVENT_RETENTION_DAYS = 90;
 
 /**
  * Paths devctx commits: decision files and history (plus a pending AGENTS.md conversion). The
@@ -100,8 +100,9 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
     }
   }
   if (changed) db.kvSet('expired_seen', JSON.stringify([...seen].slice(-2000)));
-  db.pruneEvents(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
-  db.pruneHistoryTurns(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
+  const dayMs = 86_400_000;
+  db.pruneEvents(new Date(Date.now() - cfg.memory.event_retention_days * dayMs).toISOString(), new Date(Date.now() - cfg.memory.unprocessed_retention_days * dayMs).toISOString());
+  db.pruneHistoryTurns(new Date(Date.now() - cfg.memory.event_retention_days * dayMs).toISOString());
   pruneCases(db);
   const weekAgo = Date.now() - 7 * 86_400_000;
   for (const { key, value } of db.kvList('sess:')) {
@@ -112,6 +113,33 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
     }
   }
   return retired;
+}
+
+/**
+ * Evaluates candidates of the first allowed provider for extraction and judging, cheapest first,
+ * until one passes each (or the evaluation budget of the hour runs out). Errors are returned.
+ */
+async function qualifyAhead(cfg: DevctxConfig, db: StateDb, host: string | null, log: (message: string, extra?: Record<string, unknown>) => void): Promise<string[]> {
+  const errors: string[] = [];
+  const pid = providerOrder(cfg, host)[0];
+  if (!pid || pid === 'fake') return errors;
+  for (const task of ['extract', 'judge'] as const) {
+    const needed = suiteCalls(task, cfg.language).length * cfg.llm.qualify_runs;
+    const cap = cfg.llm.qualify_calls_per_hour;
+    // Asked before every evaluation: an evaluation must fit the budget's remaining calls.
+    const fits = (): boolean => cap > 0 && evaluationCallsLeft(cfg, db) >= Math.min(needed, cap);
+    if (!fits()) {
+      errors.push(`${task}: ${RATE_LIMIT_ERROR} (evaluations)`);
+      break;
+    }
+    try {
+      const results = await qualifyProvider(cfg, pid, task, QUALIFICATIONS_PER_RUN, db, (r) => log('qualification', { model: r.key, task, pass: r.pass, score: r.score, blocked: r.blocked }), fits);
+      if (results.some((r) => r.blocked)) break;
+    } catch (error) {
+      errors.push(`${task} evaluation: ${errorMessage(error)}`);
+    }
+  }
+  return errors;
 }
 
 /**
@@ -139,13 +167,22 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         report.errors.push(`cases: ${errorMessage(error)}`);
       }
       const log = (message: string, extra?: Record<string, unknown>): void => logLine(paths.log, 'info', message, extra);
+      // Git hooks and `devctx remember` start the worker without a host: the tool last worked in here.
+      const host = workingHost(opts.host, db);
       const route: RouteOptions | null = opts.allowLlm
-        ? { cfg, host: opts.host, db, allowQualify: true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
+        ? { cfg, host, db, allowQualify: opts.allowQualify ?? true, qualifyBudget: { remaining: QUALIFICATIONS_PER_RUN }, log }
         : null;
       // `max_calls_per_hour: 0` or `providers: []` turn calls off: rules fall back to the no-LLM
       // path (explicit markers kept as proposals), history entries to the assistant's reply.
       const decisionRoute = route && !llmOff(cfg, 'decisions') ? route : null;
       const historyRoute = route && !llmOff(cfg, 'history') ? route : null;
+      if (opts.reason === 'qualify') {
+        // Started by `devctx remember` when no evaluated model answered it: evaluate candidates
+        // now, in the background, so the next call has a model (within the evaluation budget).
+        if (decisionRoute) report.errors.push(...(await qualifyAhead(cfg, db, host, log)));
+        log('qualify finished', { errors: report.errors });
+        return report;
+      }
       if (decisionRoute || historyRoute) await refreshCommunityPrices(cfg.llm.pricing_refresh_days);
       const viewOpts = { proposedTtlDays: cfg.memory.proposed_ttl_days, local: true };
       let repo: RepoContext | null | undefined;
@@ -162,6 +199,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       let attempted = 0;
       let succeeded = 0;
       let lastError: string | null = null;
+      let limited = false;
       // Implicit candidates wait for a full batch at a plain turn end, even when the worker runs for
       // something else (a history entry, the code index), so they keep costing one call per five.
       const flushImplicit = opts.reason !== 'turn_end' || extractionDue(db.pendingCandidates(), false);
@@ -171,7 +209,10 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         if (events.length === 0) break;
         const candidates = events.filter((e) => e.candidate && e.prompt);
         const outcome = await extractCandidates(candidates, db, decisionRoute);
-        if (decisionRoute && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length) {
+        // Health counts runs a model could have answered: not those cut short by the hourly limit,
+        // nor those that may not evaluate a model (`devctx remember` leaves that to this worker).
+        const unevaluated = !outcome.usedLlm && outcome.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR));
+        if (decisionRoute && candidates.length > 0 && outcome.deferredEventIds.length < candidates.length && !unevaluated) {
           attempted++;
           if (outcome.usedLlm) succeeded++;
           else lastError = outcome.errors[outcome.errors.length - 1] ?? 'no model answered';
@@ -179,28 +220,44 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         report.errors.push(...outcome.errors);
         report.candidates += outcome.candidates.length;
         const failed = new Map<string, string>();
+        const deferred = new Set(outcome.deferredEventIds);
         for (const c of outcome.candidates) {
+          if (deferred.has(c.eventId)) continue;
           try {
-            report.applied.push(await consolidate(c, ctx));
+            const res = await consolidate(c, ctx);
+            // The judge hit the hourly limit: the event stays pending and is replayed by a later run
+            // (what this run already stored from it is recognized then, not stored twice).
+            if (res.relation === 'deferred') deferred.add(c.eventId);
+            else report.applied.push(res);
           } catch (error) {
             report.errors.push(`consolidate failed: ${errorMessage(error)}`);
             failed.set(c.eventId, errorMessage(error));
           }
         }
+        if (deferred.size > outcome.deferredEventIds.length) report.errors.push(`judge: ${RATE_LIMIT_ERROR}; ${deferred.size - outcome.deferredEventIds.length} event(s) wait for a later run`);
         // An event whose rule could not be stored (a write error) stays pending and is tried again
         // by a later run; after MAX_EVENT_ATTEMPTS it is kept with its error instead of retried.
         const retry = new Set<string>();
         for (const [id, message] of failed) {
+          if (deferred.has(id)) continue;
           if (db.noteEventFailure(id) < MAX_EVENT_ATTEMPTS) retry.add(id);
           else db.markProcessed([id], `consolidate failed ${MAX_EVENT_ATTEMPTS} times: ${message}`.slice(0, 500));
         }
-        const deferred = new Set(outcome.deferredEventIds);
         const done = events.filter((e) => !deferred.has(e.id) && !failed.has(e.id)).map((e) => e.id);
         db.markProcessed(done);
         report.processed += done.length;
-        if (deferred.size > 0 || retry.size > 0) break;
+        if (deferred.size > 0 || retry.size > 0) {
+          limited = deferred.size > 0;
+          break;
+        }
       }
       if (attempted > 0) recordExtractionHealth(db, succeeded > 0, lastError);
+      // Proposals kept because no model could compare them: judged now that calls may be available.
+      if (decisionRoute && !limited) {
+        const re = await rejudgePending(ctx);
+        report.applied.push(...re.applied);
+        report.errors.push(...re.errors);
+      }
       report.retired = maintain(paths, db, cfg);
       // At a turn end the session is still running: only .devctx/rules.md is rebuilt, the tools'
       // rule files wait for the next session (new decisions reach this one through the prompt hook).

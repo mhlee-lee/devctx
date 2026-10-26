@@ -5,6 +5,13 @@ import type { Tier } from './llm/types.ts';
 import { isToolId, TOOL_IDS, type Language, type ToolId } from './types.ts';
 
 export type CommitMode = 'ride-along' | 'auto-commit' | 'manual';
+/**
+ * Whose CLI does the LLM work. `only`: the tool being worked in and nothing else (Codex while
+ * working in Codex, Claude when the same repository is opened in Claude Code; each on its own
+ * account). `prefer`: that tool first, then the other providers. `any`: the providers order.
+ */
+export type HostToolPolicy = 'only' | 'prefer' | 'any';
+export const HOST_TOOL_POLICIES: readonly HostToolPolicy[] = ['only', 'prefer', 'any'];
 
 export interface DevctxConfig {
   version: number;
@@ -20,7 +27,8 @@ export interface DevctxConfig {
     handoff_budget_tokens: number;
   };
   llm: {
-    prefer_host_tool: boolean;
+    host_tool: HostToolPolicy;
+    /** Tools whose CLI may be called, an allowlist in every `host_tool` mode; `[]` turns LLM calls off. */
     providers: ToolId[];
     qualify: boolean;
     /** Repetitions of the requirement suite a model must pass without a single miss. */
@@ -28,6 +36,12 @@ export interface DevctxConfig {
     /** Largest model tier the router may pick automatically (it still tries cheaper ones first). */
     max_tier: Tier;
     max_calls_per_hour: number;
+    /**
+     * Hourly cap of model-evaluation calls (the requirement suites), counted apart from
+     * `max_calls_per_hour` so a first evaluation never starves the hour's real calls, or the
+     * other way round. 0: evaluations never start (pin a model or set `qualify: false`).
+     */
+    qualify_calls_per_hour: number;
     timeout_seconds: number;
     pricing_refresh_days: number;
     pin: Partial<Record<ToolId, string>>;
@@ -41,6 +55,13 @@ export interface DevctxConfig {
      * in batches. Off: only explicitly marked prompts are considered.
      */
     implicit_rules: boolean;
+    /** Days this PC keeps analyzed prompts, replies and written history turns in `state.sqlite`. */
+    event_retention_days: number;
+    /**
+     * Days a prompt that was never analyzed (no model, hooks not approved) is kept before it is
+     * dropped unanalyzed. Longer than `event_retention_days` so a pause does not lose rules.
+     */
+    unprocessed_retention_days: number;
   };
   code_index: {
     /** Built-in code index (symbols, call graph, text search), used by agents through the `devctx-code` skill. */
@@ -73,17 +94,18 @@ export const DEFAULT_CONFIG: DevctxConfig = {
   git: { commit_mode: 'ride-along', auto_install_hooks: true },
   inject: { core_budget_tokens: 1500, scoped_budget_tokens: 800, prompt_budget_tokens: 600, session_budget_tokens: 400, handoff_budget_tokens: 400 },
   llm: {
-    prefer_host_tool: true,
+    host_tool: 'only',
     providers: [...TOOL_IDS],
     qualify: true,
     qualify_runs: 2,
     max_tier: 'large',
     max_calls_per_hour: 30,
+    qualify_calls_per_hour: 60,
     timeout_seconds: 120,
     pricing_refresh_days: 7,
     pin: {},
   },
-  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true, implicit_rules: true },
+  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true, implicit_rules: true, event_retention_days: 90, unprocessed_retention_days: 180 },
   code_index: { enabled: true, exclude: [], max_file_kb: 512, preapprove: true },
   history: { max_calls_per_hour: 30 },
 };
@@ -112,6 +134,13 @@ function tools(value: unknown, fallback: ToolId[]): ToolId[] {
   if (!Array.isArray(value)) return fallback;
   const out = value.filter(isToolId);
   return out.length > 0 ? [...new Set(out)] : fallback;
+}
+
+function hostTool(llm: Obj, fallback: HostToolPolicy): HostToolPolicy {
+  const v = llm.host_tool;
+  if (typeof v === 'string' && (HOST_TOOL_POLICIES as readonly string[]).includes(v)) return v as HostToolPolicy;
+  // Before `host_tool`, `prefer_host_tool: false` meant the providers order; `true` was the default.
+  return llm.prefer_host_tool === false ? 'any' : fallback;
 }
 
 export function normalizeConfig(raw: unknown): DevctxConfig {
@@ -145,13 +174,14 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       handoff_budget_tokens: num(inj.handoff_budget_tokens, d.inject.handoff_budget_tokens, 0, 2_000),
     },
     llm: {
-      prefer_host_tool: bool(llm.prefer_host_tool, d.llm.prefer_host_tool),
+      host_tool: hostTool(llm, d.llm.host_tool),
       // An explicit empty list turns LLM calls off (it does not mean "all of them").
       providers: Array.isArray(llm.providers) && llm.providers.length === 0 ? [] : tools(llm.providers, d.llm.providers),
       qualify: bool(llm.qualify, d.llm.qualify),
       qualify_runs: Math.round(num(llm.qualify_runs, d.llm.qualify_runs, 1, 5)),
       max_tier: llm.max_tier === 'small' || llm.max_tier === 'medium' ? llm.max_tier : 'large',
       max_calls_per_hour: num(llm.max_calls_per_hour, d.llm.max_calls_per_hour, 0, 1_000),
+      qualify_calls_per_hour: num(llm.qualify_calls_per_hour, d.llm.qualify_calls_per_hour, 0, 1_000),
       timeout_seconds: num(llm.timeout_seconds, d.llm.timeout_seconds, 10, 900),
       pricing_refresh_days: num(llm.pricing_refresh_days, d.llm.pricing_refresh_days, 0, 365),
       pin,
@@ -161,6 +191,8 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       proposed_ttl_days: num(mem.proposed_ttl_days, d.memory.proposed_ttl_days, 1, 3_650),
       personal: bool(mem.personal, d.memory.personal),
       implicit_rules: bool(mem.implicit_rules, d.memory.implicit_rules),
+      event_retention_days: num(mem.event_retention_days, d.memory.event_retention_days, 1, 3_650),
+      unprocessed_retention_days: num(mem.unprocessed_retention_days, d.memory.unprocessed_retention_days, 1, 3_650),
     },
     code_index: {
       enabled,
@@ -214,6 +246,7 @@ export function configProblems(paths: ProjectPaths): string[] {
     out.push(`git.commit_mode: ${JSON.stringify(commit)} is not one of ride-along | auto-commit | manual; manual is used until it is fixed`);
   }
   check('llm.max_tier', obj(r.llm).max_tier, ['small', 'medium', 'large']);
+  check('llm.host_tool', obj(r.llm).host_tool, HOST_TOOL_POLICIES);
   for (const [where, value] of [['targets', r.targets], ['llm.providers', obj(r.llm).providers]] as const) {
     if (value === undefined) continue;
     const bad = Array.isArray(value) ? value.filter((v) => !isToolId(v)) : [value];
@@ -244,21 +277,24 @@ inject:
   handoff_budget_tokens: 400  # 새 세션이 직전 작업을 이어갈 때 한 번 붙이는 직전 세션 체크포인트 상한 (0이면 끔)
 
 llm:
-  prefer_host_tool: true      # 작업 중인 도구의 CLI로 추출한다 (없으면 providers 순서)
-  providers: [claude, codex, copilot, cursor, kiro]   # []이면 LLM을 부르지 않는다
+  host_tool: only             # only: 작업 중인 도구의 CLI만 쓴다 (도구마다 자기 계정) | prefer: 그 도구 먼저, 안 되면 providers의 다른 도구 | any: providers 순서
+  providers: [claude, codex, copilot, cursor, kiro]   # 부를 수 있는 도구 (허용 목록). 작업 중인 도구가 여기 없으면 부르지 않는다. []이면 LLM을 부르지 않는다
   qualify: true               # 작업(추출/판정)별 요구사항 평가를 전부 통과한 모델 중 가장 싼 것만 사용
   qualify_runs: 2             # 평가를 몇 번 반복해 한 번도 틀리지 않아야 통과로 볼지
   max_tier: large             # 자동으로 고를 수 있는 가장 큰 모델 등급: small | medium | large
   max_calls_per_hour: 30      # 결정 추출·판정 호출 상한. 0이면 부르지 않는다(명시 표현만 확인 대기로 남김)
+  qualify_calls_per_hour: 60  # 모델 요구사항 평가 호출 상한 (위와 따로 센다. 한 시간 최대 합계 = 둘의 합). 0이면 평가를 시작하지 않는다
   timeout_seconds: 120
   pricing_refresh_days: 7     # 공개 가격표 갱신 주기. 0이면 번들 가격표만 사용
-  pin: {}                     # 특정 모델 고정. 예: { codex: gpt-6-luna }
+  pin: {}                     # 특정 모델 고정. 요구사항 평가를 건너뛰므로 평가를 통과한 모델만 고정할 것 (devctx models). 예: { codex: gpt-6-luna }
 
 memory:
   store_evidence_quote: true  # 사용자 발화 일부(200자 이하)를 근거로 저장
   proposed_ttl_days: 30       # 재확인 없는 제안 항목의 보존 기간
   personal: true              # 개인 선호는 저장소 밖(~/.local/share/devctx)에 저장
   implicit_rules: true        # "앞으로" 같은 표현이 없는 지시도 LLM이 판단 (5개씩 묶어서). false면 명시 표현만
+  event_retention_days: 90    # 분석이 끝난 프롬프트·응답 원문과 쓴 히스토리 턴을 이 PC에 두는 기간 (state.sqlite)
+  unprocessed_retention_days: 180  # 분석하지 못한 프롬프트(모델 없음, hook 미승인)를 두는 기간. 지나면 분석 없이 지운다
 
 code_index:
   enabled: ${String(codeIndex).padEnd(19)}# 내장 코드 인덱스(심볼·호출 관계·텍스트 검색)를 스킬 devctx-code로 제공

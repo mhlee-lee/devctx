@@ -80,6 +80,7 @@ create table if not exists ops(
   target_id text,
   detail text
 );
+create index if not exists ops_event on ops(event_id, item_id);
 create table if not exists violations(id text primary key, ts text not null, item_id text not null, event_id text);
 create table if not exists llm_calls(
   id text primary key,
@@ -889,6 +890,41 @@ export class StateDb {
 
   deleteProposal(id: string): void {
     this.db.prepare('delete from proposals where id = ?').run(id);
+    this.deleteJudgePending(id);
+  }
+
+  // ---- proposals waiting for a judge: kept because no model could compare them ---------------
+
+  putJudgePending(id: string, candidate: unknown, attempts: number): void {
+    this.kvSet(`judge-pending:${id}`, JSON.stringify({ candidate, attempts, at: new Date().toISOString() }));
+  }
+
+  deleteJudgePending(id: string): void {
+    this.kvDelete(`judge-pending:${id}`);
+  }
+
+  /** Oldest first; an entry that cannot be read is dropped. */
+  judgePending<T>(): { id: string; candidate: T; attempts: number; at: string }[] {
+    const out: { id: string; candidate: T; attempts: number; at: string }[] = [];
+    for (const { key, value } of this.kvList('judge-pending:')) {
+      try {
+        const v = JSON.parse(value) as { candidate: T; attempts?: number; at?: string };
+        out.push({ id: key.slice('judge-pending:'.length), candidate: v.candidate, attempts: Number(v.attempts ?? 0), at: String(v.at ?? '') });
+      } catch {
+        this.kvDelete(key);
+      }
+    }
+    return out.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  }
+
+  /** Whether this event already produced an operation on this item (a run cut short is replayed). */
+  hasOp(eventId: string, itemId: string): boolean {
+    return this.db.prepare('select 1 as x from ops where event_id = ? and item_id = ? limit 1').get(eventId, itemId) !== undefined;
+  }
+
+  /** Items this event's earlier operations created or changed (a run cut short is replayed). */
+  opItemsForEvent(eventId: string): string[] {
+    return (this.db.prepare('select distinct item_id from ops where event_id = ? and item_id is not null').all(eventId) as Row[]).map((r) => String(r.item_id));
   }
 
   /**
@@ -942,18 +978,32 @@ export class StateDb {
   // ---- housekeeping ----------------------------------------------------------------------------
 
   /**
-   * Deletes captured events that were processed before `beforeIso`. Unprocessed events are kept
-   * however old they are; decisions live in `.devctx/knowledge/`, not here.
+   * Deletes captured events that were processed before `beforeIso`, and events never processed
+   * that are older than `unprocessedBeforeIso` (a pause longer than that loses their rules; the
+   * cap keeps the database from growing forever); decisions live in `.devctx/knowledge/`, not here.
    */
-  pruneEvents(beforeIso: string): number {
+  pruneEvents(beforeIso: string, unprocessedBeforeIso?: string): number {
     const res = this.db.prepare('delete from events where processed != 0 and ts < ?').run(beforeIso);
-    return Number(res.changes ?? 0);
+    const old = unprocessedBeforeIso ? this.db.prepare('delete from events where processed = 0 and ts < ?').run(unprocessedBeforeIso) : null;
+    return Number(res.changes ?? 0) + Number(old?.changes ?? 0);
+  }
+
+  /** How many captured events this PC holds, and how many still wait for analysis. */
+  eventCounts(): { total: number; pending: number; oldestPending: string | null } {
+    const row = this.db.prepare('select count(*) as n, sum(processed = 0) as pending, min(case when processed = 0 then ts end) as oldest from events').get() as Row | undefined;
+    return { total: Number(row?.n ?? 0), pending: Number(row?.pending ?? 0), oldestPending: row ? asString(row.oldest) : null };
   }
 
   /** Time of the latest event an AI tool's hook delivered (null: hooks never ran here). */
   lastHookEventTs(): string | null {
     const row = this.db.prepare("select max(ts) as ts from events where tool not in ('cli', 'file')").get() as Row | undefined;
     return row ? asString(row.ts) : null;
+  }
+
+  /** Tool that ran the latest hook here (null: hooks never ran here). */
+  lastHookHost(): string | null {
+    const row = this.db.prepare("select host from events where tool not in ('cli', 'file') order by ts desc limit 1").get() as Row | undefined;
+    return row ? asString(row.host) : null;
   }
 
   kvGet(key: string): string | null {
