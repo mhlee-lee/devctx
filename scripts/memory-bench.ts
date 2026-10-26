@@ -210,6 +210,16 @@ for (const c of RETRIEVAL) {
   const since = new Date(Date.now() - 3_600_000).toISOString();
   const sel = selectPromptContext([...ITEMS, fresh], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set() });
   check('session', 'a rule recorded during the session reaches the next prompt', sel.ids.includes('FRESH'), `got [${sel.ids}]`);
+  // Approved (or confirmed again) during the session: its captured_at is older than the session,
+  // yet the session-start block never had it. Delivered once, like a rule recorded just now.
+  const approved = rule('APPROVED', '마이그레이션 파일은 손으로 고치지 않는다.', ['migration'], {
+    tier: 'core',
+    source: { kind: 'user-instruction', actor: null, tool: 'codex', captured_at: new Date(Date.now() - 7 * 86_400_000).toISOString() },
+  });
+  const startBlock = sessionContext(ITEMS, [], cfg).ids;
+  const late = selectPromptContext([...ITEMS, approved], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set(startBlock) });
+  const given = selectPromptContext([...ITEMS, approved], '고마워', cfg, { sessionStartedAt: since, alreadyInjected: new Set([...startBlock, 'APPROVED']) });
+  check('session', 'a core rule approved mid-session reaches the current session, once', late.ids.includes('APPROVED') && late.trace.find((t) => t.item.id === 'APPROVED')?.outcome === 'fresh' && !given.ids.includes('APPROVED') && late.ids.every((id) => id === 'APPROVED' || !startBlock.includes(id)), `late [${late.ids}] given [${given.ids}]`);
 }
 
 // Packing: a rule that does not fit is skipped and packing continues (never stop at the first miss).
