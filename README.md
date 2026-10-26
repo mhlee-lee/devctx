@@ -341,6 +341,7 @@ history:
 - 팀원 PC에서 아무것도 기록되지 않으면 `devctx doctor`의 `hook runtime`을 본다. 설치 실패 로그가 나오면 `devctx_source`(커밋 SHA나 정확한 npm 버전인지, 접근 권한이 있는지)를 확인하고 `.devctx/bin/devctx version`으로 바로 설치해 본다.
 - 로그: `.devctx/local/devctx.log`
 - 결정이 쌓이지 않으면 도구에서 프로젝트 hook을 승인했는지 확인한다. 기록됐는데 적용되지 않으면 `devctx log`에서 판정 이유를 본다(확인 대기 `proposed`로 남았는지 등).
+- `devctx status`의 `[check]`(doctor의 `similar rules`)는 단어가 거의 같은데 도구·숫자·부정이 다른 살아 있는 규칙 쌍이다. 비교할 모델이 없을 때 남은 것일 수 있고 둘 다 전달되므로, 맞는 쪽을 `devctx remember`로 다시 말하거나(모델이 다른 쪽을 대체한다) 틀린 쪽 파일을 지운다.
 - 관련 결정이 안 붙거나 엉뚱한 결정이 붙으면 `devctx why "그 프롬프트"`로 점수와 빠진 이유를 본다. 결정의 `scope.topics`에 사람들이 실제로 쓰는 단어(한국어·영어 이름, 동의어, 이 규칙이 막는 문제)를 넣으면 잘 붙는다. 대화에서 기록되는 새 결정은 추출할 때 이런 주제어를 3~8개 뽑는다. 영문 주제어는 단어 단위로 맞춘다(`PR`은 "prompt"에 걸리지 않는다).
 - 로그인이 만료되거나 쿼터가 끝난 도구는 잠시 건너뛴다(로그인 30분, 쿼터 6시간). 기본 `llm.host_tool: only`에서는 그동안 다른 도구를 부르지 않고 LLM 없이 처리한다(명시 표현만 확인 대기로 남김. `devctx doctor`의 `llm <도구>` 경고로 보인다). `prefer`나 `any`면 다른 도구 CLI로 처리한다. 로그인 만료는 해당 CLI를 실행해 다시 로그인하면 된다.
 - `.vscode/settings.json`처럼 주석이 있는 JSON 설정 파일은 주석이 지워지지 않게 devctx가 고치지 않는다. 이때 `devctx doctor`와 `devctx code status`가 직접 넣을 항목을 그대로 보여준다(`devctx init`을 다시 해도 해결되지 않는다).

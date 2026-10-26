@@ -12,8 +12,8 @@ import { repoContext, type RepoContext } from './knowledge/anchors.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { deriveStatus, knowledgeDirs, loadPersonal, loadTeam, readKnowledgeFiles } from './knowledge/view.ts';
 import { refreshCommunityPrices } from './llm/catalog.ts';
-import { workingHost, type RouteOptions } from './llm/router.ts';
-import { consolidate, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
+import { RATE_LIMIT_ERROR, workingHost, type RouteOptions } from './llm/router.ts';
+import { consolidate, rejudgePending, type ApplyResult, type ConsolidateContext } from './memory/consolidate.ts';
 import { extractCandidates } from './memory/extract.ts';
 import { StateDb } from './state/db.ts';
 import { recordExtractionHealth } from './state/health.ts';
@@ -164,6 +164,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       let attempted = 0;
       let succeeded = 0;
       let lastError: string | null = null;
+      let limited = false;
       // Implicit candidates wait for a full batch at a plain turn end, even when the worker runs for
       // something else (a history entry, the code index), so they keep costing one call per five.
       const flushImplicit = opts.reason !== 'turn_end' || extractionDue(db.pendingCandidates(), false);
@@ -181,28 +182,44 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         report.errors.push(...outcome.errors);
         report.candidates += outcome.candidates.length;
         const failed = new Map<string, string>();
+        const deferred = new Set(outcome.deferredEventIds);
         for (const c of outcome.candidates) {
+          if (deferred.has(c.eventId)) continue;
           try {
-            report.applied.push(await consolidate(c, ctx));
+            const res = await consolidate(c, ctx);
+            // The judge hit the hourly limit: the event stays pending and is replayed by a later run
+            // (what this run already stored from it is recognized then, not stored twice).
+            if (res.relation === 'deferred') deferred.add(c.eventId);
+            else report.applied.push(res);
           } catch (error) {
             report.errors.push(`consolidate failed: ${errorMessage(error)}`);
             failed.set(c.eventId, errorMessage(error));
           }
         }
+        if (deferred.size > outcome.deferredEventIds.length) report.errors.push(`judge: ${RATE_LIMIT_ERROR}; ${deferred.size - outcome.deferredEventIds.length} event(s) wait for a later run`);
         // An event whose rule could not be stored (a write error) stays pending and is tried again
         // by a later run; after MAX_EVENT_ATTEMPTS it is kept with its error instead of retried.
         const retry = new Set<string>();
         for (const [id, message] of failed) {
+          if (deferred.has(id)) continue;
           if (db.noteEventFailure(id) < MAX_EVENT_ATTEMPTS) retry.add(id);
           else db.markProcessed([id], `consolidate failed ${MAX_EVENT_ATTEMPTS} times: ${message}`.slice(0, 500));
         }
-        const deferred = new Set(outcome.deferredEventIds);
         const done = events.filter((e) => !deferred.has(e.id) && !failed.has(e.id)).map((e) => e.id);
         db.markProcessed(done);
         report.processed += done.length;
-        if (deferred.size > 0 || retry.size > 0) break;
+        if (deferred.size > 0 || retry.size > 0) {
+          limited = deferred.size > 0;
+          break;
+        }
       }
       if (attempted > 0) recordExtractionHealth(db, succeeded > 0, lastError);
+      // Proposals kept because no model could compare them: judged now that calls may be available.
+      if (decisionRoute && !limited) {
+        const re = await rejudgePending(ctx);
+        report.applied.push(...re.applied);
+        report.errors.push(...re.errors);
+      }
       report.retired = maintain(paths, db, cfg);
       // At a turn end the session is still running: only .devctx/rules.md is rebuilt, the tools'
       // rule files wait for the next session (new decisions reach this one through the prompt hook).

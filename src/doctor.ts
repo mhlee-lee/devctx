@@ -6,6 +6,7 @@ import { trackedGenerated } from './init/attributes.ts';
 import { configProblems, llmOff, loadConfig } from './config.ts';
 import { historyState } from './history/toggle.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
+import { overlappingRules } from './knowledge/overlap.ts';
 import { readExtractionHealth } from './state/health.ts';
 import { hookInstalled, HOOK_FILES } from './init/hookconfigs.ts';
 import { gitHooksBlocked, gitHooksInstalled } from './init/githooks.ts';
@@ -97,6 +98,12 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
       if (held.length > 0) {
         add('warn', 'held rules', `${held.length} rule(s) are not delivered because their text poses as a chat role or tells the agent to ignore its instructions (reword or delete the file; check who added it): ${held.slice(0, 3).map((i) => `${i.file.startsWith(root + path.sep) ? path.relative(root, i.file) : i.file} ${i.held}`).join('; ')}`);
       }
+      const overlaps = overlappingRules(items);
+      if (overlaps.length > 0) {
+        add('warn', 'similar rules', `${overlaps.length} pair(s) of live rules worded alike that no model compared (both are delivered; one may repeat or contradict the other): ${overlaps.slice(0, 3).map((p) => `${p.a.id.slice(-6)}/${p.b.id.slice(-6)}`).join(', ')} (devctx status lists them; keep one by saying it again with devctx remember, or delete a file)`);
+      }
+      const waiting = kdb.judgePending().length;
+      if (waiting > 0) add('ok', 'judge pending', `${waiting} proposal(s) wait for a model to compare them with similar rules (retried by the worker; devctx approve <id> confirms one now)`);
       const health = readExtractionHealth(kdb);
       if (health.streak > 0) add(health.streak >= 3 ? 'warn' : 'ok', 'extraction', `failed ${health.streak} worker run(s) in a row since ${health.since?.slice(0, 16) ?? '-'}: ${health.lastError ?? ''}`);
       const last = kdb.lastHookEventTs();

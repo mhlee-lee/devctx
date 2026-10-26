@@ -9,12 +9,13 @@ import { runInit } from './init/init.ts';
 import { uninstall } from './init/uninstall.ts';
 import { packageInfo } from './init/shim.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
+import { overlappingRules } from './knowledge/overlap.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
 import { codeStatus, EXIT_MEMORY_CAPPED, indexPass, refreshIndex } from './codeindex/service.ts';
 import { NOISY_GRAMMARS } from './codeindex/languages.ts';
 import { CODE_TOOLS, codeTool, parseToolArgs, usageLine } from './codeindex/tools-meta.ts';
 import { agentAccessStatus } from './init/access.ts';
-import { describeRoutes, noProviderReason, providerOrder, qualifyProvider, workingHost, type Qualification } from './llm/router.ts';
+import { describeRoutes, noProviderReason, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type Qualification } from './llm/router.ts';
 import { SUITE_TASKS, type SuiteTask } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
 import { isHookKind, isToolId, TOOL_IDS, type ToolId } from './types.ts';
@@ -153,6 +154,11 @@ function describeApplied(a: ApplyResult, ko: boolean): string {
     return ko
       ? `확정 ${id}${text}\n  이 PC에서 확인 대기였던 규칙이 결정 파일이 되었다 (다음 커밋에 함께 올라간다)`
       : `confirmed ${id}${text}\n  The proposal kept on this PC is now a decision file (goes out with your next commit)`;
+  }
+  if (a.status === 'proposed' && a.detail.startsWith('judge unavailable')) {
+    return ko
+      ? `확인 대기 ${id}${text}\n  비슷한 규칙이 있는데 비교할 모델을 쓸 수 없었다. 이 PC에만 두고 다음 실행에서 다시 비교한다. 바로 확정: devctx approve ${id}`
+      : `proposed ${id}${text}\n  A similar rule exists and no model could compare them. Kept on this PC; compared again by a later run. Approve now: devctx approve ${id}`;
   }
   if (a.status === 'proposed') {
     return ko
@@ -554,6 +560,12 @@ async function main(argv: string[]): Promise<number> {
           console.log(`[personal] ${personal.length}`);
           for (const i of personal) console.log(`  ${i.id.slice(-6)} ${i.summary}`);
         }
+        // Both delivered, neither marked: a judge that could not run leaves such pairs behind.
+        const overlaps = overlappingRules(items);
+        if (overlaps.length > 0) {
+          console.log(`[check (worded alike, no model compared them: keep one by saying it again with devctx remember, or delete a file)] ${overlaps.length}`);
+          for (const p of overlaps) console.log(`  ${p.a.id.slice(-6)} ${p.a.summary}\n  ${p.b.id.slice(-6)} ${p.b.summary}`);
+        }
         for (const e of errors) console.log(`unreadable: ${e.file}: ${e.error}`);
         if (items.length === 0 && personal.length === 0) console.log('아직 기록된 결정이 없다.');
       } finally {
@@ -620,7 +632,9 @@ async function main(argv: string[]): Promise<number> {
       const report = await runWorker({ root, host: flag(args, 'host'), reason: 'remember', allowLlm: !has(args, 'no-llm') });
       for (const a of report.applied) console.log(describeApplied(a, ko));
       if (report.skipped) console.log(ko ? `지금은 처리하지 못했다 (${report.skipped}). 다음 실행 때 기록된다.` : `Not processed now (${report.skipped}); the next run records it.`);
-      else if (report.applied.length === 0) console.log(ko ? '기록할 규칙을 찾지 못했다.' : 'No rule found to record.');
+      else if (report.applied.length === 0 && report.errors.some((e) => e.includes(RATE_LIMIT_ERROR))) {
+        console.log(ko ? '시간당 LLM 호출 한도에 걸려 지금은 기록하지 못했다. 이벤트는 보관되며 다음 worker 실행(hook 또는 devctx worker) 때 기록된다.' : 'The hourly LLM call limit is reached; the event is kept and the next worker run (a hook, or devctx worker) records it.');
+      } else if (report.applied.length === 0) console.log(ko ? '기록할 규칙을 찾지 못했다.' : 'No rule found to record.');
       for (const e of report.errors) console.log(`error ${e}`);
       return 0;
     }

@@ -80,6 +80,7 @@ create table if not exists ops(
   target_id text,
   detail text
 );
+create index if not exists ops_event on ops(event_id, item_id);
 create table if not exists violations(id text primary key, ts text not null, item_id text not null, event_id text);
 create table if not exists llm_calls(
   id text primary key,
@@ -889,6 +890,36 @@ export class StateDb {
 
   deleteProposal(id: string): void {
     this.db.prepare('delete from proposals where id = ?').run(id);
+    this.deleteJudgePending(id);
+  }
+
+  // ---- proposals waiting for a judge: kept because no model could compare them ---------------
+
+  putJudgePending(id: string, candidate: unknown, attempts: number): void {
+    this.kvSet(`judge-pending:${id}`, JSON.stringify({ candidate, attempts, at: new Date().toISOString() }));
+  }
+
+  deleteJudgePending(id: string): void {
+    this.kvDelete(`judge-pending:${id}`);
+  }
+
+  /** Oldest first; an entry that cannot be read is dropped. */
+  judgePending<T>(): { id: string; candidate: T; attempts: number; at: string }[] {
+    const out: { id: string; candidate: T; attempts: number; at: string }[] = [];
+    for (const { key, value } of this.kvList('judge-pending:')) {
+      try {
+        const v = JSON.parse(value) as { candidate: T; attempts?: number; at?: string };
+        out.push({ id: key.slice('judge-pending:'.length), candidate: v.candidate, attempts: Number(v.attempts ?? 0), at: String(v.at ?? '') });
+      } catch {
+        this.kvDelete(key);
+      }
+    }
+    return out.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  }
+
+  /** Whether this event already produced an operation on this item (a run cut short is replayed). */
+  hasOp(eventId: string, itemId: string): boolean {
+    return this.db.prepare('select 1 as x from ops where event_id = ? and item_id = ? limit 1').get(eventId, itemId) !== undefined;
   }
 
   /**

@@ -75,7 +75,8 @@ import type { Candidate } from '../src/memory/extract.ts';
 import { heuristicCandidates } from '../src/memory/extract.ts';
 import { parseExtractResult, parseJudgeResult } from '../src/memory/prompts.ts';
 import { StateDb } from '../src/state/db.ts';
-import { projectPaths } from '../src/util/paths.ts';
+import { projectPaths, type ProjectPaths } from '../src/util/paths.ts';
+import { overlappingRules } from '../src/knowledge/overlap.ts';
 import { runWorker } from '../src/worker.ts';
 import { approxTokens, today } from '../src/util/text.ts';
 
@@ -1620,6 +1621,67 @@ let paraphraseLine = '';
     const offRun = await runWorker({ root: off, host: 'claude', reason: 'manual', allowLlm: true });
     check('config', 'with max_calls_per_hour: 0 no model is called; explicit rules become proposals', !fs.existsSync(`${process.env.DEVCTX_FAKE_LLM}.requests.jsonl`) && offRun.applied.some((a) => a.status === 'proposed'), JSON.stringify(offRun.applied.map((a) => a.status)));
     delete process.env.DEVCTX_FAKE_LLM;
+
+    // The judge must not fall back to word overlap: a rule would go live next to one it replaces
+    // or contradicts, both delivered, nothing to settle it. At the hourly limit the event waits for
+    // a later run; when the judge fails otherwise the rule is a proposal compared again later.
+    const vitest = { message: 1, title: 'Vitest', statement: '테스트는 Jest 대신 Vitest로 작성한다.', type: 'rule', enforcement: 'should', durability: 'durable', audience: 'team', scope: { paths: [], topics: ['테스트', 'test', 'vitest', 'jest'] }, evidence_quote: '앞으로 테스트는 Jest 대신 Vitest로 작성해', reason: null, valid_until: null, confidence: 0.9 };
+    const supersede = { relation: 'supersede', target_id: '1', merged_statement: null, cascade_ids: [], why: 'Vitest replaces Jest', confidence: 0.9 };
+    const judgeRepo = (name: string, limit: number): { root: string; paths: ProjectPaths } => {
+      const root = repo(name);
+      runInit({ root, tools: ['claude'], language: 'ko', gitHooks: false, force: false, codeIndex: false, source: null });
+      const paths = projectPaths(root);
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 30 /, `max_calls_per_hour: ${limit} `));
+      writeItem(paths, newItem({ id: `01JUDGEJEST${name.length}00000000000000`.slice(0, 26), summary: '테스트는 Jest로 작성한다.', scope: { paths: [], topics: ['테스트', 'test', 'jest'] } }), 'ko');
+      const db = StateDb.open(paths.stateDb);
+      db.insertEvent({ ts: new Date().toISOString(), tool: 'claude', host: 'claude', kind: 'prompt', session: 's', cwd: root, prompt: '앞으로 테스트는 Jest 대신 Vitest로 작성해', lastAssistant: null, transcriptPath: null, model: null, flags: ['durable'], candidate: true });
+      db.close();
+      return { root, paths };
+    };
+    const teamOf = (paths: ProjectPaths): { summary: string; status: string; local: boolean; pending: number; proposals: number }[] => {
+      const db = StateDb.open(paths.stateDb);
+      try {
+        const pending = db.pendingEvents(10).length;
+        const proposals = db.judgePending().length;
+        return loadTeam(paths, db, { proposedTtlDays: 30, local: true }).items.map((i) => ({ summary: i.summary, status: i.status, local: Boolean(i.local), pending, proposals }));
+      } finally {
+        db.close();
+      }
+    };
+    {
+      const { root, paths } = judgeRepo('judge-limit', 1); // the extract call spends the hour's only call
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-limit.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [vitest] }, { items: [vitest] }], judge: [supersede] }));
+      const limited = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      check('judge', 'at the hourly limit the judge defers: nothing is written, the event stays pending', limited.applied.length === 0 && limited.errors.some((e) => e.includes(RATE_LIMIT_ERROR)) && t1.length === 1 && t1[0]?.status === 'active' && t1[0]?.pending === 1, JSON.stringify({ applied: limited.applied.map((a) => a.relation), errors: limited.errors, team: t1 }));
+      fs.writeFileSync(paths.config, (readText(paths.config) ?? '').replace(/max_calls_per_hour: 1 /, 'max_calls_per_hour: 30 '));
+      const later = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      check('judge', 'the next run with calls left judges the kept event: the old rule is replaced', later.applied.some((a) => a.relation === 'supersede') && t2.find((i) => i.summary.includes('Vitest'))?.status === 'active' && t2.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'superseded' && t2[0]?.pending === 0, JSON.stringify({ applied: later.applied.map((a) => a.relation), team: t2 }));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    {
+      const { root, paths } = judgeRepo('judge-down', 30);
+      process.env.DEVCTX_FAKE_LLM = path.join(tmp, 'fake-judge-down.json');
+      fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [vitest] }], judge: [{ __error: 'boom' }, supersede] }));
+      const down = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t1 = teamOf(paths);
+      check('judge', 'when the judge fails the rule is a proposal on this PC, kept for a later comparison', down.applied.length === 1 && down.applied[0]?.status === 'proposed' && down.applied[0]?.detail.startsWith('judge unavailable') && t1.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'active' && t1.find((i) => i.summary.includes('Vitest'))?.local === true && t1[0]?.proposals === 1 && t1[0]?.pending === 0, JSON.stringify({ applied: down.applied.map((a) => `${a.relation}:${a.status}:${a.detail}`), team: t1 }));
+      const again = await runWorker({ root, host: 'claude', reason: 'manual', allowLlm: true });
+      const t2 = teamOf(paths);
+      check('judge', 'a later run judges the kept proposal: the old rule is replaced and the proposal goes', again.applied.some((a) => a.relation === 'supersede') && t2.find((i) => i.summary === '테스트는 Jest로 작성한다.')?.status === 'superseded' && t2.find((i) => i.summary.includes('Vitest'))?.status === 'active' && t2.every((i) => !i.local) && t2[0]?.proposals === 0, JSON.stringify({ applied: again.applied.map((a) => `${a.relation}:${a.status}`), team: t2 }));
+      const jdb = StateDb.open(paths.stateDb);
+      const pairs = overlappingRules(loadTeam(paths, jdb, { proposedTtlDays: 30, local: true }).items);
+      jdb.close();
+      check('judge', 'rules a model compared are not listed as overlapping', pairs.length === 0, pairs.map((p) => `${p.a.summary} | ${p.b.summary}`).join('; '));
+      delete process.env.DEVCTX_FAKE_LLM;
+    }
+    check(
+      'judge',
+      'two live rules worded alike that name different tools are listed for people to check',
+      overlappingRules([rule('OV1', '테스트는 Jest로 작성한다.', ['테스트', 'test', 'jest'], { status: 'active' }), rule('OV2', '테스트는 Jest 대신 Vitest로 작성한다.', ['테스트', 'test', 'vitest', 'jest'], { status: 'active' }), rule('OV3', '금액 계산에는 BigDecimal을 사용한다.', ['금액', 'BigDecimal'], { status: 'active' })]).map((p) => `${p.a.id}-${p.b.id}`).join(',') === 'OV1-OV2',
+    );
 
     // Uninstall: devctx's parts go, people's content stays.
     const un = repo('uninstall');
