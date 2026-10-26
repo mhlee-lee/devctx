@@ -9,7 +9,7 @@ import { extractFactsChecked } from './extract/index.ts';
 import { encodeFacts, type FileFacts } from './facts.ts';
 import { codeDbPath, listRepoFiles, takeIndexLock } from './files.ts';
 import { languageOf } from './languages.ts';
-import { CodeStore, type FileRow, type SymbolRow } from './store.ts';
+import { CodeStore, SKIPPED, type FileRow, type SymbolRow } from './store.ts';
 
 export { codeDbPath, indexingInProgress, listRepoFiles } from './files.ts';
 
@@ -126,6 +126,9 @@ export function pendingChanges(root: string, cfg: DevctxConfig): number {
   try {
     const { all, wanted } = wantedFiles(root, cfg);
     const rows = store.rows();
+    // A moved size limit: files skipped for size, and parsed files now above it, need a sync.
+    const limitMoved = store.meta('max_file_kb') !== String(cfg.code_index.max_file_kb);
+    const maxBytes = cfg.code_index.max_file_kb * 1024;
     let n = 0;
     for (const rel of rows.keys()) if (!wanted.has(rel)) n++;
     for (const rel of wanted.keys()) {
@@ -138,6 +141,7 @@ export function pendingChanges(root: string, cfg: DevctxConfig): number {
         continue;
       }
       if (!prev || !prev.hash || prev.size !== st.size || prev.mtime !== st.mtimeMs) n++;
+      else if (limitMoved && (prev.hash === SKIPPED ? st.size <= maxBytes : prev.error === null && st.size > maxBytes)) n++;
     }
     if (store.meta('project') !== JSON.stringify(readProjectInfo(root, all))) n++;
     return n;
@@ -202,6 +206,13 @@ export async function syncIndex(root: string, cfg: DevctxConfig, opts: SyncOptio
       store.setMeta('project', projectJson);
       result.changed = true;
     }
+    // The size limit moved: files skipped for size, and parsed files now above it, are looked at
+    // again (their rows lose the hash that lets the stat check below pass them over).
+    const limitKey = String(cfg.code_index.max_file_kb);
+    if (store.meta('max_file_kb') !== limitKey) {
+      store.forgetForLimit(maxBytes);
+      store.setMeta('max_file_kb', limitKey);
+    }
 
     const rows = store.rows();
     for (const rel of rows.keys()) {
@@ -254,8 +265,12 @@ export async function syncIndex(root: string, cfg: DevctxConfig, opts: SyncOptio
       if (prev && prev.hash && prev.size === st.size && prev.mtime === st.mtimeMs) continue;
       const lang = spec.id;
       if (st.size > maxBytes) {
-        if (!prev || prev.error === null) {
-          pending.push({ row: { path: rel, lang, size: st.size, mtime: st.mtimeMs, hash: 'skipped', error: `larger than ${cfg.code_index.max_file_kb} KB` }, facts: null });
+        // Recorded once (and again after its hash was cleared) so the file list shows it and later
+        // syncs pass it over by stat alone.
+        if (!prev || prev.error === null || !prev.hash) {
+          pending.push({ row: { path: rel, lang, size: st.size, mtime: st.mtimeMs, hash: SKIPPED, error: `larger than ${cfg.code_index.max_file_kb} KB` }, facts: null });
+          // A file that was parsed before loses its facts and symbols: the graph must be rebuilt.
+          if (prev && prev.error === null) result.changed = true;
         }
         continue;
       }

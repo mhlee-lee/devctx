@@ -14,10 +14,12 @@ import { extractFactsChecked, headerDialectOf } from '../src/codeindex/extract/i
 import type { LangId } from '../src/codeindex/facts.ts';
 import { LANGUAGES, NOISY_GRAMMARS } from '../src/codeindex/languages.ts';
 import { loadGraph } from '../src/codeindex/load.ts';
-import { traceCalls } from '../src/codeindex/queries.ts';
+import { searchSymbols, traceCalls } from '../src/codeindex/queries.ts';
 import { refreshIndex } from '../src/codeindex/service.ts';
-import { normalizeConfig } from '../src/config.ts';
+import { pendingChanges } from '../src/codeindex/sync.ts';
+import { loadConfig, normalizeConfig } from '../src/config.ts';
 import { git } from '../src/util/git.ts';
+import { projectPaths } from '../src/util/paths.ts';
 
 const verbose = process.argv.includes('-v');
 
@@ -172,6 +174,49 @@ await repo(
     check('resolution', 'inherited tsconfig paths resolve from the config that set them', out.includes('libs/money/format.ts') && !out.includes('apps/web/src/format.ts'), out.replace(/\n/g, ' | '));
   },
 );
+
+// ---------------------------------------------------------------------------------------------
+// 4. The cache follows the size limit and file growth
+// ---------------------------------------------------------------------------------------------
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-smoke-cache-'));
+  try {
+    git(['init', '-q'], root);
+    const padding = `// ${'x'.repeat(98)}\n`.repeat(200); // ~20 KB of comment
+    fs.writeFileSync(path.join(root, 'big.ts'), `${padding}export function legacyFn() { return 1; }\n`);
+    fs.writeFileSync(path.join(root, 'small.ts'), 'export function freshFn() { return 2; }\n');
+    git(['add', '.'], root);
+    // The limit comes from the repository's config: index passes run as child processes that read it.
+    const paths = projectPaths(root);
+    const setLimit = (kb: number) => {
+      fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+      fs.writeFileSync(paths.config, `version: 1\ncode_index:\n  max_file_kb: ${kb}\n`);
+      return loadConfig(paths);
+    };
+    const found = (name: string, file: string): boolean => {
+      const g = loadGraph(root);
+      return g ? searchSymbols(g, name).includes(file) : false;
+    };
+    let cfg = setLimit(16);
+    await refreshIndex(root, cfg);
+    check('cache', 'a file above max_file_kb is listed but not parsed', !found('legacyFn', 'big.ts') && found('freshFn', 'small.ts'));
+    const low = cfg;
+    cfg = setLimit(64);
+    check('cache', 'raising max_file_kb counts the skipped file as pending work', pendingChanges(root, cfg) === 1 && pendingChanges(root, low) === 0);
+    await refreshIndex(root, cfg);
+    check('cache', 'raising max_file_kb parses the file that was skipped', found('legacyFn', 'big.ts'));
+    // A parsed file grows past the limit: its symbols must leave the cached graph.
+    fs.writeFileSync(path.join(root, 'small.ts'), `${padding.repeat(4)}export function freshFn() { return 2; }\n`);
+    await refreshIndex(root, cfg);
+    check('cache', 'a file that grew past max_file_kb drops out of symbol search', !found('freshFn', 'small.ts'));
+    cfg = setLimit(16);
+    check('cache', 'lowering max_file_kb counts parsed files above it as pending work', pendingChanges(root, cfg) === 1);
+    await refreshIndex(root, cfg);
+    check('cache', 'lowering max_file_kb drops the files above it', !found('legacyFn', 'big.ts') && pendingChanges(root, cfg) === 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Report
