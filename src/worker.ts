@@ -57,9 +57,6 @@ export interface WorkerReport {
 /** Worker runs that also bring the code index up to date (turn ends leave it to the engine). */
 const CODE_INDEX_REASONS = new Set(['session_start', 'code-index', 'manual']);
 
-/** Processed events older than this are deleted (decisions live in files; unprocessed events stay). */
-const EVENT_RETENTION_DAYS = 90;
-
 /**
  * Paths devctx commits: decision files and history (plus a pending AGENTS.md conversion). The
  * rule files compile builds are local and gitignored: a path-limited commit would track them again.
@@ -103,8 +100,9 @@ function maintain(paths: ProjectPaths, db: StateDb, cfg: DevctxConfig): number {
     }
   }
   if (changed) db.kvSet('expired_seen', JSON.stringify([...seen].slice(-2000)));
-  db.pruneEvents(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
-  db.pruneHistoryTurns(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString());
+  const dayMs = 86_400_000;
+  db.pruneEvents(new Date(Date.now() - cfg.memory.event_retention_days * dayMs).toISOString(), new Date(Date.now() - cfg.memory.unprocessed_retention_days * dayMs).toISOString());
+  db.pruneHistoryTurns(new Date(Date.now() - cfg.memory.event_retention_days * dayMs).toISOString());
   pruneCases(db);
   const weekAgo = Date.now() - 7 * 86_400_000;
   for (const { key, value } of db.kvList('sess:')) {

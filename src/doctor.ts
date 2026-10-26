@@ -108,6 +108,13 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
       if (health.streak > 0) add(health.streak >= 3 ? 'warn' : 'ok', 'extraction', `failed ${health.streak} worker run(s) in a row since ${health.since?.slice(0, 16) ?? '-'}: ${health.lastError ?? ''}`);
       const last = kdb.lastHookEventTs();
       add(last ? 'ok' : 'warn', 'capture', last ? `last AI hook event ${last.slice(0, 16).replace('T', ' ')}` : 'no AI hook event recorded yet (approve the project hooks in each tool)');
+      const ev = kdb.eventCounts();
+      const oldPending = ev.oldestPending && Date.now() - Date.parse(ev.oldestPending) > (cfg.memory.unprocessed_retention_days - 7) * 86_400_000;
+      add(
+        oldPending ? 'warn' : 'ok',
+        'stored prompts',
+        `${ev.total} on this PC (state.sqlite), ${ev.pending} waiting for analysis${ev.oldestPending ? ` (oldest ${ev.oldestPending.slice(0, 10)})` : ''}; analyzed ones are deleted after ${cfg.memory.event_retention_days} days, waiting ones after ${cfg.memory.unprocessed_retention_days} days unanalyzed${oldPending ? ' — some are about to be dropped: run devctx worker with a model available' : ''} (devctx purge erases the text now)`,
+      );
       const hist = historyState(paths.root);
       const hc = kdb.historyCounts();
       add(

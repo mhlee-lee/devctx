@@ -973,12 +973,20 @@ export class StateDb {
   // ---- housekeeping ----------------------------------------------------------------------------
 
   /**
-   * Deletes captured events that were processed before `beforeIso`. Unprocessed events are kept
-   * however old they are; decisions live in `.devctx/knowledge/`, not here.
+   * Deletes captured events that were processed before `beforeIso`, and events never processed
+   * that are older than `unprocessedBeforeIso` (a pause longer than that loses their rules; the
+   * cap keeps the database from growing forever); decisions live in `.devctx/knowledge/`, not here.
    */
-  pruneEvents(beforeIso: string): number {
+  pruneEvents(beforeIso: string, unprocessedBeforeIso?: string): number {
     const res = this.db.prepare('delete from events where processed != 0 and ts < ?').run(beforeIso);
-    return Number(res.changes ?? 0);
+    const old = unprocessedBeforeIso ? this.db.prepare('delete from events where processed = 0 and ts < ?').run(unprocessedBeforeIso) : null;
+    return Number(res.changes ?? 0) + Number(old?.changes ?? 0);
+  }
+
+  /** How many captured events this PC holds, and how many still wait for analysis. */
+  eventCounts(): { total: number; pending: number; oldestPending: string | null } {
+    const row = this.db.prepare('select count(*) as n, sum(processed = 0) as pending, min(case when processed = 0 then ts end) as oldest from events').get() as Row | undefined;
+    return { total: Number(row?.n ?? 0), pending: Number(row?.pending ?? 0), oldestPending: row ? asString(row.oldest) : null };
   }
 
   /** Time of the latest event an AI tool's hook delivered (null: hooks never ran here). */

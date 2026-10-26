@@ -107,7 +107,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | 히스토리·프롬프트 분석 켜짐/꺼짐 | `~/.local/share/devctx/history.json`, `capture.json` | 이 PC만 |
 | 개인 선호, 모델 평가 결과 | `~/.local/share/devctx/` | 이 PC만 |
 
-`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 다만 hook은 히스토리를 꺼도 프롬프트를 이 PC의 `state.sqlite`에 저장한다(규칙 추출, 세션 이어가기, 이전 작업 검색용). 분석이 끝난 것은 90일이 지나면 지우고, 지금 지우려면 `devctx purge`를 실행한다(아직 분석하지 않은 프롬프트 속 규칙은 기록되지 않는다). 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
+`.devctx/local/`은 `init`이 `.gitignore`에 넣는다. 프롬프트 히스토리를 켜지 않으면 대화 원문은 Git에 올라가지 않는다. 다만 hook은 히스토리를 꺼도 프롬프트를 이 PC의 `state.sqlite`에 저장한다(규칙 추출, 세션 이어가기, 이전 작업 검색용). 분석이 끝난 것은 90일(`memory.event_retention_days`), 분석하지 못한 것은 180일(`memory.unprocessed_retention_days`)이 지나면 지우고, 지금 지우려면 `devctx purge`를 실행한다(아직 분석하지 않은 프롬프트 속 규칙은 기록되지 않는다). 남아 있는 건수는 `devctx doctor`의 `stored prompts`에 나온다. 결정 파일에는 근거로 쓴 사용자 문장 일부(200자 이하)만 들어간다(`memory.store_evidence_quote`).
 
 ## 5. 비용과 토큰
 

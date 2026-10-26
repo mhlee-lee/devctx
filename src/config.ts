@@ -55,6 +55,13 @@ export interface DevctxConfig {
      * in batches. Off: only explicitly marked prompts are considered.
      */
     implicit_rules: boolean;
+    /** Days this PC keeps analyzed prompts, replies and written history turns in `state.sqlite`. */
+    event_retention_days: number;
+    /**
+     * Days a prompt that was never analyzed (no model, hooks not approved) is kept before it is
+     * dropped unanalyzed. Longer than `event_retention_days` so a pause does not lose rules.
+     */
+    unprocessed_retention_days: number;
   };
   code_index: {
     /** Built-in code index (symbols, call graph, text search), used by agents through the `devctx-code` skill. */
@@ -98,7 +105,7 @@ export const DEFAULT_CONFIG: DevctxConfig = {
     pricing_refresh_days: 7,
     pin: {},
   },
-  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true, implicit_rules: true },
+  memory: { store_evidence_quote: true, proposed_ttl_days: 30, personal: true, implicit_rules: true, event_retention_days: 90, unprocessed_retention_days: 180 },
   code_index: { enabled: true, exclude: [], max_file_kb: 512, preapprove: true },
   history: { max_calls_per_hour: 30 },
 };
@@ -184,6 +191,8 @@ export function normalizeConfig(raw: unknown): DevctxConfig {
       proposed_ttl_days: num(mem.proposed_ttl_days, d.memory.proposed_ttl_days, 1, 3_650),
       personal: bool(mem.personal, d.memory.personal),
       implicit_rules: bool(mem.implicit_rules, d.memory.implicit_rules),
+      event_retention_days: num(mem.event_retention_days, d.memory.event_retention_days, 1, 3_650),
+      unprocessed_retention_days: num(mem.unprocessed_retention_days, d.memory.unprocessed_retention_days, 1, 3_650),
     },
     code_index: {
       enabled,
@@ -284,6 +293,8 @@ memory:
   proposed_ttl_days: 30       # 재확인 없는 제안 항목의 보존 기간
   personal: true              # 개인 선호는 저장소 밖(~/.local/share/devctx)에 저장
   implicit_rules: true        # "앞으로" 같은 표현이 없는 지시도 LLM이 판단 (5개씩 묶어서). false면 명시 표현만
+  event_retention_days: 90    # 분석이 끝난 프롬프트·응답 원문과 쓴 히스토리 턴을 이 PC에 두는 기간 (state.sqlite)
+  unprocessed_retention_days: 180  # 분석하지 못한 프롬프트(모델 없음, hook 미승인)를 두는 기간. 지나면 분석 없이 지운다
 
 code_index:
   enabled: ${String(codeIndex).padEnd(19)}# 내장 코드 인덱스(심볼·호출 관계·텍스트 검색)를 스킬 devctx-code로 제공

@@ -651,6 +651,12 @@ const cand = (statement: string, durable: boolean): Candidate => ({
       const removed = db.pruneEvents(ago(90));
       const pending = db.pendingEvents(10).map((e) => e.id);
       check('events', 'only processed events older than 90 days are deleted', removed === 1 && pending.includes(oldPending));
+      // A prompt never analyzed is kept longer, not forever: the unprocessed cap drops it.
+      const veryOld = ev(ago(200));
+      const counts = db.eventCounts();
+      const dropped = db.pruneEvents(ago(90), ago(180));
+      const left = db.pendingEvents(10).map((e) => e.id);
+      check('events', 'unanalyzed prompts are dropped only past their own, longer retention', counts.pending === 2 && counts.oldestPending?.slice(0, 10) === ago(200).slice(0, 10) && dropped === 1 && !left.includes(veryOld) && left.includes(oldPending), JSON.stringify({ counts, dropped, left }));
     } finally {
       db.close();
     }
