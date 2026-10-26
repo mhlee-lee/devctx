@@ -257,7 +257,7 @@ AI 도구는 스킬 `devctx-code`로 쓴다. 스킬은 저장소 파일이라 cl
 | Cursor | `.agents/skills/devctx-code/` | `.cursor/permissions.json`의 Auto-review 안내 (터미널 허용 목록이 이미 파일로 관리될 때만 거기에도 추가) |
 | Kiro | `.kiro/skills/devctx-code/` | `~/.kiro/workspace-roots/<저장소>/permissions.yaml`의 shell 허용 규칙 |
 
-Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자 폴더에 이 저장소 전용 항목을 쓴다. `devctx init`과 하루 한 번 세션 시작 hook이 확인하므로 팀원 PC에도 따로 할 일이 없다. 허용되는 것은 `.devctx/bin/devctx code`로 시작하는 명령 하나뿐이고, 같은 스크립트를 hook이 이미 자동으로 실행한다.
+Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자 폴더에 이 저장소 전용 항목을 쓴다(`~/.copilot/permissions-config.json`, `~/.kiro/workspace-roots/…/permissions.yaml`. `DEVCTX_HOME`을 바꿔도 이 파일들의 위치는 바뀌지 않는다. `COPILOT_HOME`, `KIRO_HOME`을 따른다). `devctx init`과 하루 한 번 세션 시작 hook이 확인하므로 팀원 PC에도 따로 할 일이 없다. 허용되는 것은 `.devctx/bin/devctx code`로 시작하는 명령 하나뿐이고, 같은 스크립트를 hook이 이미 자동으로 실행한다. 처음 고치기 전에 파일을 `*.devctx-backup`으로 복사해 두고, `init` 출력에 `home` 줄로 무엇을 넣었는지 보여준다. 이 PC에서는 건드리지 않게 하려면 `devctx init --no-home-permissions`(PC별로 기억하고 세션 시작 점검도 따른다. 그 도구는 스킬 명령마다 승인을 묻는다. 되돌리기: `--home-permissions`). 팀 전체에서 끄려면 `code_index.preapprove: false`.
 
 `devctx code status`로 색인 상태와 스킬·허용 설치 상태를 본다.
 

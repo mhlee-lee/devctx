@@ -24,6 +24,22 @@ export interface AccessResult {
   file: string;
   action: 'created' | 'updated' | 'unchanged' | 'removed' | 'skipped';
   note?: string;
+  /** A file in the user's home directory (Copilot CLI, Kiro), not in the repository. */
+  machine?: boolean;
+}
+
+/** Suffix of the copy kept of a home-directory file before devctx first edits it. */
+export const BACKUP_SUFFIX = '.devctx-backup';
+
+/** Copies a home-directory file once, before devctx's first edit, so the pre-devctx state is kept. */
+function backupOnce(file: string): void {
+  const copy = `${file}${BACKUP_SUFFIX}`;
+  if (!fs.existsSync(file) || fs.existsSync(copy)) return;
+  try {
+    fs.copyFileSync(file, copy);
+  } catch {
+    // the edit itself still only adds or removes devctx's own entry
+  }
 }
 
 function obj(v: unknown): Json {
@@ -199,6 +215,7 @@ function editJson(root: string, rel: string, mutate: (data: Json) => void, opts:
   const before = JSON.stringify(data);
   mutate(data);
   if (JSON.stringify(data) === before) return { file: rel, action: 'unchanged' };
+  if (opts.absolute) backupOnce(file);
   if (Object.keys(data).length === 0) {
     fs.rmSync(file, { force: true });
     return { file: rel, action: 'removed' };
@@ -340,9 +357,9 @@ const COPILOT_IDS = [`${CODE_COMMAND}:*`, `./${CODE_COMMAND}:*`];
 function copilotCliPermissions(root: string, enabled: boolean): AccessResult {
   const home = process.env.COPILOT_HOME ? path.resolve(process.env.COPILOT_HOME) : path.join(os.homedir(), '.copilot');
   const file = path.join(home, 'permissions-config.json');
-  if (!fs.existsSync(home)) return { file, action: 'unchanged' };
+  if (!fs.existsSync(home)) return { file, action: 'unchanged', machine: true };
   const key = mainRepoRoot(root);
-  return editJson(
+  const res = editJson(
     root,
     file,
     (d) => {
@@ -365,6 +382,8 @@ function copilotCliPermissions(root: string, enabled: boolean): AccessResult {
     },
     { create: enabled, absolute: true },
   );
+  const what = enabled ? `approves "${COPILOT_IDS[0]}" for ${key}` : `removes devctx's approval for ${key}`;
+  return { ...res, machine: true, note: res.action === 'created' || res.action === 'updated' ? `${what} (copy of the file before devctx: ${path.basename(file)}${BACKUP_SUFFIX})` : res.note };
 }
 
 const KIRO_MATCH = [`${CODE_COMMAND} *`, `./${CODE_COMMAND} *`];
@@ -381,17 +400,17 @@ export function kiroPermissionsFile(root: string): string {
 function kiroPermissions(root: string, enabled: boolean): AccessResult {
   const file = kiroPermissionsFile(root);
   const home = path.dirname(path.dirname(path.dirname(file)));
-  if (!fs.existsSync(home)) return { file, action: 'unchanged' };
+  if (!fs.existsSync(home)) return { file, action: 'unchanged', machine: true };
   const text = readText(file);
-  if (text === null && !enabled) return { file, action: 'unchanged' };
+  if (text === null && !enabled) return { file, action: 'unchanged', machine: true };
   const doc = parseDocument(text ?? 'rules: []\n');
-  if (doc.errors.length > 0) return { file, action: 'skipped', note: 'not valid YAML; left untouched' };
+  if (doc.errors.length > 0) return { file, action: 'skipped', note: 'not valid YAML; left untouched', machine: true };
   let rules = doc.get('rules');
   if (!isSeq(rules)) {
     doc.set('rules', doc.createNode([]));
     rules = doc.get('rules');
   }
-  if (!isSeq(rules)) return { file, action: 'skipped', note: 'unexpected layout' };
+  if (!isSeq(rules)) return { file, action: 'skipped', note: 'unexpected layout', machine: true };
   const ours = (item: unknown): boolean => {
     if (!isMap(item)) return false;
     const match = item.get('match');
@@ -399,7 +418,8 @@ function kiroPermissions(root: string, enabled: boolean): AccessResult {
     return item.get('capability') === 'shell' && item.get('effect') === 'allow' && KIRO_MATCH.every((m) => list.includes(m));
   };
   const present = rules.items.some(ours);
-  if (enabled === present) return { file, action: 'unchanged' };
+  if (enabled === present) return { file, action: 'unchanged', machine: true };
+  backupOnce(file);
   if (enabled) {
     const rule = doc.createNode({ capability: 'shell', effect: 'allow', match: [...KIRO_MATCH] });
     rules.flow = false; // the block style Kiro itself writes
@@ -413,10 +433,11 @@ function kiroPermissions(root: string, enabled: boolean): AccessResult {
     } catch {
       // Kiro keeps other state there
     }
-    return { file, action: 'removed' };
+    return { file, action: 'removed', machine: true };
   }
   writeFileAtomic(file, String(doc));
-  return { file, action: enabled ? (text === null ? 'created' : 'updated') : 'removed' };
+  const note = enabled ? `allows shell "${KIRO_MATCH[0]}" for this workspace${text === null ? '' : ` (copy of the file before devctx: ${path.basename(file)}${BACKUP_SUFFIX})`}` : undefined;
+  return { file, action: enabled ? (text === null ? 'created' : 'updated') : 'removed', machine: true, note };
 }
 
 // ---- entry points ------------------------------------------------------------------------------
@@ -427,6 +448,11 @@ export interface AccessOptions {
   /** Also pre-approve the command (config `code_index.preapprove`). */
   preapprove: boolean;
   language: Language;
+  /**
+   * Also write the per-machine files in the user's home directory (Copilot CLI, Kiro). Off on a
+   * PC whose owner said `devctx init --no-home-permissions`; removals (uninstall) always run.
+   */
+  machine?: boolean;
 }
 
 /** Repository files: skills and the permission settings tools read from the repository. */
@@ -449,6 +475,7 @@ export function installRepoAccess(root: string, tools: readonly ToolId[], opts: 
  */
 export function installMachineAccess(root: string, tools: readonly ToolId[], opts: AccessOptions): AccessResult[] {
   const allow = opts.enabled && opts.preapprove;
+  if (opts.machine === false && allow) return [];
   const results: AccessResult[] = [];
   if (tools.includes('copilot') || !allow) results.push(copilotCliPermissions(root, allow && tools.includes('copilot')));
   if (tools.includes('kiro') || !allow) results.push(kiroPermissions(root, allow && tools.includes('kiro')));

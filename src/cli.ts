@@ -104,7 +104,8 @@ const HELP = `devctx — project decision memory for AI coding tools
 
 사용법:
   devctx init [--tools claude,codex,copilot,cursor,kiro] [--source <npm|git|path>] [--lang ko|en]
-              [--no-code-index] [--no-git-hooks] [--force]
+              [--no-code-index] [--no-git-hooks] [--no-home-permissions] [--force]
+                                 --no-home-permissions: 이 PC의 ~/.copilot, ~/.kiro 권한 파일은 건드리지 않는다 (PC별로 기억)
   devctx status                  기록된 결정 목록
   devctx code [status]           코드 인덱스 상태, 저장소 언어, 스킬·사전 허용 설치 상태
   devctx code index              지금 색인 (바뀐 파일만 다시 파싱)
@@ -254,10 +255,11 @@ async function main(argv: string[]): Promise<number> {
         gitHooks: !has(args, 'no-git-hooks'),
         force: has(args, 'force'),
         codeIndex: !has(args, 'no-code-index'),
+        homePermissions: has(args, 'no-home-permissions') ? false : has(args, 'home-permissions') ? true : undefined,
       });
       console.log(`devctx init: ${report.root}`);
       for (const h of report.hookFiles) console.log(`  hook  ${h.action.padEnd(9)} ${h.file}`);
-      for (const a of report.accessFiles) if (a.action !== 'unchanged') console.log(`  skill ${a.action.padEnd(9)} ${a.file}`);
+      for (const a of report.accessFiles) if (a.action !== 'unchanged') console.log(`  ${a.machine ? 'home ' : 'skill'} ${a.action.padEnd(9)} ${a.file}`);
       if (report.gitHooks) {
         console.log(`  git   installed: ${report.gitHooks.installed.join(', ') || '-'}; present: ${report.gitHooks.present.join(', ') || '-'}`);
       }

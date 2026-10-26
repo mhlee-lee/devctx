@@ -140,6 +140,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 - **브랜치별 보관 없음:** worktree마다 인덱스가 하나라 브랜치를 오가면 차이 나는 파일을 다시 파싱한다. 여러 브랜치를 동시에 다룬다면 `git worktree`를 쓴다. worktree마다 인덱스가 따로 생긴다.
 - **토큰:** 색인은 LLM 없이 로컬에서 파싱만 한다(django 규모 전체 색인 약 4초). 토큰이 드는 건 AI가 스킬 명령 결과를 읽을 때뿐이고, 파일을 통째로 읽는 것보다 적다.
 - **끄기:** `devctx init --no-code-index`, 또는 `code_index.enabled: false` 뒤 `devctx init`
+- **사용자 폴더:** Copilot CLI와 Kiro를 대상으로 하면 `init`과 하루 한 번 세션 시작 점검이 `~/.copilot/permissions-config.json`, `~/.kiro/workspace-roots/…/permissions.yaml`에 이 저장소의 스킬 명령 허용 항목을 쓴다(`DEVCTX_HOME`과 무관. 처음 고치기 전에 `*.devctx-backup` 복사본을 남긴다). 이 PC에서는 건드리지 않게 하려면 `devctx init --no-home-permissions`. 자세한 것은 [README의 스킬과 미리 허용](../README.md#코드-인덱스).
 
 ## 7. 프롬프트 히스토리 (선택)
 

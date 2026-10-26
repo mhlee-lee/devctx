@@ -52,7 +52,7 @@ import { recentChanges, sessionContext } from '../src/hooks/context.ts';
 import { runInit } from '../src/init/init.ts';
 import { installKey, readToolsLock, renderShim, renderToolsLock, shimStatus } from '../src/init/shim.ts';
 import { approveProposal, discardProposal, listProposals, resolveConflict } from '../src/memory/manual.ts';
-import { agentAccessStatus, renderSkill } from '../src/init/access.ts';
+import { agentAccessStatus, BACKUP_SUFFIX, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
 import { callsLeft, evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
@@ -66,7 +66,7 @@ import type { KnowledgeItem } from '../src/knowledge/types.ts';
 import { applyStats, deriveStatus, knowledgeDirs, loadTeam, readKnowledgeFiles } from '../src/knowledge/view.ts';
 import { consolidate, fastVerdict } from '../src/memory/consolidate.ts';
 import { readExtractionHealth, recordExtractionHealth } from '../src/state/health.ts';
-import { healthNotices, noteCommit } from '../src/upkeep.ts';
+import { dailyUpkeep, healthNotices, noteCommit } from '../src/upkeep.ts';
 import { git } from '../src/util/git.ts';
 import { readText, sha256 } from '../src/util/fsx.ts';
 import { sameRule } from '../src/memory/dedupe.ts';
@@ -1488,6 +1488,35 @@ let paraphraseLine = '';
     fs.writeFileSync(path.join(repo, '.vscode/settings.json'), '{\n  // team settings\n  "editor.tabSize": 2,\n}\n');
     const access = agentAccessStatus(repo, ['copilot'], { enabled: true, preapprove: true, language: 'ko' }).find((x) => x.file === '.vscode/settings.json');
     check('access', 'a settings file with comments gets the exact entry to add by hand', access?.ok === false && access.hint?.includes('chat.tools.terminal.autoApprove') === true && !access.hint.includes('run "devctx init"'), access?.hint);
+
+    // The Copilot CLI approval lives in the user's home directory: the file is copied before the
+    // first edit, the change is named, and a PC can opt out (the daily check follows the choice).
+    {
+      const copilotHome = path.join(tmp, 'copilot-home');
+      fs.mkdirSync(copilotHome);
+      const permFile = path.join(copilotHome, 'permissions-config.json');
+      fs.writeFileSync(permFile, '{\n  "locations": {\n    "/elsewhere": { "tool_approvals": [{ "kind": "commands", "commandIdentifiers": ["ls:*"] }] }\n  }\n}\n');
+      const savedCopilot = process.env.COPILOT_HOME;
+      process.env.COPILOT_HOME = copilotHome;
+      try {
+        const home = path.join(tmp, 'home-perms');
+        fs.mkdirSync(home);
+        git(['init', '-q'], home);
+        const optOut = runInit({ root: home, tools: ['copilot'], language: 'ko', gitHooks: false, force: false, codeIndex: true, source: null, homePermissions: false });
+        const untouched = readText(permFile)?.includes('ls:*') && !readText(permFile)?.includes('devctx') && !fs.existsSync(`${permFile}${BACKUP_SUFFIX}`);
+        const upkeepDb = StateDb.open(projectPaths(home).stateDb);
+        const daily = dailyUpkeep(home, loadConfig(projectPaths(home)), upkeepDb);
+        upkeepDb.close();
+        check('access', '--no-home-permissions leaves the home directory alone, also at the daily check', Boolean(untouched) && !optOut.accessFiles.some((a) => a.machine && a.action !== 'unchanged') && optOut.notes.some((n) => n.includes('--no-home-permissions')) && !daily.some((d) => d.includes('permissions-config')) && !readText(permFile)?.includes('devctx'), JSON.stringify({ daily, notes: optOut.notes.filter((n) => n.includes('home')) }));
+        const optIn = runInit({ root: home, tools: ['copilot'], language: 'ko', gitHooks: false, force: false, codeIndex: true, source: null, homePermissions: true });
+        const edited = optIn.accessFiles.find((a) => a.machine && a.file === permFile);
+        const backup = readText(`${permFile}${BACKUP_SUFFIX}`);
+        check('access', 'editing the home file keeps a copy of it from before devctx and says what was added', edited?.action === 'updated' && edited.note?.includes('approves') === true && edited.note.includes(BACKUP_SUFFIX) && backup?.includes('ls:*') === true && !backup.includes('devctx') && readText(permFile)?.includes('.devctx/bin/devctx code:*') === true && readText(permFile)?.includes('ls:*') === true, JSON.stringify(edited));
+      } finally {
+        if (savedCopilot === undefined) delete process.env.COPILOT_HOME;
+        else process.env.COPILOT_HOME = savedCopilot;
+      }
+    }
 
     const unknown = runCli(['statsu'], repo);
     check('cli', 'an unknown command is an error, not just the help text', unknown.status === 1 && unknown.stderr.includes('statsu') && !unknown.stdout.includes('사용법'), unknown.stderr);
