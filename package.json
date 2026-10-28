@@ -1,6 +1,6 @@
 {
   "name": "devctx",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Project decision memory for AI coding tools: captures corrections through tool hooks, consolidates them in git, and delivers them to every tool at session start and per prompt.",
   "type": "module",
