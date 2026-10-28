@@ -42,7 +42,17 @@ function ensureBlock(file: string, block: string): boolean {
   return true;
 }
 
-/** Removes the devctx block from `.gitattributes` and `.gitignore` (files left empty are deleted). */
+/**
+ * What uninstall leaves in `.gitignore`: once the removal is pulled, each teammate's clone still
+ * has its untracked `.devctx/local` (prompts and replies) and generated rule list until that
+ * person runs uninstall; without this line `git add -A` would commit them.
+ */
+export const UNINSTALLED_IGNORE = '/.devctx/';
+
+/**
+ * Removes the devctx block from `.gitattributes` and `.gitignore` (files left empty are deleted).
+ * `.gitignore` keeps one line, `UNINSTALLED_IGNORE`, instead of the block.
+ */
 export function removeGitBlocks(root: string, apply: boolean): string[] {
   const changed: string[] = [];
   for (const rel of ['.gitattributes', '.gitignore']) {
@@ -51,7 +61,10 @@ export function removeGitBlocks(root: string, apply: boolean): string[] {
     const start = current?.indexOf(BEGIN) ?? -1;
     const end = current?.indexOf(END) ?? -1;
     if (current === null || start < 0 || end < start) continue;
-    const rest = `${current.slice(0, start)}${current.slice(end + END.length)}`.replace(/\n{3,}/g, '\n\n').trim();
+    let rest = `${current.slice(0, start)}${current.slice(end + END.length)}`.replace(/\n{3,}/g, '\n\n').trim();
+    if (rel === '.gitignore' && !rest.split('\n').some((l) => ['/.devctx/', '.devctx/', '/.devctx', '.devctx'].includes(l.trim()))) {
+      rest = rest ? `${rest}\n${UNINSTALLED_IGNORE}` : UNINSTALLED_IGNORE;
+    }
     if (apply) {
       if (rest) writeFileAtomic(file, `${rest}\n`);
       else fs.rmSync(file, { force: true });
@@ -68,7 +81,13 @@ export function ensureGitAttributes(root: string): boolean {
 
 /** Keeps the devctx block of `.gitignore` current (init, and once a day from the hooks). */
 export function ensureGitIgnore(root: string): boolean {
-  return ensureBlock(path.join(root, '.gitignore'), IGNORE);
+  const file = path.join(root, '.gitignore');
+  // Installed again after an uninstall: its line would ignore the committed `.devctx/` files.
+  const current = readText(file);
+  const lines = current?.split('\n') ?? [];
+  const leftover = lines.some((l) => l === UNINSTALLED_IGNORE);
+  if (leftover) writeFileAtomic(file, lines.filter((l) => l !== UNINSTALLED_IGNORE).join('\n').replace(/^\n+/, ''));
+  return ensureBlock(file, IGNORE) || leftover;
 }
 
 /** Generated rule files an earlier devctx version committed. */

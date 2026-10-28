@@ -232,7 +232,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
 | `devctx capture [on\|off]` | 내 프롬프트 분석 켜기·끄기 (이 PC) |
 | `devctx history [on\|off]` | 프롬프트 히스토리 켜기·끄기, 상태와 최근 기록 |
 | `devctx purge` | 이 PC에 저장된 프롬프트·AI 응답 원문 지우기 |
-| `devctx uninstall [--yes]` | 이 저장소에서 devctx 제거 (`--yes` 없이는 지울 것만 보여줌) |
+| `devctx uninstall [--all] [--yes]` | 이 저장소에서 devctx 제거, `--all`은 이 PC 전체 (`--yes` 없이는 지울 것만 보여줌) |
 | `devctx models` | 추출·판정·요약에 쓰는 모델과 비용 |
 | `devctx code status` | 코드 인덱스 상태, 스킬·허용 설치 상태 |
 

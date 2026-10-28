@@ -89,3 +89,21 @@ export function setHistoryEnabled(root: string, enabled: boolean): HistoryState 
 export function captureEnabled(root: string): boolean {
   return switchState(root, 'capture').enabled;
 }
+
+/**
+ * Drops this repository's own history/capture settings (uninstall; `apply: false` only reports
+ * whether there are any). A `--global` setting stays.
+ */
+export function forgetRepo(root: string, apply = true): boolean {
+  let found = false;
+  for (const name of Object.keys(DEFAULTS) as Switch[]) {
+    const data = load(name);
+    const key = repoKey(root);
+    if (!(key in data.repos)) continue;
+    found = true;
+    if (!apply) continue;
+    delete data.repos[key];
+    writeJsonAtomic(toggleFile(name), data);
+  }
+  return found;
+}

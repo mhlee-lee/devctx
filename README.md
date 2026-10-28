@@ -310,7 +310,7 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 | `devctx compile [--check]` | 이 PC의 규칙 목록과 도구별 규칙 파일 재생성, AGENTS.md의 devctx 블록 확인 (`--check`는 최신인지만 확인) |
 | `devctx worker` | 대기 중인 기록을 지금 처리 (보통 hook이 자동 실행) |
 | `devctx purge` | 이 PC에 저장된 프롬프트·AI 응답 원문 지우기 |
-| `devctx uninstall [--yes] [--keep-history]` | 이 저장소에서 devctx 제거. `--yes` 없이는 지울 것만 보여준다 |
+| `devctx uninstall [--all] [--yes] [--keep-history]` | 이 저장소에서 devctx 제거. `--all`은 이 PC의 모든 프로젝트와 `~/.local/share/devctx`까지. `--yes` 없이는 지울 것만 보여준다 ([제거](#제거)) |
 
 ## 추출 모델
 
@@ -376,14 +376,20 @@ history:
 ## 제거
 
 ```sh
-devctx uninstall          # 지울 것만 보여준다
-devctx uninstall --yes    # 실제로 지운다 (--keep-history: .devctx/history/는 남긴다)
-# 출력된 git add 명령으로 커밋해야 팀원에게도 반영된다
+devctx uninstall               # 이 저장소에서 지울 것만 보여준다
+devctx uninstall --yes         # 실제로 지운다 (--keep-history: .devctx/history/는 남긴다)
+devctx uninstall --all         # 이 PC 전체: 모든 프로젝트 + ~/.local/share/devctx (미리보기)
+devctx uninstall --all --yes   # 이 PC에서 devctx를 모두 지운다
+# 출력된 git add 명령으로 프로젝트마다 커밋해야 팀원에게도 반영된다
 ```
 
-지우는 것: 도구별 hook 파일의 devctx 항목(다른 항목은 남기고, devctx 항목만 있던 파일은 삭제), 코드 인덱스 스킬과 미리 허용 항목(사용자 폴더의 Copilot CLI·Kiro 항목 포함), `.git/hooks/*`·`.gitattributes`·`.gitignore`의 devctx 블록, 도구별 `devctx-*` 규칙 파일, AGENTS.md의 devctx 블록(사람이 쓴 내용은 남는다. devctx 내용만 있으면 파일을 지우고 CLAUDE.md의 `@AGENTS.md`도 지운다), `.devctx/`(결정 파일, 설정, 로컬 DB, 프롬프트 히스토리).
+저장소에서 지우는 것: 도구별 hook 파일의 devctx 항목(다른 항목은 남기고, devctx 항목만 있던 파일은 삭제), 코드 인덱스 스킬과 미리 허용 항목(사용자 폴더의 Copilot CLI·Kiro 항목 포함), `.git/hooks/*`·`.gitattributes`·`.gitignore`의 devctx 블록, 도구별 `devctx-*` 규칙 파일, AGENTS.md의 devctx 블록(사람이 쓴 내용은 남는다. devctx 내용만 있으면 파일을 지우고 CLAUDE.md의 `@AGENTS.md`도 지운다), `.devctx/`(결정 파일, 설정, 로컬 DB, 프롬프트 히스토리), 그렇게 비게 된 도구 폴더(`.codex/`, `.agents/` 등. 다른 파일이 있으면 남긴다), 이 PC에 둔 그 저장소의 히스토리·프롬프트 분석 설정.
 
-남는 것: 이 PC의 공용 데이터 `~/.local/share/devctx/`(개인 선호, 모델 평가, 설치본). 다른 저장소에서 쓰지 않으면 직접 지운다.
+- 백그라운드 작업(규칙 정리 worker, 코드 색인)이 돌고 있으면 최대 10초 기다리고, 그래도 돌고 있으면 멈춘 뒤 지운다. 지운 직후 다시 생기지 않게 하려는 것이다. lock 파일의 프로세스가 실제 devctx 작업일 때만 멈춘다.
+- `.gitignore`에는 `/.devctx/` 한 줄을 남긴다. 제거 커밋을 pull한 팀원 PC에는 각자의 `.devctx/local`(프롬프트 원문이 든 로컬 DB)이 남아 있어서, 이 줄이 없으면 `git add -A`에 함께 커밋될 수 있다. 나중에 다시 `devctx init`하면 이 줄은 지워진다.
+- 팀원은 pull한 뒤 각자 PC에 남은 것(`.devctx/local`, git hook 블록, Copilot·Kiro 허용 항목)을 한 번 지운다: `npx --yes github:mhlee-lee/devctx uninstall --yes`
+- 이 PC의 공용 데이터(`~/.local/share/devctx/`: 설치본, 개인 선호, 모델 평가, 프로젝트 목록)는 다른 프로젝트가 쓸 수 있어서 프로젝트 하나를 지울 때는 남긴다. `--all`은 등록된 모든 프로젝트(와 지금 있는 프로젝트)에서 지운 뒤 이 폴더와, devctx가 Copilot CLI·Kiro 권한 파일을 처음 고칠 때 만든 백업(`*.devctx-backup`)까지 지운다.
+- 전역 `devctx` 명령은 npm이 관리하므로 직접 지운다: `npm rm -g devctx` (`npm link`로 연결했어도 같다). 목록에 없는 프로젝트(이 PC에서 init이나 hook이 한 번도 돌지 않은 clone)는 그 안에서 `devctx uninstall --yes`로 지운다.
 
 ## 개발
 

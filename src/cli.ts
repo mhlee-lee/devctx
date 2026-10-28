@@ -7,7 +7,7 @@ import { runDoctor } from './doctor.ts';
 import { runGitHook } from './githook-run.ts';
 import { runHook } from './hooks/entry.ts';
 import { runInit } from './init/init.ts';
-import { uninstall } from './init/uninstall.ts';
+import { globalCommand, uninstall, uninstallMachine, type UninstallReport, type UninstallStep } from './init/uninstall.ts';
 import { packageInfo } from './init/shim.ts';
 import { registeredProjects, registerProject } from './init/projects.ts';
 import { updateProject, type UpdateResult } from './init/update.ts';
@@ -142,8 +142,9 @@ const HELP = `devctx — project decision memory for AI coding tools
                                  내 프롬프트를 규칙 후보로 분석할지 (기본 켜짐, 이 PC 설정). 꺼도 규칙은 전달된다
   devctx worker [--no-llm]       대기 중인 이벤트 처리 (보통 hook이 자동 실행)
   devctx purge                   이 PC에 저장된 프롬프트·AI 응답 원문 지우기 (.devctx/local/state.sqlite. 결정 파일은 그대로)
-  devctx uninstall [--yes] [--keep-history]
+  devctx uninstall [--all] [--yes] [--keep-history]
                                  이 저장소에서 devctx 제거. --yes 없이 실행하면 지울 것만 보여준다
+                                 --all: 이 PC의 모든 프로젝트와 ~/.local/share/devctx(설치본, 개인 선호, 모델 평가)까지 제거
 
 내부용: devctx hook --tool <tool> --event <event>, devctx git-hook <name>
 `;
@@ -787,31 +788,83 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case 'uninstall': {
-      const root = flag(args, 'root') ? path.resolve(flag(args, 'root') as string) : (gitToplevel(process.cwd()) ?? process.cwd());
-      const ko = loadConfig(projectPaths(root)).language === 'ko';
       const apply = has(args, 'yes');
-      const report = uninstall(root, { apply, keepHistory: has(args, 'keep-history') });
-      if (report.steps.length === 0) {
-        console.log(ko ? '이 저장소에 devctx가 설치되어 있지 않다.' : 'devctx is not installed in this repository.');
+      const keepHistory = has(args, 'keep-history');
+      const all = has(args, 'all');
+      const here = flag(args, 'root') ? path.resolve(flag(args, 'root') as string) : (gitToplevel(process.cwd()) ?? process.cwd());
+      const ko = all || loadConfig(projectPaths(here)).language === 'ko';
+      const printSteps = (report: UninstallReport | { steps: UninstallStep[]; notes?: string[] }): void => {
+        for (const n of report.notes ?? []) console.log(`  ${ko ? '참고' : 'note'}   ${n}`);
+        for (const s of report.steps) {
+          const verb = s.action === 'remove' ? (ko ? '삭제' : 'remove') : ko ? '수정' : 'edit';
+          console.log(`  ${verb.padEnd(6)} ${s.target}${s.note ? `  (${s.note})` : ''}`);
+        }
+      };
+      const commitHint = (report: UninstallReport): void => {
+        if (!apply || report.commitPaths.length === 0) return;
+        console.log(ko ? '  팀원에게도 반영하려면 커밋한다:' : '  Commit it so the team gets it too:');
+        console.log(`    git add -A -- ${report.commitPaths.join(' ')}`);
+        console.log(`    git commit -m "${ko ? 'chore: devctx 제거' : 'chore: remove devctx'}"`);
+      };
+      const teammates = ko
+        ? '- 팀원은 이 커밋을 pull한 뒤 각자 PC에 남은 것(.devctx/local, git hook 블록, Copilot·Kiro 허용 항목)을 지운다: npx --yes github:mhlee-lee/devctx uninstall --yes'
+        : '- After pulling it, each teammate clears what stays on their PC (.devctx/local, git hook blocks, Copilot/Kiro entries): npx --yes github:mhlee-lee/devctx uninstall --yes';
+
+      if (!all) {
+        const report = uninstall(here, { apply, keepHistory });
+        if (report.steps.length === 0) {
+          console.log(ko ? '이 저장소에 devctx가 설치되어 있지 않다.' : 'devctx is not installed in this repository.');
+          return 0;
+        }
+        console.log(apply ? (ko ? 'devctx를 제거했다:' : 'Removed devctx:') : ko ? '제거할 것 (실행하려면 devctx uninstall --yes):' : 'Would remove (run devctx uninstall --yes):');
+        printSteps(report);
+        commitHint(report);
+        if (apply) {
+          if (report.commitPaths.length > 0) console.log(teammates);
+          const left = registeredProjects();
+          console.log(
+            left.length > 0
+              ? ko
+                ? `- 이 PC의 다른 프로젝트 ${left.length}개가 devctx를 쓰고 있어 공용 데이터(~/.local/share/devctx/)는 남겨 둔다. 이 PC에서 모두 지우려면: devctx uninstall --all`
+                : `- ${left.length} other project(s) on this PC still use devctx, so ~/.local/share/devctx/ stays. To remove everything from this PC: devctx uninstall --all`
+              : ko
+                ? '- 이 PC에서 devctx를 쓰는 다른 프로젝트가 없다. 공용 데이터(설치본, 개인 선호, 모델 평가)와 전역 명령까지 지우려면: devctx uninstall --all'
+                : '- No other project on this PC uses devctx. To remove its shared data (installs, personal rules, model evaluations) too: devctx uninstall --all',
+          );
+        }
         return 0;
       }
-      console.log(apply ? (ko ? 'devctx를 제거했다:' : 'Removed devctx:') : ko ? '제거할 것 (실행하려면 devctx uninstall --yes):' : 'Would remove (run devctx uninstall --yes):');
-      for (const s of report.steps) {
-        const verb = s.action === 'remove' ? (ko ? '삭제' : 'remove') : ko ? '수정' : 'edit';
-        console.log(`  ${verb.padEnd(6)} ${s.target}${s.note ? `  (${s.note})` : ''}`);
+
+      // Everything on this PC: every project it knows (and the one we are in), then its own data.
+      const real = (p: string): string => {
+        try {
+          return fs.realpathSync(p);
+        } catch {
+          return path.resolve(p);
+        }
+      };
+      const current = findProjectRoot(here);
+      const roots = [...new Set([...(current ? [real(current)] : []), ...registeredProjects()])];
+      console.log(apply ? '이 PC에서 devctx를 모두 제거했다.' : '이 PC에서 지울 것 (실행하려면 devctx uninstall --all --yes):');
+      let committed = false;
+      for (const root of roots) {
+        const report = uninstall(root, { apply, keepHistory });
+        if (report.steps.length === 0) continue;
+        console.log(`\n${root}`);
+        printSteps(report);
+        commitHint(report);
+        committed ||= report.commitPaths.length > 0;
       }
-      if (apply && report.commitPaths.length > 0) {
-        console.log(ko ? '\n팀원에게도 반영하려면 커밋한다:' : '\nCommit it so the team gets it too:');
-        console.log(`  git add -A -- ${report.commitPaths.join(' ')}`);
-        console.log(`  git commit -m "${ko ? 'chore: devctx 제거' : 'chore: remove devctx'}"`);
+      const machine = uninstallMachine(apply);
+      if (machine.length > 0) {
+        console.log('\n이 PC의 devctx 데이터');
+        printSteps({ steps: machine });
       }
-      if (apply) {
-        console.log(
-          ko
-            ? '- 이 PC의 공용 데이터(개인 선호, 모델 평가, 설치본)는 ~/.local/share/devctx/에 남아 있다. 다른 저장소에서 쓰지 않으면 지워도 된다.'
-            : '- Data shared by every repository on this PC (personal preferences, model evaluations, installs) stays in ~/.local/share/devctx/.',
-        );
-      }
+      if (roots.length === 0 && machine.length === 0) console.log('  이 PC에 devctx가 남긴 것이 없다.');
+      if (apply && committed) console.log(`\n${teammates}`);
+      const bin = globalCommand();
+      if (bin) console.log(`\n- 전역 devctx 명령(${bin})은 npm이 관리한다. 지우려면: npm rm -g devctx (npm link로 연결했어도 같다)`);
+      console.log('- 목록에 없는 프로젝트(이 PC에서 init이나 hook이 한 번도 돌지 않은 clone)는 그 안에서 devctx uninstall --yes로 지운다.');
       return 0;
     }
 

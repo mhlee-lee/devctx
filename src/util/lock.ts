@@ -43,9 +43,14 @@ function alive(pid: number): boolean {
 
 /** A live holder within `staleMs` keeps the lock. */
 export function lockHeld(file: string, staleMs: number): boolean {
+  return lockHolder(file, staleMs) !== null;
+}
+
+/** The pid of the live holder within `staleMs`, or null. */
+export function lockHolder(file: string, staleMs: number): number | null {
   const read = readInfo(file);
-  if (!read?.info) return false;
-  return alive(read.info.pid) && Date.now() - read.info.at < staleMs;
+  if (!read?.info) return null;
+  return alive(read.info.pid) && Date.now() - read.info.at < staleMs ? read.info.pid : null;
 }
 
 export interface LockHandle {

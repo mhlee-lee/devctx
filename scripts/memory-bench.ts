@@ -88,6 +88,9 @@ const verbose = process.argv.includes('-v');
 // throwaway directory, never to the data of the person running the suite.
 const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-home-'));
 process.env.DEVCTX_HOME = benchHome;
+// The Copilot CLI and Kiro permission files (and the copies devctx keeps of them) are the user's own.
+process.env.COPILOT_HOME = path.join(benchHome, 'copilot');
+process.env.KIRO_HOME = path.join(benchHome, 'kiro');
 
 // ---------------------------------------------------------------------------------------------
 // Harness
@@ -1426,7 +1429,7 @@ console.log('init by ' + v);
       moved?.source === `git+file://${upstream}#${newSha}` && moved.version === '0.2.0' && readText(path.join(app, 'init-args'))?.includes('--tools claude,codex') === true && viaShim.stdout.trim() === '0.2.0',
       all.stdout + all.stderr + viaShim.stderr,
     );
-    check('update', 'a project that cannot be updated is reported without stopping the others (exit 1)', all.status === 1 && /실패\s+0\.1\.0\s+\S*broken/.test(all.stdout) && /업데이트함\s+0\.1\.0 -> 0\.2\.0\s+\S*app/.test(all.stdout), all.stdout);
+    check('update', 'a project that cannot be updated is reported without stopping the others (exit 1)', all.status === 1 && /실패\s+[\d.]+\s+\S*broken/.test(all.stdout) && /업데이트함\s+[\d.]+ -> 0\.2\.0\s+\S*app/.test(all.stdout), all.stdout);
     const rerun = runCli(['update', '--root', app], tmp);
     check('update', '--root updates only that project; one on the newest release is left alone', rerun.status === 0 && rerun.stdout.includes('최신이다') && !rerun.stdout.includes('init by') && !rerun.stdout.includes('broken'), rerun.stdout);
     uninstall(broken, { apply: true, keepHistory: false });
@@ -1890,12 +1893,87 @@ console.log('init by ' + v);
       traces.length === 0 &&
         !fs.existsSync(path.join(un, '.devctx')) &&
         readText(path.join(un, 'AGENTS.md')) === '# 팀 안내\n사람이 쓴 문단\n' &&
-        readText(path.join(un, '.gitignore')) === 'node_modules/\n' &&
+        readText(path.join(un, '.gitignore')) === 'node_modules/\n/.devctx/\n' &&
         !fs.existsSync(path.join(un, '.gitattributes')) &&
         JSON.stringify(settings) === JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: './scripts/lint.sh' }] }] }, model: 'x' }) &&
         hookFiles.length === 0,
       JSON.stringify({ traces, settings, hookFiles }),
     );
+    check(
+      'uninstall',
+      'folders devctx created are removed once empty, folders with other files stay, and this PC forgets the repository\'s settings',
+      !['.codex', '.cursor', '.agents'].some((d) => fs.existsSync(path.join(un, d))) && fs.existsSync(path.join(un, '.claude/settings.json')) && !historyEnabled(un),
+    );
+    // A teammate pulls the removal: their untracked local data must not show up for `git add -A`.
+    fs.mkdirSync(path.join(un, '.devctx/local'), { recursive: true });
+    fs.writeFileSync(path.join(un, '.devctx/local/state.sqlite'), 'prompts');
+    const leftover = git(['status', '--porcelain', '--untracked-files=all'], un).stdout;
+    fs.rmSync(path.join(un, '.devctx'), { recursive: true, force: true });
+    runInit({ root: un, tools: ['claude'], language: 'ko', gitHooks: false, force: false, codeIndex: false, source: null });
+    const reignored = git(['check-ignore', '-q', '.devctx/config.yaml'], un).ok;
+    check(
+      'uninstall',
+      "a teammate's leftover .devctx stays out of commits after the removal; installing again drops that line",
+      !leftover.includes('.devctx') && !reignored && !(readText(path.join(un, '.gitignore')) ?? '').split('\n').includes('/.devctx/'),
+      leftover,
+    );
+
+    // Background work still running is waited for, then stopped; a reused pid of another program is left alone.
+    const bg = repo('uninstall-bg');
+    runInit({ root: bg, tools: ['claude'], language: 'ko', gitHooks: false, force: false, codeIndex: false, source: null });
+    const pkg = path.join(tmp, 'fake-devctx');
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(pkg, 'cli.js'), 'setTimeout(() => {}, 60000);\n');
+    fs.writeFileSync(path.join(pkg, 'other.js'), 'setTimeout(() => {}, 60000);\n');
+    // Started through a shell that exits, so they are not this process's children (no zombies).
+    const startBg = (script: string, arg: string): number => Number(spawnSync('/bin/sh', ['-c', `"${process.execPath}" "${script}" ${arg} >/dev/null 2>&1 </dev/null & echo $!`], { encoding: 'utf8' }).stdout.trim());
+    const worker = startBg(path.join(pkg, 'cli.js'), 'worker');
+    const other = startBg(path.join(pkg, 'other.js'), 'index');
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    fs.writeFileSync(projectPaths(bg).workerLock, JSON.stringify({ pid: worker, at: Date.now() }));
+    fs.writeFileSync(path.join(bg, '.devctx/local/code.lock'), JSON.stringify({ pid: other, at: Date.now() }));
+    const stopped = uninstall(bg, { apply: true, keepHistory: false, waitMs: 300 });
+    await new Promise((r) => setTimeout(r, 300));
+    check(
+      'uninstall',
+      'devctx background work still running is stopped before .devctx is removed; another program with a reused pid is not',
+      !isAlive(worker) && isAlive(other) && !fs.existsSync(path.join(bg, '.devctx')) && stopped.notes.some((n) => n.includes(String(worker))),
+      JSON.stringify({ worker: isAlive(worker), other: isAlive(other), notes: stopped.notes }),
+    );
+    for (const pid of [worker, other]) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // gone
+      }
+    }
+
+    // `uninstall --all`: every project on this PC and devctx's own data, after a preview.
+    const allHome = process.env.DEVCTX_HOME;
+    process.env.DEVCTX_HOME = path.join(tmp, 'all-home');
+    const p1 = repo('all-1');
+    const p2 = repo('all-2');
+    for (const p of [p1, p2]) runInit({ root: p, tools: ['claude'], language: 'ko', gitHooks: true, force: false, codeIndex: false, source: null });
+    const copilotBackup = path.join(process.env.COPILOT_HOME as string, 'permissions-config.json.devctx-backup');
+    fs.mkdirSync(path.dirname(copilotBackup), { recursive: true });
+    fs.writeFileSync(copilotBackup, '{}');
+    const preview = run(['uninstall', '--all'], tmp);
+    const untouched = [p1, p2].every((p) => fs.existsSync(path.join(p, '.devctx'))) && fs.existsSync(process.env.DEVCTX_HOME) && fs.existsSync(copilotBackup);
+    const gone = run(['uninstall', '--all', '--yes'], tmp);
+    check(
+      'uninstall',
+      'uninstall --all previews, then removes devctx from every project on this PC and its data directory and backup copies',
+      untouched && preview.stdout.includes('all-2') && gone.status === 0 && [p1, p2].every((p) => !fs.existsSync(path.join(p, '.devctx'))) && !fs.existsSync(process.env.DEVCTX_HOME) && !fs.existsSync(copilotBackup),
+      preview.stdout + gone.stdout + gone.stderr,
+    );
+    process.env.DEVCTX_HOME = allHome;
   } finally {
     for (const [k, v] of [['DEVCTX_HOME', saved.home], ['DEVCTX_FAKE_LLM', saved.fake]] as const) {
       if (v === undefined) delete process.env[k];
