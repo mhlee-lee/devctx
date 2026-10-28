@@ -51,6 +51,8 @@ import { GENERATED_MARKER, hasAgentsBlock, renderAgentsBlock, RULES_FILE, withAg
 import { recentChanges, sessionContext } from '../src/hooks/context.ts';
 import { runInit } from '../src/init/init.ts';
 import { installKey, readToolsLock, renderShim, renderToolsLock, shimStatus } from '../src/init/shim.ts';
+import { registeredProjects, registerProject } from '../src/init/projects.ts';
+import { gitRemoteUrls, latestReleaseTag } from '../src/init/update.ts';
 import { approveProposal, discardProposal, listProposals, resolveConflict } from '../src/memory/manual.ts';
 import { agentAccessStatus, BACKUP_SUFFIX, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
@@ -81,6 +83,11 @@ import { runWorker } from '../src/worker.ts';
 import { approxTokens, today } from '../src/util/text.ts';
 
 const verbose = process.argv.includes('-v');
+
+// Machine-level state (the project registry `init` writes, router state, personal rules) goes to a
+// throwaway directory, never to the data of the person running the suite.
+const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-home-'));
+process.env.DEVCTX_HOME = benchHome;
 
 // ---------------------------------------------------------------------------------------------
 // Harness
@@ -1352,6 +1359,84 @@ let paraphraseLine = '';
     const kept = readToolsLock(projectPaths(initRoot).toolsLock);
     check('install', 'an exact npm source sets the version; re-running init moves neither', pinned?.version === '0.3.0' && kept?.version === '0.3.0' && kept.source === '@team/devctx@0.3.0', JSON.stringify(kept));
 
+    // `devctx update`: the newest release tag by number (annotated tags peeled, pre-releases skipped).
+    const sha = (c: string) => c.repeat(40);
+    const tags = [`${sha('a')}\trefs/tags/v0.2.0`, `${sha('b')}\trefs/tags/v0.2.0^{}`, `${sha('c')}\trefs/tags/v0.10.0`, `${sha('d')}\trefs/tags/v0.11.0-beta`, `${sha('e')}\trefs/tags/v0.9.9`].join('\n');
+    const newest = latestReleaseTag(tags);
+    check('update', 'the newest release tag is compared by number, not by name, and skips pre-releases', newest?.version === '0.10.0' && newest.sha === sha('c') && latestReleaseTag(tags.split('\n').slice(0, 2).join('\n'))?.sha === sha('b'), JSON.stringify(newest));
+    check(
+      'update',
+      'hosted git shortcuts are looked up over https, then ssh (the order npm clones them in)',
+      JSON.stringify(gitRemoteUrls('github:team/devctx#abc')) === JSON.stringify(['https://github.com/team/devctx.git', 'git@github.com:team/devctx.git']) && gitRemoteUrls('team/devctx')[1] === 'git@github.com:team/devctx.git' && JSON.stringify(gitRemoteUrls('git+ssh://git@host/x.git#abc')) === JSON.stringify(['ssh://git@host/x.git']),
+    );
+
+    // End to end: a devctx repository with release tags, a project pinned to an older commit. Its
+    // own machine directory, so `--all` sees only the projects made here.
+    const sectionHome = process.env.DEVCTX_HOME;
+    process.env.DEVCTX_HOME = path.join(tmp, 'update-home');
+    const upstream = path.join(tmp, 'upstream');
+    fs.mkdirSync(path.join(upstream, 'dist'), { recursive: true });
+    git(['init', '-q'], upstream);
+    git(['config', 'user.email', 'dev@example.com'], upstream);
+    git(['config', 'user.name', 'Dev'], upstream);
+    // Stands in for the new version's init: records how it was called and moves tools.lock.
+    fs.writeFileSync(
+      path.join(upstream, 'dist/cli.js'),
+      `const fs = require('fs'), path = require('path'), a = process.argv.slice(2), get = (k) => a[a.indexOf(k) + 1];
+const v = require('../package.json').version;
+if (a[0] === 'version') { console.log(v); process.exit(0); }
+fs.writeFileSync(path.join(get('--root'), '.devctx/tools.lock'), 'devctx_version: ' + v + '\\ndevctx_source: ' + get('--source') + '\\n');
+fs.writeFileSync(path.join(get('--root'), 'init-args'), a.join(' '));
+console.log('init by ' + v);
+`,
+    );
+    const release = (version: string, tag: string | null): string => {
+      fs.writeFileSync(path.join(upstream, 'package.json'), JSON.stringify({ name: 'devctx', version }));
+      git(['add', '-A'], upstream);
+      git(['commit', '-qm', version], upstream);
+      if (tag) git(['tag', '-a', tag, '-m', tag], upstream);
+      return git(['rev-parse', 'HEAD'], upstream).stdout;
+    };
+    const oldSha = release('0.1.0', null);
+    const newSha = release('0.2.0', 'v0.2.0');
+    const project = (name: string, source: string): string => {
+      const dir = path.join(tmp, name);
+      fs.mkdirSync(dir);
+      git(['init', '-q'], dir);
+      runInit({ root: dir, tools: ['claude', 'codex'], language: 'ko', gitHooks: false, force: false, codeIndex: false, source });
+      return dir;
+    };
+    const app = project('app', `git+file://${upstream}#${oldSha}`);
+    // Set up by a devctx without the registry: running update inside it still includes it.
+    fs.rmSync(path.join(process.env.DEVCTX_HOME, 'projects.json'), { force: true });
+    const checked = runCli(['update', '--check'], app);
+    check(
+      'update',
+      'update --check reports the newest release and changes nothing; the project it runs in is included (and registered) even when it was not registered',
+      checked.status === 0 && checked.stdout.includes('0.2.0') && readToolsLock(projectPaths(app).toolsLock)?.source.endsWith(oldSha) === true && registeredProjects().includes(app),
+      checked.stdout + checked.stderr,
+    );
+    const broken = project('broken', `git+file://${path.join(tmp, 'gone')}#${sha('0')}`);
+    const all = runCli(['update'], tmp);
+    const moved = readToolsLock(projectPaths(app).toolsLock);
+    const viaShim = spawnSync('/bin/sh', [projectPaths(app).shim, 'version'], { encoding: 'utf8', env: { ...process.env, DEVCTX_CLI: '' } });
+    check(
+      'update',
+      'update (every registered project by default) moves each to the newest release with that version itself (keeping its tools), where the shim finds it',
+      moved?.source === `git+file://${upstream}#${newSha}` && moved.version === '0.2.0' && readText(path.join(app, 'init-args'))?.includes('--tools claude,codex') === true && viaShim.stdout.trim() === '0.2.0',
+      all.stdout + all.stderr + viaShim.stderr,
+    );
+    check('update', 'a project that cannot be updated is reported without stopping the others (exit 1)', all.status === 1 && /실패\s+0\.1\.0\s+\S*broken/.test(all.stdout) && /업데이트함\s+0\.1\.0 -> 0\.2\.0\s+\S*app/.test(all.stdout), all.stdout);
+    const rerun = runCli(['update', '--root', app], tmp);
+    check('update', '--root updates only that project; one on the newest release is left alone', rerun.status === 0 && rerun.stdout.includes('최신이다') && !rerun.stdout.includes('init by') && !rerun.stdout.includes('broken'), rerun.stdout);
+    uninstall(broken, { apply: true, keepHistory: false });
+    git(['add', '-A'], app);
+    git(['-c', 'user.email=dev@example.com', '-c', 'user.name=Dev', 'commit', '-qm', 'setup'], app);
+    git(['worktree', 'add', '-q', path.join(tmp, 'app-wt')], app);
+    registerProject(path.join(tmp, 'app-wt'));
+    check('update', 'uninstall drops a project from the registry; linked worktrees are never added', JSON.stringify(registeredProjects()) === JSON.stringify([app]) && fs.existsSync(path.join(tmp, 'app-wt/.devctx/tools.lock')), JSON.stringify(registeredProjects()));
+    process.env.DEVCTX_HOME = sectionHome;
+
     // A project for the commands below.
     const repo = path.join(tmp, 'repo');
     fs.mkdirSync(repo);
@@ -2454,4 +2539,5 @@ console.log(`injected sets      precision ${precision.toFixed(2)}, recall ${reca
 if (paraphraseLine) console.log(`paraphrased        ${paraphraseLine}`);
 if (speedLine) console.log(`speed              ${speedLine}`);
 console.log(`total              ${results.length - failed.length}/${results.length}`);
+fs.rmSync(benchHome, { recursive: true, force: true });
 process.exitCode = failed.length > 0 ? 1 : 0;

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import path from 'node:path';
 import { compile } from './compile/compile.ts';
 import { loadConfig } from './config.ts';
@@ -8,6 +9,8 @@ import { runHook } from './hooks/entry.ts';
 import { runInit } from './init/init.ts';
 import { uninstall } from './init/uninstall.ts';
 import { packageInfo } from './init/shim.ts';
+import { registeredProjects, registerProject } from './init/projects.ts';
+import { updateProject, type UpdateResult } from './init/update.ts';
 import type { KnowledgeItem } from './knowledge/types.ts';
 import { overlappingRules } from './knowledge/overlap.ts';
 import { applyCachedStale, loadPersonal, loadTeam } from './knowledge/view.ts';
@@ -106,6 +109,10 @@ const HELP = `devctx — project decision memory for AI coding tools
   devctx init [--tools claude,codex,copilot,cursor,kiro] [--source <npm|git|path>] [--lang ko|en]
               [--no-code-index] [--no-git-hooks] [--no-home-permissions] [--force]
                                  --no-home-permissions: 이 PC의 ~/.copilot, ~/.kiro 권한 파일은 건드리지 않는다 (PC별로 기억)
+  devctx update [--check] [--root <프로젝트>] [--source <npm|git|path>]
+                                 이 PC에서 devctx를 쓰는 모든 프로젝트를 최신 릴리스로 올리고, 그 버전으로 tools.lock·실행 스크립트·hook·스킬을 갱신 (결과는 프로젝트마다 커밋)
+                                 --root: 그 프로젝트만, --check: 바꾸지 않고 새 버전만 확인
+                                 --source: 이 프로젝트(또는 --root)만 최신 대신 이 위치로 고정 (예: github:owner/devctx#<커밋 SHA>)
   devctx status                  기록된 결정 목록
   devctx code [status]           코드 인덱스 상태, 저장소 언어, 스킬·사전 허용 설치 상태
   devctx code index              지금 색인 (바뀐 파일만 다시 파싱)
@@ -278,6 +285,56 @@ async function main(argv: string[]): Promise<number> {
       // Registered by earlier versions; the session hook removes those MCP entries.
       process.stderr.write('devctx: the code index MCP server was replaced by the devctx-code skill (run "devctx init" to update the tool configs)\n');
       return 1;
+
+    case 'update': {
+      const source = flag(args, 'source');
+      if (has(args, 'source') && !source) throw new Error('--source에 설치 위치가 없다 (예: --source github:mhlee-lee/devctx#<커밋 SHA>)');
+      const check = has(args, 'check');
+      const real = (p: string): string => {
+        try {
+          return fs.realpathSync(p);
+        } catch {
+          return path.resolve(p);
+        }
+      };
+      // Every project on this PC by default. The one we are in comes first, also when it is not
+      // registered yet (set up by a devctx version without the registry). `--root` and `--source`
+      // (projects may come from different sources) are about one project only.
+      const explicit = flag(args, 'root');
+      const here = explicit ? (findProjectRoot(path.resolve(explicit)) ?? path.resolve(explicit)) : findProjectRoot(process.cwd());
+      if (source && !here) throw new Error('--source는 프로젝트 하나에만 적용한다. 그 프로젝트 안에서 실행하거나 --root <경로>를 준다');
+      const single = Boolean(explicit || source);
+      const roots = [...new Set([...(here ? [real(here)] : []), ...(single ? [] : registeredProjects())])];
+      if (roots.length === 0) {
+        console.log('이 PC에 등록된 프로젝트가 없다. 프로젝트에서 devctx init을 실행하거나, 그 프로젝트 안에서 devctx update를 실행하면 등록된다.');
+        return 0;
+      }
+      const cache = { latest: new Map(), installed: new Map() };
+      const results: UpdateResult[] = [];
+      for (const root of roots) {
+        if (results.length > 0) console.log('');
+        console.log(`devctx update${check ? ' --check' : ''}: ${root}`);
+        const r = updateProject(root, { source, check, print: (line) => console.log(line), cache });
+        if (r.status === 'failed') console.log(`  실패  ${r.error}`);
+        else registerProject(root);
+        results.push(r);
+      }
+      const updated = results.filter((r) => r.status === 'updated');
+      const many = results.length > 1;
+      if (many) {
+        const label = { updated: '업데이트함', current: '최신', available: '새 버전 있음', failed: '실패' } as const;
+        // Hangul takes two terminal columns.
+        const pad = (s: string, width: number): string => s + ' '.repeat(Math.max(1, width - [...s].reduce((n, c) => n + (/[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/.test(c) ? 2 : 1), 0)));
+        console.log(`\n요약 (${results.length}개 프로젝트):`);
+        for (const r of results) {
+          const move = r.status === 'updated' || r.status === 'available' ? `${r.from?.version || '?'} -> ${r.version ?? '?'}` : (r.from?.version ?? '');
+          console.log(`  ${pad(label[r.status], 13)}${pad(move, 18)}${r.root}${r.error ? `: ${r.error}` : ''}`);
+        }
+      }
+      if (updated.length > 0) console.log(`\n${many ? '업데이트한 프로젝트마다 위의 git add·commit을 실행한다. ' : ''}커밋하면 팀원 PC의 hook도 다음 실행 때 새 버전을 설치해 쓴다.`);
+      if (check && results.some((r) => r.status === 'available')) console.log(`\n적용: devctx update${explicit ? ` --root ${explicit}` : ''}`);
+      return results.some((r) => r.status === 'failed') ? 1 : 0;
+    }
 
     case 'code': {
       const sub = args.positional[0] ?? 'status';

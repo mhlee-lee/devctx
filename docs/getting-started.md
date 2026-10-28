@@ -205,7 +205,7 @@ LLM이 사용자가 하지 않은 말(도구 이름, 버전 등)을 규칙에 �
   git add .devctx/knowledge
   git commit -m "chore: devctx 결정" -- .devctx/knowledge
   ```
-- `--source`로 설치 위치를 바꾸거나 devctx를 업데이트한 뒤 `devctx init`을 다시 실행했으면, 출력되는 `git add` 명령으로 `.devctx/tools.lock`과 `.devctx/bin/devctx`를 커밋해야 팀원에게 반영된다. 실행 스크립트가 다른 버전이면 `devctx doctor`가 `shim version`으로 알린다.
+- devctx 새 버전으로 옮기려면 `devctx update`(이 PC의 모든 프로젝트, 하나만은 `--root <프로젝트>`)를 실행하고, 출력되는 `git add` 명령으로 `.devctx/tools.lock`과 `.devctx/bin/devctx` 등을 커밋해야 팀원에게 반영된다. `--source`로 설치 위치를 직접 바꾸고 `devctx init`을 다시 실행했을 때도 같다. 실행 스크립트가 다른 버전이면 `devctx doctor`가 `shim version`으로 알린다.
 
 ## 9. 알아둘 한계
 

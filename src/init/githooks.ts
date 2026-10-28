@@ -94,6 +94,13 @@ export function gitHooksInstalled(root: string): boolean {
   return GIT_HOOKS.every((name) => readText(path.join(dir, name))?.includes(BEGIN) ?? false);
 }
 
+/** Any git hook has devctx's block (installed once, maybe partly removed since). */
+export function gitHooksPresent(root: string): boolean {
+  const dir = gitHooksDir(root);
+  if (!dir) return false;
+  return GIT_HOOKS.some((name) => readText(path.join(dir, name))?.includes(BEGIN) ?? false);
+}
+
 /** Why the git hooks cannot be installed automatically (null when they can). */
 export function gitHooksBlocked(root: string): string | null {
   const dir = gitHooksDir(root);

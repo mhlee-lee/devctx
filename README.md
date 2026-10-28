@@ -40,6 +40,8 @@ npm link      # devctx 명령을 전역에 연결
 devctx version
 ```
 
+`npm link`는 clone한 폴더를 전역 `devctx` 명령으로 연결할 뿐이다. 프로젝트의 hook은 전역 명령을 쓰지 않고, 프로젝트마다 커밋된 `.devctx/bin/devctx`가 `.devctx/tools.lock`에 고정된 버전을 실행한다([팀원과 공유](#팀원과-공유)). 새 버전으로 옮기는 방법은 [devctx 업데이트](#devctx-업데이트)에 있다.
+
 ## 프로젝트에 적용
 
 ```sh
@@ -125,9 +127,29 @@ git add -A -- .devctx && git commit -m "chore: devctx 설치 위치 고정"
 
 `devctx doctor`가 로컬 경로를 쓰고 있으면 알려준다.
 
-`tools.lock`은 팀이 함께 쓰는 고정값이라 `devctx init`을 다시 실행해도(hook·스킬 갱신) 바뀌지 않는다. 바꾸는 것은 `--source`를 줄 때뿐이고, 그때 버전은 그 위치를 따른다(정확한 npm 버전이면 그 버전, git 주소면 지금 실행 중인 devctx의 버전). 그래서 버전 이름과 실제 코드가 어긋나지 않는다. devctx를 올린 뒤 팀도 옮기려면 새 커밋 SHA나 버전으로 `--source`를 주고 다시 커밋한다.
+`tools.lock`은 팀이 함께 쓰는 고정값이라 `devctx init`을 다시 실행해도(hook·스킬 갱신) 바뀌지 않는다. 바꾸는 것은 `--source`를 줄 때뿐이고, 그때 버전은 그 위치를 따른다(정확한 npm 버전이면 그 버전, git 주소면 지금 실행 중인 devctx의 버전). 그래서 버전 이름과 실제 코드가 어긋나지 않는다. devctx를 올린 뒤 팀도 옮기려면 `devctx update`를 실행하고 커밋한다([devctx 업데이트](#devctx-업데이트)).
 
-`.devctx/bin/devctx`(실행 스크립트)도 커밋된 파일이라 devctx를 업데이트해도 저절로 바뀌지 않는다. 다른 버전의 devctx가 쓴 스크립트면 `devctx doctor`가 `shim version`으로 알리고, `devctx init`을 다시 실행해 커밋하면 된다.
+`.devctx/bin/devctx`(실행 스크립트)도 커밋된 파일이라 devctx를 업데이트해도 저절로 바뀌지 않는다. 다른 버전의 devctx가 쓴 스크립트면 `devctx doctor`가 `shim version`으로 알리고, `devctx update`(또는 `devctx init`)를 실행해 커밋하면 된다.
+
+### devctx 업데이트
+
+devctx 저장소의 `main`에 패키지 변경(`src/`, `data/`, `vendor/`, `package.json`, `package-lock.json`, `tsconfig.json`)이 올라가면, CI가 검사를 통과한 뒤 patch 버전을 올린 커밋(`chore(release): v0.1.2`)을 `main`에 넣고 `v0.1.2` 태그를 단다. 문서만 바뀐 push는 버전을 올리지 않는다. minor·major로 올리려면 `package.json`의 버전을 직접 바꿔 push한다(아직 태그가 없는 버전이면 그대로 릴리스한다). CI가 `main`에 커밋을 넣으므로, devctx를 고치는 PC에서는 다음 작업 전에 `git pull`한다.
+
+프로젝트는 `devctx update`로 최신 릴리스로 옮긴다. 기본으로 이 PC에서 devctx를 쓰는 모든 프로젝트를 한 번에 옮긴다.
+
+```sh
+devctx update                   # 전역 devctx가 없으면 아무 프로젝트에서: .devctx/bin/devctx update
+devctx update --check           # 바꾸지 않고 새 버전만 확인
+devctx update --root <프로젝트>  # 그 프로젝트만
+# 출력되는 git add·commit을 프로젝트마다 실행한다
+```
+
+- 최신 버전은 프로젝트마다 `devctx_source`의 종류로 찾는다. git 주소면 그 저장소에서 가장 높은 `v<버전>` 태그를 찾아 그 커밋 SHA로 고정한다(태그가 아직 없으면 기본 브랜치의 최신 커밋). 정확한 npm 버전이면 레지스트리의 최신 버전, 로컬 경로면 그 checkout의 지금 버전이다. 같은 설치 위치를 쓰는 프로젝트끼리는 조회와 설치를 한 번만 한다.
+- `--source <위치>`를 주면 최신 대신 그 위치로 고정한다(되돌릴 때도 쓴다). 프로젝트마다 설치 위치가 다를 수 있어서 지금 있는 프로젝트(또는 `--root`)에만 적용한다.
+- 새 버전을 hook이 쓰는 자리(`~/.local/share/devctx/versions/`)에 설치한 뒤 **새 버전의** `devctx init --source <새 위치>`로 `tools.lock`, 실행 스크립트, hook, 스킬을 갱신한다. 지금 돌고 있는 이전 버전이 새 파일을 쓰지 않는다. 도구 선택은 `config.yaml`의 `targets`를 따르고, 설정과 결정 파일은 그대로다.
+- 커밋하면 clone한 팀원 PC의 hook이 다음 실행 때 새 버전을 백그라운드로 설치해 쓴다.
+- 디스크를 뒤지지 않는다. 이 PC에서 `devctx init`·`devctx update`를 실행했거나 hook이 하루 한 번 점검을 돈 저장소 목록(`~/.local/share/devctx/projects.json`)과, 지금 있는 프로젝트를 옮긴다. AI 도구가 만드는 linked worktree는 넣지 않고, `devctx uninstall`하거나 지운 저장소는 빠진다. 한 프로젝트가 실패해도 나머지는 계속하고, 끝에 프로젝트별 결과를 보여준다(하나라도 실패하면 종료 코드 1).
+- 목록이 생기기 전에 설치한 프로젝트는 그 안에서 `devctx update`를 한 번 실행하면 옮겨지고 목록에 들어간다. 이 프로젝트들은 `update` 명령이 없는 버전에 고정돼 있어 `.devctx/bin/devctx update`는 "알 수 없는 명령"으로 끝나므로, 처음 한 번은 새 버전의 전역 `devctx`(`git pull` 뒤 `npm install`, `npm link`)로 실행한다.
 
 ## 사용
 
@@ -268,6 +290,7 @@ Copilot CLI와 Kiro는 저장소 파일로 권한을 받지 않아서, 사용자
 | 명령 | 설명 |
 |---|---|
 | `devctx init [--tools claude,codex,...] [--source <npm\|git>] [--lang ko\|en] [--no-code-index]` | 저장소에 설치. 다시 실행하면 hook, 스킬, 권한 설정, 실행 스크립트를 갱신한다. 설치 위치(`devctx_source`)는 `--source`를 줄 때만 바꾼다 |
+| `devctx update [--check] [--root <프로젝트>] [--source <npm\|git\|path>]` | 이 PC의 모든 프로젝트를 최신 릴리스로 옮기고 그 버전으로 `tools.lock`·실행 스크립트·hook·스킬 갱신. `--root`는 그 프로젝트만, `--check`는 확인만 ([devctx 업데이트](#devctx-업데이트)) |
 | `devctx status` | 기록된 결정 목록, 히스토리·프롬프트 분석 켜짐 여부 |
 | `devctx code [status]` | 코드 인덱스 상태, 저장소 언어, 스킬·허용 설치 상태 |
 | `devctx code index` | 지금 색인 (바뀐 파일만 다시 파싱) |

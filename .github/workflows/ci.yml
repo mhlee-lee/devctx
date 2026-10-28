@@ -1,4 +1,5 @@
-# Typecheck and the two self-check suites on every push and pull request. The suites run with the
+# Typecheck and the two self-check suites on every push and pull request; on main, a release
+# (version bump and tag) after they pass. The suites run with the
 # test LLM provider (DEVCTX_FAKE_LLM) and never call a real AI CLI.
 name: ci
 
@@ -31,3 +32,44 @@ jobs:
         env:
           DEVCTX_OFFLINE: '1'
       - run: npm run bench:codeindex
+
+  # Every change to the package that reaches main gets the next patch version (package.json and
+  # package-lock.json) and a v<version> tag, once the checks above pass. `devctx update` moves
+  # projects to the newest tag. To release a minor or major version, set it in package.json yourself:
+  # an untagged version is released as it is.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Bump the version and tag it
+        run: |
+          # A later push is already on main: its own run releases both (only checked commits get a tag).
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then echo "main moved on; the newer run releases"; exit 0; fi
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -n "$last" ] && git diff --quiet "$last" HEAD -- src data vendor package.json package-lock.json tsconfig.json; then
+            echo "no package changes since $last"; exit 0
+          fi
+          current=$(node -p "require('./package.json').version")
+          if [ -z "$last" ] || git rev-parse -q --verify "refs/tags/v$current" >/dev/null; then
+            npm version patch --no-git-tag-version >/dev/null
+          fi
+          version=$(node -p "require('./package.json').version")
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git diff --quiet || git commit -qam "chore(release): v$version [skip ci]"
+          git tag -a "v$version" -m "v$version"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/v$version"
+          echo "released v$version"

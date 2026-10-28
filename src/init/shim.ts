@@ -76,6 +76,34 @@ function dataDir(): string {
   return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'devctx');
 }
 
+/** Where the shim installs each (version, source): `<dir>/<installKey>`. */
+export function versionsDir(): string {
+  return path.join(dataDir(), 'versions');
+}
+
+/** `dist/cli.js` (built) or else `src/cli.ts` (type stripping) of a devctx package directory. */
+export function packageCli(pkg: string): string | null {
+  return [path.join(pkg, 'dist', 'cli.js'), path.join(pkg, 'src', 'cli.ts')].find((f) => fs.existsSync(f)) ?? null;
+}
+
+/** The devctx package npm installed under `<prefix>/node_modules` (also a scoped one), as the shim looks for it. */
+export function installedPackage(prefix: string): string | null {
+  const base = path.join(prefix, 'node_modules');
+  const candidates = [path.join(base, 'devctx')];
+  try {
+    for (const scope of fs.readdirSync(base)) if (scope.startsWith('@')) candidates.push(path.join(base, scope, 'devctx'));
+  } catch {
+    // not installed
+  }
+  return candidates.find((pkg) => packageCli(pkg) !== null) ?? null;
+}
+
+/** A git URL or a hosted-git shortcut (`github:owner/repo`, `owner/repo`), as npm reads `devctx_source`. */
+export function isGitSource(source: string): boolean {
+  const s = source.trim();
+  return /^(github:|gitlab:|bitbucket:|git\+|git:\/\/|git@|https?:\/\/[^#]*\.git(#|$))/.test(s) || /^[\w.-]+\/[\w.-]+(#.*)?$/.test(s);
+}
+
 /**
  * What the committed shim finds on this PC. `devctx doctor` may itself run from a global install,
  * so it checks the hooks' own path: an install that npm refused shows up here, not as "ok".
@@ -84,27 +112,12 @@ export function shimStatus(root: string): ShimStatus {
   const lock = readToolsLock(path.join(root, '.devctx', 'tools.lock'));
   const status: ShimStatus = { lock, cli: null, installedVersion: null, failed: null, installing: false };
   if (!lock) return status;
-  const target = path.join(dataDir(), 'versions', installKey(lock));
-  const inModules = (base: string): string[] => {
-    const out = [path.join(base, 'devctx')];
-    try {
-      for (const scope of fs.readdirSync(base)) if (scope.startsWith('@')) out.push(path.join(base, scope, 'devctx'));
-    } catch {
-      // not installed
-    }
-    return out;
-  };
-  const pkgs = [
-    ...inModules(path.join(target, 'node_modules')),
-    ...(lock.source && fs.existsSync(lock.source) && fs.statSync(lock.source).isDirectory() ? [lock.source] : []),
-  ];
-  for (const pkg of pkgs) {
-    const cli = [path.join(pkg, 'dist', 'cli.js'), path.join(pkg, 'src', 'cli.ts')].find((f) => fs.existsSync(f));
-    if (cli) {
-      status.cli = cli;
-      status.installedVersion = readJson<{ version?: string }>(path.join(pkg, 'package.json'), {}).version ?? null;
-      break;
-    }
+  const target = path.join(versionsDir(), installKey(lock));
+  const local = lock.source && fs.existsSync(lock.source) && fs.statSync(lock.source).isDirectory() && packageCli(lock.source) ? lock.source : null;
+  const pkg = installedPackage(target) ?? local;
+  if (pkg) {
+    status.cli = packageCli(pkg);
+    status.installedVersion = readJson<{ version?: string }>(path.join(pkg, 'package.json'), {}).version ?? null;
   }
   if (!status.cli) {
     const local = path.join(root, 'node_modules', 'devctx', 'dist', 'cli.js');
@@ -128,8 +141,7 @@ export function shimStatus(root: string): ShimStatus {
 export function sourcePinProblem(source: string): string | null {
   const s = source.trim();
   if (!s || /^(\/|\.\/|\.\.\/|~)/.test(s)) return null; // local paths are reported separately
-  const git = /^(github:|gitlab:|bitbucket:|git\+|git:\/\/|git@|https?:\/\/[^#]*\.git(#|$))/.test(s) || /^[\w.-]+\/[\w.-]+(#.*)?$/.test(s);
-  if (git) {
+  if (isGitSource(s)) {
     const ref = s.includes('#') ? s.slice(s.indexOf('#') + 1) : '';
     if (/^[0-9a-f]{40}$/i.test(ref.replace(/^commit[:=]/, ''))) return null;
     return ref ? `git ref "${ref}" can be moved; pin a full commit SHA (#<40-hex>)` : 'git source without a ref follows the default branch; pin a full commit SHA (#<40-hex>)';

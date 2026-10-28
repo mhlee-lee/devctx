@@ -228,7 +228,7 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   // The committed shim is what every clone runs; one from an older devctx keeps its old behavior
   // (e.g. reusing an install after the source changed) until someone re-runs init and commits it.
   if (shimOk && readText(paths.shim) !== renderShim()) {
-    add('warn', 'shim version', '.devctx/bin/devctx was written by another devctx version; run "devctx init" and commit .devctx/bin/devctx so every clone gets the current one');
+    add('warn', 'shim version', '.devctx/bin/devctx was written by another devctx version; run "devctx update" (or "devctx init") and commit .devctx/bin/devctx so every clone gets the current one');
   }
   if (lock && path.isAbsolute(lock.source)) {
     const exists = fs.existsSync(path.join(lock.source, 'dist', 'cli.js')) || fs.existsSync(path.join(lock.source, 'src', 'cli.ts'));

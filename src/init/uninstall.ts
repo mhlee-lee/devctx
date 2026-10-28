@@ -11,6 +11,7 @@ import { installAgentAccess, removeLegacyMcp } from './access.ts';
 import { removeGitBlocks } from './attributes.ts';
 import { removeGitHooks } from './githooks.ts';
 import { removeToolHooks } from './hookconfigs.ts';
+import { unregisterProject } from './projects.ts';
 
 export interface UninstallStep {
   /** Path relative to the repository (or a description for things outside it). */
@@ -113,6 +114,7 @@ export function uninstall(root: string, opts: { apply: boolean; keepHistory: boo
     }
     step('.devctx', 'remove', keep ? 'decisions, settings, local data; .devctx/history kept' : 'decisions, settings, local data and prompt history');
   }
+  if (apply) unregisterProject(root);
   // `git add` fails on a path it never knew: keep files that exist or that git tracks.
   const known = [...touched].filter((rel) => fs.existsSync(path.join(root, rel)) || git(['ls-files', '--', rel], root, 5_000).stdout !== '');
   return { applied: apply, steps, commitPaths: known.sort() };

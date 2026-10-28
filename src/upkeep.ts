@@ -1,6 +1,7 @@
 import type { DevctxConfig } from './config.ts';
 import { ensureGitAttributes, ensureGitIgnore } from './init/attributes.ts';
 import { installAgentAccess, removeLegacyMcp } from './init/access.ts';
+import { registerProject } from './init/projects.ts';
 import { hookInstalled, installToolHooks } from './init/hookconfigs.ts';
 import { HOME_PERMISSIONS_KEY } from './init/init.ts';
 import type { StateDb } from './state/db.ts';
@@ -35,6 +36,8 @@ export function dailyUpkeep(root: string, cfg: DevctxConfig, db: StateDb): strin
     if (a.action !== 'unchanged' && a.action !== 'skipped') changed.push(`${a.action} ${a.file}`);
   }
   db.kvSet('access_checked', today());
+  // Known to `devctx update` on this PC, also when this clone was set up by its hooks.
+  registerProject(root);
   return changed;
 }
 

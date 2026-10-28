@@ -12,6 +12,7 @@ import { git } from '../util/git.ts';
 import { ensureGitHooks, type GitHookResult } from './githooks.ts';
 import { installAgentAccess, removeLegacyMcp, type AccessResult } from './access.ts';
 import { installToolHooks, type HookFileResult } from './hookconfigs.ts';
+import { registerProject } from './projects.ts';
 import { defaultSource, npmSpecVersion, packageInfo, readToolsLock, renderShim, renderToolsLock, sourcePinProblem } from './shim.ts';
 
 export interface InitOptions {
@@ -165,6 +166,7 @@ export function runInit(opts: InitOptions): InitReport {
   try {
     const result = compile(paths, cfg, db, { tool: 'cli', manual: true });
     if (result.agents === 'migrated') notes.push('AGENTS.md: the file an earlier version generated now holds your text from preamble.md plus the devctx block (preamble.md removed).');
+    registerProject(opts.root);
     return { root: opts.root, commitPaths: changedPaths(opts.root), written, notes, hookFiles, accessFiles, gitHooks, compile: result };
   } finally {
     db.close();
