@@ -18,7 +18,7 @@ import { codeStatus, EXIT_MEMORY_CAPPED, indexPass, refreshIndex } from './codei
 import { NOISY_GRAMMARS } from './codeindex/languages.ts';
 import { CODE_TOOLS, codeTool, parseToolArgs, usageLine } from './codeindex/tools-meta.ts';
 import { agentAccessStatus } from './init/access.ts';
-import { describeRoutes, NO_QUALIFIED_MODEL_ERROR, noProviderReason, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, workingHost, type Qualification } from './llm/router.ts';
+import { describeRoutes, NO_QUALIFIED_MODEL_ERROR, noProviderReason, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, refusalText, workingHost, type Qualification } from './llm/router.ts';
 import { SUITE_TASKS, type SuiteTask } from './llm/suite.ts';
 import { StateDb } from './state/db.ts';
 import { isHookKind, isToolId, TOOL_IDS, type ToolId } from './types.ts';
@@ -123,6 +123,7 @@ const HELP = `devctx — project decision memory for AI coding tools
   devctx compile [--check]       이 PC의 규칙 목록(.devctx/rules.md)과 도구별 경로 규칙 파일 다시 만들기 (--check: 변경 여부만 확인)
   devctx models [--refresh] [--host <tool>]
                                  작업(추출/판정/요약)별로 쓰는 모델, 후보 비용 순위와 평가 결과
+                                 --refresh: 모델 목록과, CLI가 이 계정에 제공하지 않던 모델을 다시 확인
   devctx models --qualify <provider> [--task extract|judge|summarize|all] [--limit N]
                                  싼 후보부터 요구사항 평가를 돌려 통과하는 첫 모델을 찾는다
   devctx history [on|off] [--discard]
@@ -466,6 +467,10 @@ async function main(argv: string[]): Promise<number> {
           for (const task of tasks) {
             console.log(`[${task}] ${target}: cheapest candidates first, until one meets every requirement`);
             const results = await qualifyProvider(cfg, target, task, limit, db, (r) => {
+              if (r.blocked === 'unavailable' || r.blocked === 'effort') {
+                console.log(`  ${'skip'.padEnd(6)} ${r.key}  ${refusalText(r.blocked)}`);
+                return;
+              }
               const verdict = r.blocked ? `blocked (${r.blocked})` : r.pass ? 'PASS' : 'fail';
               const cost = r.avgCostUsd === null ? '' : `  $${r.avgCostUsd.toFixed(4)}/call`;
               console.log(`  ${verdict.padEnd(6)} ${r.key}  ${r.score}${cost}`);
@@ -508,6 +513,7 @@ async function main(argv: string[]): Promise<number> {
         if (allowed.length > shown.length) console.log(`  ... ${allowed.length - shown.length} more candidates (pricier)`);
         const aboveTier = r.models.length - allowed.length;
         if (aboveTier > 0) console.log(`  ... ${aboveTier} above max_tier ${cfg.llm.max_tier} (used only when pinned)`);
+        if (r.unavailable.length > 0) console.log(`  not offered to this account: ${r.unavailable.join(', ')} (asked again after a CLI update, in 7 days, or with --refresh)`);
       }
       console.log('\nest/call: expected cost of one call incl. CLI overhead and reasoning effort (~ = price guessed from the name; Kiro: credits)');
       console.log('measured: mean cost of real calls so far. A candidate is used only after passing every requirement of the task.');

@@ -35,6 +35,20 @@ const DEFAULT_QUALIFY_BUDGET = 2;
 const QUALITY_STRIKES = 2;
 /** How long a provider is skipped after an account problem. */
 const BLOCK_TTL_MS: Partial<Record<FailureKind, number>> = { auth: 30 * 60 * 1000, quota: 6 * 60 * 60 * 1000 };
+/** How long a model the CLI refused is left out (also until the CLI version changes). */
+const NOTE_TTL_MS: Record<ModelNote['issue'], number> = { unavailable: 7 * 24 * 60 * 60 * 1000, 'no-effort': 30 * 24 * 60 * 60 * 1000 };
+
+/**
+ * What a CLI said about a model itself, whatever the task: it does not offer the model to this
+ * account (left out), or the model takes no reasoning effort (called once, without the setting).
+ */
+export interface ModelNote {
+  issue: 'unavailable' | 'no-effort';
+  error: string;
+  at: string;
+  /** CLI version that said it: another version is asked again. */
+  version: string | null;
+}
 
 export interface Qualification {
   /** pass/fail: verdict of the requirement suite. error: the evaluation could not run. */
@@ -77,6 +91,8 @@ interface RouterCache {
   /** Keyed by candidateKey. */
   stats: Record<string, Stats>;
   blocked: Record<string, ProviderBlock>;
+  /** Keyed by `${provider}:${model id}`. */
+  models: Record<string, ModelNote>;
 }
 
 export interface RouteOptions {
@@ -93,7 +109,8 @@ export interface RouteOptions {
 
 export type RouteResult<T> =
   | { ok: true; value: T; provider: ProviderId; model: string }
-  | { ok: false; error: string; attempts: string[] };
+  /** called: a model was run on this request and gave no usable answer (not just none to ask). */
+  | { ok: false; error: string; attempts: string[]; called?: boolean };
 
 function cacheFile(): string {
   return path.join(machineDir(), 'router.json');
@@ -106,12 +123,12 @@ function emptyStats(): Stats {
 function loadCache(): RouterCache {
   const c = readJson<Partial<RouterCache> & { version?: number } | null>(cacheFile(), null);
   if (c && c.version === 2) {
-    return { version: 2, discovery: c.discovery ?? {}, qualification: c.qualification ?? {}, stats: c.stats ?? {}, blocked: c.blocked ?? {} };
+    return { version: 2, discovery: c.discovery ?? {}, qualification: c.qualification ?? {}, stats: c.stats ?? {}, blocked: c.blocked ?? {}, models: c.models ?? {} };
   }
   // Version 1 verdicts came from a smaller suite: keep discovery and usage, re-evaluate models.
   const stats: Record<string, Stats> = {};
   for (const [key, s] of Object.entries(c?.stats ?? {})) stats[key] = { ...emptyStats(), ...s, strikes: {} };
-  return { version: 2, discovery: c?.discovery ?? {}, qualification: {}, stats, blocked: c?.blocked ?? {} };
+  return { version: 2, discovery: c?.discovery ?? {}, qualification: {}, stats, blocked: c?.blocked ?? {}, models: {} };
 }
 
 function saveCache(cache: RouterCache): void {
@@ -198,7 +215,7 @@ async function discover(
   cfg: DevctxConfig,
   cache: RouterCache,
   force: boolean,
-): Promise<{ version: string | null; models: ModelCandidate[] }> {
+): Promise<{ version: string | null; verdict: string | null; models: ModelCandidate[] }> {
   const prev = cache.discovery[provider.id];
   const version = await provider.version(bin);
   let models: ModelCandidate[];
@@ -220,13 +237,67 @@ async function discover(
       ...models.filter((m) => m.id !== pin),
     ];
   }
-  return { version, models };
+  return { version, verdict: verdictVersion(provider, version), models };
+}
+
+/**
+ * Version an evaluation verdict holds for: the CLI's, plus the provider revision when there is one
+ * (a verdict reached through an older way of calling or reading the CLI is evaluated again).
+ */
+function verdictVersion(provider: Provider, version: string | null): string | null {
+  return provider.revision ? `${version ?? '?'}+r${provider.revision}` : version;
+}
+
+function noteKey(model: Pick<ModelCandidate, 'provider' | 'id'>): string {
+  return `${model.provider}:${model.id}`;
+}
+
+/** The CLI's word about a model, while it holds (same CLI version, within its TTL). */
+function modelNote(cache: RouterCache, model: Pick<ModelCandidate, 'provider' | 'id'>, version: string | null): ModelNote | null {
+  const key = noteKey(model);
+  const note = cache.models[key];
+  if (!note) return null;
+  if (note.version !== version || Date.now() - Date.parse(note.at) > NOTE_TTL_MS[note.issue]) {
+    delete cache.models[key];
+    return null;
+  }
+  return note;
+}
+
+function noteModel(cache: RouterCache, model: ModelCandidate, kind: 'unavailable' | 'effort', error: string, version: string | null): void {
+  cache.models[noteKey(model)] = { issue: kind === 'effort' ? 'no-effort' : 'unavailable', error: error.slice(0, 300), at: new Date().toISOString(), version };
+}
+
+/** A candidate the CLI already refused: its model is not offered, or it asks an effort the model rejects. */
+function refused(cache: RouterCache, model: ModelCandidate, version: string | null): boolean {
+  const note = modelNote(cache, model, version);
+  return note !== null && (note.issue === 'unavailable' || model.effort !== null);
+}
+
+/**
+ * Models the CLI may be asked for: refused models left out, and a model that takes no reasoning
+ * effort becomes one candidate without the setting instead of one per effort level.
+ */
+function usable(models: readonly ModelCandidate[], cache: RouterCache, version: string | null): ModelCandidate[] {
+  const out = new Map<string, ModelCandidate>();
+  for (const model of models) {
+    const note = modelNote(cache, model, version);
+    if (note?.issue === 'unavailable') continue;
+    const m = note?.issue === 'no-effort' && model.effort !== null ? { ...model, effort: null } : model;
+    if (!out.has(candidateKey(m))) out.set(candidateKey(m), m);
+  }
+  return [...out.values()];
 }
 
 /** Candidates in expected-cost order, up to the configured tier (a pinned model always stays). */
-function candidates(models: readonly ModelCandidate[], maxTier: Tier): { model: ModelCandidate; estimate: CostEstimate }[] {
+function candidates(
+  models: readonly ModelCandidate[],
+  maxTier: Tier,
+  cache: RouterCache,
+  version: string | null,
+): { model: ModelCandidate; estimate: CostEstimate }[] {
   const limit = TIERS.indexOf(maxTier);
-  return rankModels(models).filter((r) => r.model.source === 'pinned' || TIERS.indexOf(r.estimate.tier) <= limit);
+  return rankModels(usable(models, cache, version)).filter((r) => r.model.source === 'pinned' || TIERS.indexOf(r.estimate.tier) <= limit);
 }
 
 /** Pinned models, the test provider and `qualify: false` skip the requirement suite. */
@@ -287,12 +358,23 @@ function bumpStats(cache: RouterCache, key: string, ok: boolean, error: string |
   return s;
 }
 
+/** Evaluation that ended because the CLI refused the model or its effort setting: no verdict, no model call. */
+function refusal(kind: FailureKind | null | undefined): kind is 'unavailable' | 'effort' {
+  return kind === 'unavailable' || kind === 'effort';
+}
+
+export function refusalText(kind: 'unavailable' | 'effort'): string {
+  return kind === 'unavailable'
+    ? 'not offered by the CLI to this account (left out until a CLI update or 7 days)'
+    : 'takes no reasoning effort setting (evaluated once without it)';
+}
+
 async function runQualification(
   provider: Provider,
   bin: string,
   model: ModelCandidate,
   task: SuiteTask,
-  version: string | null,
+  version: { cli: string | null; verdict: string | null },
   cache: RouterCache,
   cfg: DevctxConfig,
   db: StateDb | null,
@@ -306,8 +388,10 @@ async function runQualification(
   }
   if (res.blocked === 'auth' || res.blocked === 'quota') {
     block(cache, provider.id, res.blocked, res.details.join(' '));
+  } else if (refusal(res.blocked)) {
+    noteModel(cache, model, res.blocked, res.details.join(' '), version.cli);
   } else {
-    storeQualification(cache, key, version, res);
+    storeQualification(cache, key, version.verdict, res);
   }
   return res;
 }
@@ -357,7 +441,9 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
   const evaluationLimit = cfg.llm.qualify_calls_per_hour;
   let limited = false;
   let unevaluated = 0;
+  let rejected = 0;
   let asked = false; // a model was actually run or evaluated
+  let called = false; // a model was run on this request and failed it (not the account, not a refusal)
   const cache = loadCache();
   const budget = opts.qualifyBudget ?? { remaining: DEFAULT_QUALIFY_BUDGET };
   try {
@@ -373,8 +459,8 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
         attempts.push(`${pid}: not installed`);
         continue;
       }
-      const { version, models } = await discover(provider, bin, cfg, cache, false);
-      const ranked = candidates(models, cfg.llm.max_tier);
+      const { version, verdict, models } = await discover(provider, bin, cfg, cache, false);
+      const ranked = candidates(models, cfg.llm.max_tier, cache, version);
       if (ranked.length === 0) {
         attempts.push(`${pid}: no usable models`);
         continue;
@@ -383,10 +469,14 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
       let providerBlocked = false;
       for (const { model } of ranked) {
         if (tries >= MAX_TRIES_PER_PROVIDER) break;
+        if (refused(cache, model, version)) continue; // refused earlier in this loop (another effort level)
         const key = candidateKey(model);
         if (!trusted(cfg, model)) {
-          const q = qualificationFor(cache, key, task, version);
-          if (q && q.status !== 'pass') continue; // failed, or its evaluation errored recently
+          const q = qualificationFor(cache, key, task, verdict);
+          if (q && q.status !== 'pass') {
+            rejected++; // failed, or its evaluation errored recently
+            continue;
+          }
           if (!q) {
             if (!opts.allowQualify || budget.remaining <= 0) {
               unevaluated++;
@@ -397,9 +487,15 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
               break providers;
             }
             budget.remaining--;
-            asked = true;
-            const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
+            const res = await runQualification(provider, bin, model, task, { cli: version, verdict }, cache, cfg, db);
             opts.log?.('qualification', { model: key, task, pass: res.pass, score: `${res.score}/${res.total}`, blocked: res.blocked });
+            if (refusal(res.blocked)) {
+              // Refused before any answer: nothing was spent, the next candidate gets the evaluation.
+              budget.remaining++;
+              attempts.push(`${key}: ${refusalText(res.blocked)}`);
+              continue;
+            }
+            asked = true;
             attempts.push(`${key}: ${task} evaluation ${res.blocked ? `could not run (${res.blocked})` : res.pass ? 'passed' : 'failed'} ${res.score}/${res.total}`);
             if (res.blocked === 'auth' || res.blocked === 'quota') {
               providerBlocked = true;
@@ -428,6 +524,12 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
           providerBlocked = true;
           break;
         }
+        if (refusal(raw.kind)) {
+          noteModel(cache, model, raw.kind, error ?? '', version);
+          tries--;
+          continue;
+        }
+        called = true;
         // A model that keeps failing gets re-evaluated next time instead of being trusted.
         if (stats.consecutiveFail >= 3) delete cache.qualification[qKey(key, task)];
       }
@@ -439,7 +541,8 @@ export async function routeCall<T>(req: LlmRequest, parse: (data: unknown) => T 
     // background worker does): callers know the answer is not a model's refusal. Providers that
     // are not installed, skipped or without models do not change that.
     if (unevaluated > 0 && !asked) return { ok: false, error: NO_QUALIFIED_MODEL_ERROR, attempts: [...attempts, `${unevaluated} candidate(s) wait for the background worker's evaluation`] };
-    return { ok: false, error: 'no provider produced a valid answer', attempts };
+    if (rejected > 0 && !asked) attempts.push(`${rejected} candidate(s) failed their evaluation or could not be evaluated recently (devctx models)`);
+    return { ok: false, error: 'no provider produced a valid answer', attempts, called };
   } finally {
     saveCache(cache);
   }
@@ -494,13 +597,18 @@ export interface RouteReport {
   /** Candidate the router would use per task right now (null: nothing qualified yet). */
   selected: Partial<Record<SuiteTask, string | null>>;
   models: ModelReport[];
+  /** Model ids the CLI does not offer to this account (left out of the candidates). */
+  unavailable: string[];
 }
 
 function measured(s: Stats | undefined): number | null {
   return s && s.costCalls > 0 ? s.costUsd / s.costCalls : null;
 }
 
-/** Diagnostics for `devctx models`: what each provider would use per task and why. */
+/**
+ * Diagnostics for `devctx models`: what each provider would use per task and why. `refresh` also
+ * asks again about models the CLI did not offer (access may have been granted since).
+ */
 export async function describeRoutes(cfg: DevctxConfig, host: string | null, opts: { refresh: boolean }): Promise<RouteReport[]> {
   const cache = loadCache();
   const out: RouteReport[] = [];
@@ -508,29 +616,34 @@ export async function describeRoutes(cfg: DevctxConfig, host: string | null, opt
     const provider = getProvider(pid);
     const bin = await provider.resolveBinary();
     if (!bin) {
-      out.push({ provider: pid, bin: null, version: null, blocked: null, selected: {}, models: [] });
+      out.push({ provider: pid, bin: null, version: null, blocked: null, selected: {}, models: [], unavailable: [] });
       continue;
     }
-    const { version, models } = await discover(provider, bin, cfg, cache, opts.refresh);
-    const eligible = candidates(models, cfg.llm.max_tier);
+    if (opts.refresh) {
+      for (const [key, note] of Object.entries(cache.models)) if (key.startsWith(`${pid}:`) && note.issue === 'unavailable') delete cache.models[key];
+    }
+    const { version, verdict, models } = await discover(provider, bin, cfg, cache, opts.refresh);
+    const eligible = candidates(models, cfg.llm.max_tier, cache, version);
     const eligibleKeys = new Set(eligible.map((r) => candidateKey(r.model)));
     const selected: RouteReport['selected'] = {};
     for (const task of SUITE_TASKS) {
-      const pick = eligible.find(({ model }) => trusted(cfg, model) || qualificationFor(cache, candidateKey(model), task, version)?.status === 'pass');
+      const pick = eligible.find(({ model }) => trusted(cfg, model) || qualificationFor(cache, candidateKey(model), task, verdict)?.status === 'pass');
       selected[task] = pick ? candidateKey(pick.model) : null;
     }
+    const unavailable = [...new Set(models.filter((m) => modelNote(cache, m, version)?.issue === 'unavailable').map((m) => m.id))];
     out.push({
       provider: pid,
       bin,
       version,
       blocked: activeBlock(cache, pid),
       selected,
-      models: rankModels(models).map(({ model, estimate }) => {
+      models: rankModels(usable(models, cache, version)).map(({ model, estimate }) => {
         const key = candidateKey(model);
         const qualification: ModelReport['qualification'] = {};
-        for (const task of SUITE_TASKS) qualification[task] = qualificationFor(cache, key, task, version);
+        for (const task of SUITE_TASKS) qualification[task] = qualificationFor(cache, key, task, verdict);
         return { key, estimate, qualification, stats: cache.stats[key] ?? null, measuredUsd: measured(cache.stats[key]), auto: eligibleKeys.has(key), pinned: model.source === 'pinned' };
       }),
+      unavailable,
     });
   }
   saveCache(cache);
@@ -544,9 +657,10 @@ export function cachedSelection(cfg: DevctxConfig, host: string | null): { provi
   for (const pid of providerOrder(cfg, host)) {
     const d = cache.discovery[pid];
     if (!d) continue;
-    const eligible = candidates(d.models, cfg.llm.max_tier);
+    const eligible = candidates(d.models, cfg.llm.max_tier, cache, d.version);
+    const verdict = verdictVersion(getProvider(pid), d.version);
     for (const task of SUITE_TASKS) {
-      const pick = eligible.find(({ model }) => trusted(cfg, model) || qualificationFor(cache, candidateKey(model), task, d.version)?.status === 'pass');
+      const pick = eligible.find(({ model }) => trusted(cfg, model) || qualificationFor(cache, candidateKey(model), task, verdict)?.status === 'pass');
       out.push({ provider: pid, task, key: pick ? candidateKey(pick.model) : null });
     }
   }
@@ -567,6 +681,8 @@ export interface QualifyReport {
  * `devctx models --qualify <provider>`: walks the candidates of one provider in cost order and
  * evaluates them until one passes the task's suite (or `limit` evaluations ran). Candidates with a
  * current verdict are skipped; an existing pass ends the walk because nothing cheaper is left.
+ * A model the CLI refuses costs nothing and does not count toward `limit`; the walk then goes on
+ * over the changed candidates (a model without effort levels comes back as one candidate).
  * `canStart` is asked before each evaluation (the background worker keeps to the hourly budget).
  */
 export async function qualifyProvider(
@@ -582,22 +698,31 @@ export async function qualifyProvider(
   const provider = getProvider(pid);
   const bin = await provider.resolveBinary();
   if (!bin) return [];
-  const { version, models } = await discover(provider, bin, cfg, cache, false);
+  const { version, verdict, models } = await discover(provider, bin, cfg, cache, false);
   const results: QualifyReport[] = [];
+  const seen = new Set<string>();
+  let evaluated = 0;
   try {
-    for (const { model } of candidates(models, cfg.llm.max_tier)) {
-      if (results.length >= limit) break;
-      const key = candidateKey(model);
-      const q = qualificationFor(cache, key, task, version);
-      if (q?.status === 'pass') break;
-      if (q) continue;
-      if (!canStart()) break;
-      const res = await runQualification(provider, bin, model, task, version, cache, cfg, db);
-      saveCache(cache);
-      const report: QualifyReport = { key, task, pass: res.pass, score: `${res.score}/${res.total}`, details: res.details, blocked: res.blocked, avgCostUsd: res.avgCostUsd };
-      results.push(report);
-      onResult?.(report);
-      if (res.blocked === 'auth' || res.blocked === 'quota' || res.pass) break;
+    walk: for (;;) {
+      for (const { model } of candidates(models, cfg.llm.max_tier, cache, version)) {
+        const key = candidateKey(model);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (evaluated >= limit) break walk;
+        const q = qualificationFor(cache, key, task, verdict);
+        if (q?.status === 'pass') break walk;
+        if (q) continue;
+        if (!canStart()) break walk;
+        const res = await runQualification(provider, bin, model, task, { cli: version, verdict }, cache, cfg, db);
+        saveCache(cache);
+        const report: QualifyReport = { key, task, pass: res.pass, score: `${res.score}/${res.total}`, details: res.details, blocked: res.blocked, avgCostUsd: res.avgCostUsd };
+        results.push(report);
+        onResult?.(report);
+        if (refusal(res.blocked)) continue walk;
+        evaluated++;
+        if (res.blocked === 'auth' || res.blocked === 'quota' || res.pass) break walk;
+      }
+      break;
     }
   } finally {
     saveCache(cache);

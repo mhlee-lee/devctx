@@ -351,9 +351,37 @@ export class StateDb {
     };
   }
 
-  pendingEvents(limit: number): StoredEvent[] {
-    const rows = this.db.prepare('select * from events where processed = 0 order by ts, id limit ?').all(limit) as Row[];
+  /**
+   * Unprocessed events, oldest first, except that prompts a model already failed on come after the
+   * others (a batch that fails for what it says must not stay first in every run). `implicit:
+   * false` leaves out prompts that only a model can judge (they may wait long for one; the rest
+   * must not wait behind them).
+   */
+  pendingEvents(limit: number, opts: { implicit?: boolean } = {}): StoredEvent[] {
+    const skipImplicit = opts.implicit === false ? `and not (candidate = 1 and flags like '%"implicit"%')` : '';
+    const rows = this.db
+      .prepare(
+        `select * from events where processed = 0 ${skipImplicit}
+         order by coalesce((select cast(value as integer) from kv where kv.key = 'extract_fail:' || events.id), 0), ts, id limit ?`,
+      )
+      .all(limit) as Row[];
     return rows.map((r) => this.toEvent(r));
+  }
+
+  /** Runs in which a model was called on this pending event and failed. */
+  extractFailures(id: string): number {
+    return Number(this.kvGet(`extract_fail:${id}`) ?? '0');
+  }
+
+  /** Counts a run in which a model was called on these pending events and failed; returns the counts. */
+  noteExtractFailure(ids: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const id of ids) {
+      const n = this.extractFailures(id) + 1;
+      this.kvSet(`extract_fail:${id}`, String(n));
+      out.set(id, n);
+    }
+    return out;
   }
 
   hasPendingCandidates(): boolean {
@@ -385,6 +413,7 @@ export class StateDb {
     for (const id of ids) {
       stmt.run(error ? 2 : 1, error ?? null, id);
       clear.run(`event_retry:${id}`);
+      clear.run(`extract_fail:${id}`);
     }
   }
 
@@ -985,6 +1014,9 @@ export class StateDb {
   pruneEvents(beforeIso: string, unprocessedBeforeIso?: string): number {
     const res = this.db.prepare('delete from events where processed != 0 and ts < ?').run(beforeIso);
     const old = unprocessedBeforeIso ? this.db.prepare('delete from events where processed = 0 and ts < ?').run(unprocessedBeforeIso) : null;
+    if (Number(old?.changes ?? 0) > 0) {
+      this.db.prepare("delete from kv where key like 'extract_fail:%' and substr(key, 14) not in (select id from events)").run();
+    }
     return Number(res.changes ?? 0) + Number(old?.changes ?? 0);
   }
 

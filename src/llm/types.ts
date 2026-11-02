@@ -32,8 +32,12 @@ export interface LlmRequest {
   timeoutMs: number;
 }
 
-/** auth/quota: account problem, skip the provider for a while. infra: CLI/timeout. answer: bad output. */
-export type FailureKind = 'auth' | 'quota' | 'infra' | 'answer';
+/**
+ * auth/quota: account problem, skip the provider for a while. infra: CLI/timeout. answer: bad output.
+ * unavailable: the CLI does not offer this model (to this account). effort: the model takes no
+ * reasoning effort setting. The last two are about the model itself, whatever the task.
+ */
+export type FailureKind = 'auth' | 'quota' | 'infra' | 'answer' | 'unavailable' | 'effort';
 
 export interface LlmRawResult {
   ok: boolean;
@@ -42,7 +46,7 @@ export interface LlmRawResult {
   error?: string;
   kind?: FailureKind;
   ms: number;
-  /** Cost reported by the CLI itself (Claude Code). */
+  /** Cost reported by the CLI itself (Claude Code, Copilot CLI). */
   costUsd?: number | null;
   /** Token usage reported by the CLI (Codex), priced with the catalog. */
   usage?: TokenUsage | null;
@@ -52,6 +56,11 @@ export interface Provider {
   id: ProviderId;
   /** Human-readable name used in diagnostics. */
   label: string;
+  /**
+   * Bumped when how devctx calls the CLI or reads its output changes: evaluation verdicts of an
+   * earlier revision are not trusted (a model may have failed because of the old reading).
+   */
+  revision?: number;
   /** Resolves the CLI binary, or null when the tool is not installed. */
   resolveBinary(): Promise<string | null>;
   version(bin: string): Promise<string | null>;

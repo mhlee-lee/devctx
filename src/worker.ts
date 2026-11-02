@@ -28,6 +28,8 @@ const LOCK_STALE_MS = 60 * 60 * 1000;
 const MAX_ROUNDS = 10;
 /** Worker runs that may fail to store what one event said before the event is given up. */
 const MAX_EVENT_ATTEMPTS = 3;
+/** Runs in which a model was called on a held prompt and failed before the prompt is given up. */
+const MAX_MODEL_FAILURES = 5;
 /** Model evaluations one worker run may start (each runs a task's requirement suite). */
 const QUALIFICATIONS_PER_RUN = 3;
 
@@ -134,7 +136,8 @@ async function qualifyAhead(cfg: DevctxConfig, db: StateDb, host: string | null,
     }
     try {
       const results = await qualifyProvider(cfg, pid, task, QUALIFICATIONS_PER_RUN, db, (r) => log('qualification', { model: r.key, task, pass: r.pass, score: r.score, blocked: r.blocked }), fits);
-      if (results.some((r) => r.blocked)) break;
+      // A refused model says nothing about the CLI; a login, quota or CLI failure would repeat.
+      if (results.some((r) => r.blocked && r.blocked !== 'unavailable' && r.blocked !== 'effort')) break;
     } catch (error) {
       errors.push(`${task} evaluation: ${errorMessage(error)}`);
     }
@@ -200,15 +203,32 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
       let succeeded = 0;
       let lastError: string | null = null;
       let limited = false;
+      // Prompts without explicit markers that no model analyzed stay pending for a later run; with
+      // calls turned off by configuration no model ever will, so they are not kept for one.
+      const holdImplicit = !llmOff(cfg, 'decisions');
+      const held = new Set<string>();
       // Implicit candidates wait for a full batch at a plain turn end, even when the worker runs for
       // something else (a history entry, the code index), so they keep costing one call per five.
-      const flushImplicit = opts.reason !== 'turn_end' || extractionDue(db.pendingCandidates(), false);
+      // Once no model answered this run, the rest of them wait too: a backlog of held prompts must
+      // neither be sent again batch after batch nor keep newer events from being read.
+      let skipImplicit = !(opts.reason !== 'turn_end' || extractionDue(db.pendingCandidates(), false));
       for (let round = 0; round < MAX_ROUNDS; round++) {
-        const pending = db.pendingEvents(50);
-        const events = flushImplicit ? pending : pending.filter((e) => !(e.candidate && e.flags.includes('implicit')));
+        const events = db
+          .pendingEvents(50 + held.size, skipImplicit ? { implicit: false } : {})
+          .filter((e) => !held.has(e.id))
+          .slice(0, 50);
         if (events.length === 0) break;
         const candidates = events.filter((e) => e.candidate && e.prompt);
-        const outcome = await extractCandidates(candidates, db, decisionRoute);
+        const outcome = await extractCandidates(candidates, db, decisionRoute, { holdImplicit });
+        for (const id of outcome.heldEventIds) held.add(id);
+        if (outcome.heldEventIds.length > 0) skipImplicit = true;
+        // A prompt a model was called on and failed in MAX_MODEL_FAILURES runs is given up: what it
+        // says keeps models from answering (a content filter, an answer that never parses).
+        const given = [...db.noteExtractFailure(outcome.failedEventIds)].filter(([, n]) => n >= MAX_MODEL_FAILURES).map(([id]) => id);
+        if (given.length > 0) {
+          db.markProcessed(given, `no model answered it in ${MAX_MODEL_FAILURES} runs`);
+          report.processed += given.length;
+        }
         // Health counts runs a model could have answered: not those cut short by the hourly limit,
         // nor those that may not evaluate a model (`devctx remember` leaves that to this worker).
         const unevaluated = !outcome.usedLlm && outcome.errors.some((e) => e.startsWith(NO_QUALIFIED_MODEL_ERROR));
@@ -243,7 +263,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
           if (db.noteEventFailure(id) < MAX_EVENT_ATTEMPTS) retry.add(id);
           else db.markProcessed([id], `consolidate failed ${MAX_EVENT_ATTEMPTS} times: ${message}`.slice(0, 500));
         }
-        const done = events.filter((e) => !deferred.has(e.id) && !failed.has(e.id)).map((e) => e.id);
+        const done = events.filter((e) => !deferred.has(e.id) && !failed.has(e.id) && !held.has(e.id)).map((e) => e.id);
         db.markProcessed(done);
         report.processed += done.length;
         if (deferred.size > 0 || retry.size > 0) {
@@ -292,6 +312,7 @@ export async function runWorker(opts: WorkerOptions): Promise<WorkerReport> {
         reason: opts.reason,
         processed: report.processed,
         candidates: report.candidates,
+        held: held.size > 0 ? held.size : undefined,
         applied: report.applied.map((a) => `${a.relation}:${a.itemId ?? '-'}`),
         changed: report.compiled.changed,
         history: report.history?.written.length ?? 0,

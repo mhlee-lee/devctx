@@ -310,8 +310,9 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
     if (off) add('ok', `llm (${work})`, `off by configuration (${off}): ${work === 'decisions' ? 'only explicit markers are kept, as proposals on this PC' : 'entries use the start of the assistant reply instead of a summary'}`);
   }
   const policy = `llm.host_tool: ${cfg.llm.host_tool}${isToolId(llmHost) ? `, working in ${llmHost}` : cfg.llm.host_tool === 'any' ? '' : ', no tool running: targets first'}`;
+  const meanwhileKept = `explicit markers are kept as proposals and other prompts wait for a model (up to ${cfg.memory.unprocessed_retention_days} days)`;
   if (order.length === 0 && !llmOff(cfg, 'decisions')) {
-    add('warn', 'llm CLIs', `none may be called: ${noProviderReason(cfg, llmHost)}; no model is used (only explicit markers are kept, as proposals) until llm.providers includes it or llm.host_tool is prefer`);
+    add('warn', 'llm CLIs', `none may be called: ${noProviderReason(cfg, llmHost)}; no model is used (${meanwhileKept}) until llm.providers includes it or llm.host_tool is prefer`);
   } else {
     // Found on PATH only: login and quota show up in "llm usage" once a call is made.
     add(available.some((a) => !a.includes('(')) ? 'ok' : 'warn', 'llm CLIs', `${available.join(', ')} (installed; login is not checked here, see llm usage; ${policy})`);
@@ -322,7 +323,7 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
   const pins = Object.entries(cfg.llm.pin);
   if (pins.length > 0) add('ok', 'llm pin', `${pins.map(([t, m]) => `${t}: ${m}`).join(', ')} (a pinned model is used without the requirement suite; pin only one that passed it, see devctx models)`);
   for (const [pid, b] of Object.entries(blocks)) {
-    const meanwhile = cfg.llm.host_tool === 'only' ? 'no other tool is called (llm.host_tool: only), so only explicit markers are kept meanwhile' : 'other installed tools are used meanwhile';
+    const meanwhile = cfg.llm.host_tool === 'only' ? `no other tool is called (llm.host_tool: only): ${meanwhileKept}` : 'other installed tools are used meanwhile';
     const hint = b.kind === 'auth' ? `log in again by running "${pid}"; ${meanwhile}` : `usage limit reached; ${meanwhile}`;
     add('warn', `llm ${pid}`, `${hint} (retry after ${b.until.slice(0, 16)}Z)`);
   }

@@ -1,11 +1,13 @@
 import fs from 'node:fs';
-import type { LlmRawResult, Provider } from '../types.ts';
+import type { FailureKind, LlmRawResult, Provider } from '../types.ts';
 
 /**
  * Test provider, active only when DEVCTX_FAKE_LLM points at a JSON file of queued answers:
  * `{ "extract": [answer, ...], "judge": [...], "qualify": [...] }`. Each call pops one answer for
- * its task (`{"__error": "..."}` simulates a failure) and appends the prompt to `<file>.requests.jsonl`.
- * DEVCTX_FAKE_MODELS sets how many candidate models it offers (default 1), to test retries.
+ * its task (`{"__error": "...", "__kind": "unavailable"}` simulates a failure, `__kind` optional)
+ * and appends the request to `<file>.requests.jsonl`. DEVCTX_FAKE_MODELS sets how many candidate
+ * models it offers (default 1), to test retries; DEVCTX_FAKE_EFFORTS (e.g. "low,high") offers each
+ * at those reasoning efforts.
  */
 export const fakeProvider: Provider = {
   id: 'fake',
@@ -21,28 +23,32 @@ export const fakeProvider: Provider = {
 
   async discover() {
     const n = Math.max(1, Math.min(5, Number(process.env.DEVCTX_FAKE_MODELS ?? 1) || 1));
-    return Array.from({ length: n }, (_, i) => ({
-      provider: 'fake' as const,
-      id: i === 0 ? 'fake-small' : `fake-small-${i + 1}`,
-      extraArgs: [],
-      effort: null,
-      description: 'fast test model',
-      source: 'discovered' as const,
-    }));
+    const efforts = (process.env.DEVCTX_FAKE_EFFORTS ?? '').split(',').filter(Boolean);
+    return Array.from({ length: n }, (_, i) => i === 0 ? 'fake-small' : `fake-small-${i + 1}`).flatMap((id) =>
+      (efforts.length > 0 ? efforts : [null]).map((effort) => ({
+        provider: 'fake' as const,
+        id,
+        extraArgs: [],
+        effort,
+        description: 'fast test model',
+        source: 'discovered' as const,
+      })),
+    );
   },
 
   async run(_bin, model, req): Promise<LlmRawResult> {
     const file = process.env.DEVCTX_FAKE_LLM;
     if (!file) return { ok: false, error: 'DEVCTX_FAKE_LLM not set', text: '', ms: 0 };
     const queue = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown[]>;
-    fs.appendFileSync(`${file}.requests.jsonl`, `${JSON.stringify({ task: req.task, model: model.id, prompt: req.prompt })}\n`);
+    fs.appendFileSync(`${file}.requests.jsonl`, `${JSON.stringify({ task: req.task, model: model.id, effort: model.effort, prompt: req.prompt })}\n`);
     const list = queue[req.task] ?? [];
     const next = list.shift();
     queue[req.task] = list;
     fs.writeFileSync(file, JSON.stringify(queue));
     if (next === undefined) return { ok: false, error: `no fake answer queued for ${req.task}`, text: '', ms: 1 };
     if (next && typeof next === 'object' && '__error' in next) {
-      return { ok: false, error: String((next as Record<string, unknown>).__error), text: '', ms: 1 };
+      const failure = next as Record<string, unknown>;
+      return { ok: false, error: String(failure.__error), text: '', ms: 1, ...(failure.__kind ? { kind: failure.__kind as FailureKind } : {}) };
     }
     return { ok: true, data: next, text: JSON.stringify(next), ms: 1, costUsd: 0 };
   },

@@ -41,7 +41,10 @@ import { installToolHooks } from '../src/init/hookconfigs.ts';
 import { sourcePinProblem } from '../src/init/shim.ts';
 import { normalizeModelId } from '../src/llm/catalog.ts';
 import { runProcess } from '../src/llm/exec.ts';
-import { jsonCandidates, pickAnswer } from '../src/llm/json.ts';
+import { extractJson, jsonCandidates, pickAnswer } from '../src/llm/json.ts';
+import { classifyFailure } from '../src/llm/providers/common.ts';
+import { readCopilotEvents } from '../src/llm/providers/copilot.ts';
+import { PROVIDERS } from '../src/llm/providers/index.ts';
 import { buildExtractPrompt, MAX_TOPICS } from '../src/memory/prompts.ts';
 import { suiteCalls, suiteCurrent } from '../src/llm/suite.ts';
 import { scoreAll } from '../src/knowledge/retrieve.ts';
@@ -57,7 +60,7 @@ import { approveProposal, discardProposal, listProposals, resolveConflict } from
 import { agentAccessStatus, BACKUP_SUFFIX, renderSkill } from '../src/init/access.ts';
 import { findPastWork } from '../src/recall.ts';
 import { appendEntry, renderEntry, renderHeader } from '../src/history/writer.ts';
-import { callsLeft, evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
+import { callsLeft, evaluationCallsLeft, NO_QUALIFIED_MODEL_ERROR, providerOrder, qualifyProvider, RATE_LIMIT_ERROR, routeCall, workingHost } from '../src/llm/router.ts';
 import type { ToolId } from '../src/types.ts';
 import { anchorsFor, positiveTerms, repoContext, staleReason } from '../src/knowledge/anchors.ts';
 import { heldReason } from '../src/knowledge/guard.ts';
@@ -74,13 +77,13 @@ import { readText, sha256 } from '../src/util/fsx.ts';
 import { sameRule } from '../src/memory/dedupe.ts';
 import { hasMaskedSecret, isQuoteValid, redactSecrets, unsupportedTerms } from '../src/memory/evidence.ts';
 import type { Candidate } from '../src/memory/extract.ts';
-import { heuristicCandidates } from '../src/memory/extract.ts';
+import { heuristicCandidates, topicsFrom } from '../src/memory/extract.ts';
 import { parseExtractResult, parseJudgeResult } from '../src/memory/prompts.ts';
 import { StateDb } from '../src/state/db.ts';
 import { projectPaths, type ProjectPaths } from '../src/util/paths.ts';
 import { overlappingRules } from '../src/knowledge/overlap.ts';
 import { runWorker } from '../src/worker.ts';
-import { approxTokens, today } from '../src/util/text.ts';
+import { approxTokens, stripPasted, today } from '../src/util/text.ts';
 
 const verbose = process.argv.includes('-v');
 
@@ -852,22 +855,35 @@ let paraphraseLine = '';
 
   // The worker also runs for other reasons (history entries): implicit candidates still wait.
   const wroot = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-hold-'));
+  const fakeSaved = process.env.DEVCTX_FAKE_LLM;
   try {
     const wdb = StateDb.open(projectPaths(wroot).stateDb);
     const s = detectSignals('DB 컬럼명은 snake_case');
     wdb.insertEvent({ ts: new Date().toISOString(), tool: 'claude', host: 'claude', kind: 'prompt', session: 's', cwd: wroot, prompt: 'DB 컬럼명은 snake_case', lastAssistant: null, transcriptPath: null, model: null, flags: s.flags, candidate: s.candidate });
     wdb.close();
+    const pendingImplicit = (): number => {
+      const db = StateDb.open(projectPaths(wroot).stateDb);
+      try {
+        return db.pendingCandidates().implicit;
+      } finally {
+        db.close();
+      }
+    };
     await runWorker({ root: wroot, host: null, reason: 'turn_end', allowLlm: false });
-    const held = StateDb.open(projectPaths(wroot).stateDb);
-    const stillPending = held.pendingCandidates().implicit;
-    held.close();
+    const stillPending = pendingImplicit();
+    // Without a model nothing can tell whether it states a rule: it waits for a run with one.
     await runWorker({ root: wroot, host: null, reason: 'session_end', allowLlm: false });
-    const after = StateDb.open(projectPaths(wroot).stateDb);
-    const flushed = after.pendingCandidates().implicit;
-    after.close();
+    const heldWithoutModel = pendingImplicit();
+    process.env.DEVCTX_FAKE_LLM = path.join(wroot, 'fake.json');
+    fs.writeFileSync(process.env.DEVCTX_FAKE_LLM, JSON.stringify({ extract: [{ items: [] }] }));
+    await runWorker({ root: wroot, host: null, reason: 'session_end', allowLlm: true });
+    const flushed = pendingImplicit();
     check('capture', 'a worker run at a plain turn end leaves a lone implicit candidate waiting', stillPending === 1, `pending ${stillPending}`);
-    check('capture', 'a session boundary flushes it', flushed === 0, `pending ${flushed}`);
+    check('capture', 'a session boundary without a model keeps it for a run with one', heldWithoutModel === 1, `pending ${heldWithoutModel}`);
+    check('capture', 'a session boundary with a model flushes it', flushed === 0, `pending ${flushed}`);
   } finally {
+    if (fakeSaved === undefined) delete process.env.DEVCTX_FAKE_LLM;
+    else process.env.DEVCTX_FAKE_LLM = fakeSaved;
     fs.rmSync(wroot, { recursive: true, force: true });
   }
 }
@@ -2598,6 +2614,263 @@ console.log('init by ' + v);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 26. Calls that failed for the CLI's sake, not the model's: hard-wrapped text, JSONL answers,
+//     refused models, prompts no model analyzed, pasted reviews and SQL, remember without a model
+// ---------------------------------------------------------------------------------------------
+{
+  // Copilot CLI's text output as captured: cut at 100 columns, a long word split, spaces dropped.
+  const wrapped = [
+    '{"en":"Never run npm install in this repository because the lockfile is managed by pnpm and the CI',
+    'pipeline will reject any change to package-lock.json files","word":"durabilitydurabilitydurabilitydu',
+    'rabilitydurabilitydurabilitydurabilitydurabilitydurabilitydurabilitydurabilitydurability","ko":"금액',
+    '저장과 계산에는 항상 BigDecimal을 사용하고 double이나 float는 절대 쓰지 않는다 왜냐하면 부동소수점',
+    '오차 때문에 정산 금액이 틀어질 수 있기 때문이다"}',
+  ].join('\n');
+  const un = extractJson(wrapped) as Record<string, string> | undefined;
+  check(
+    'llm',
+    'hard-wrapped CLI text: a split word is joined again, a space the wrap took comes back',
+    un?.en === 'Never run npm install in this repository because the lockfile is managed by pnpm and the CI pipeline will reject any change to package-lock.json files' &&
+      un?.word === 'durability'.repeat(12) &&
+      un?.ko === '금액 저장과 계산에는 항상 BigDecimal을 사용하고 double이나 float는 절대 쓰지 않는다 왜냐하면 부동소수점 오차 때문에 정산 금액이 틀어질 수 있기 때문이다',
+    JSON.stringify(un),
+  );
+
+  const long = '금액 저장·계산에는 BigDecimal을 쓴다. 백 칸을 넘는 답도 JSONL에서는 한 줄로 온다 durability durability durability durability';
+  const events = [
+    { type: 'session.skills_loaded', data: { skills: [{ name: 'x', description: 'Sign in with your credentials when the model is not available' }] } },
+    { type: 'assistant.message', data: { content: '', toolRequests: [{ name: 'bash' }] } },
+    { type: 'assistant.message', data: { content: JSON.stringify({ why: long }), toolRequests: [] } },
+    { type: 'session.usage_checkpoint', data: { totalNanoAiu: 340343000, totalPremiumRequests: 1 } },
+    { type: 'result', exitCode: 0 },
+  ]
+    .map((e) => JSON.stringify(e))
+    .join('\n');
+  const ev = readCopilotEvents(events);
+  check('llm', 'Copilot JSONL: the last assistant message is the answer, unwrapped', (extractJson(ev.answer ?? '') as { why?: string } | undefined)?.why === long && ev.error === null, JSON.stringify(ev));
+  check('llm', 'Copilot JSONL: the cost comes from the usage checkpoint (nano AI credits, 1 credit = $0.01)', Math.abs((ev.costUsd ?? 0) - 0.00340343) < 1e-12, String(ev.costUsd));
+  const quota = readCopilotEvents(JSON.stringify({ type: 'session.error', data: { errorType: 'quota', message: 'monthly limit' } }));
+  check('llm', 'Copilot JSONL: a session error is read as the CLI\'s own error', quota.error?.type === 'quota' && quota.answer === null);
+
+  check('llm', 'a model the CLI does not offer is told apart from other CLI failures', classifyFailure('no answer (exit 1): Error: Model "gpt-5-mini" from --model flag is not available.', 'infra') === 'unavailable');
+  check('llm', 'a model that takes no reasoning effort is told apart', classifyFailure('no answer (exit 1): Error: Model "claude-haiku-4.5" does not support reasoning effort configuration (requested: "low").', 'infra') === 'effort');
+  check('llm', 'an answer that mentions a model is not a refusal', classifyFailure('no JSON in answer: that model is not available here', 'answer') === 'answer');
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-refuse-'));
+  const saved = {
+    DEVCTX_HOME: process.env.DEVCTX_HOME,
+    DEVCTX_FAKE_LLM: process.env.DEVCTX_FAKE_LLM,
+    DEVCTX_FAKE_MODELS: process.env.DEVCTX_FAKE_MODELS,
+    DEVCTX_FAKE_EFFORTS: process.env.DEVCTX_FAKE_EFFORTS,
+    DEVCTX_FAKE_QUALIFY: process.env.DEVCTX_FAKE_QUALIFY,
+  };
+  const fake = path.join(home, 'fake.json');
+  const fresh = (queue: Record<string, unknown[]>): void => {
+    fs.rmSync(path.join(home, 'router.json'), { force: true });
+    fs.rmSync(`${fake}.requests.jsonl`, { force: true });
+    fs.writeFileSync(fake, JSON.stringify(queue));
+  };
+  const asked = (): string =>
+    (readText(`${fake}.requests.jsonl`) ?? '')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { model: string; effort: string | null })
+      .map((r) => `${r.model}@${r.effort ?? '-'}`)
+      .join(',');
+  try {
+    process.env.DEVCTX_HOME = home;
+    process.env.DEVCTX_FAKE_LLM = fake;
+    const cfg = normalizeConfig({});
+    const call = () => routeCall({ task: 'extract', prompt: 'x', schema: {}, timeoutMs: 1000 }, (d) => d, { cfg, host: null, db: null, allowQualify: false });
+
+    process.env.DEVCTX_FAKE_MODELS = '2';
+    fresh({ extract: [{ __error: 'Model "fake-small" from --model flag is not available.', __kind: 'unavailable' }, { items: [] }, { items: [] }] });
+    const first = await call();
+    const second = await call();
+    check('llm', 'a model the CLI does not offer: the next one answers the same call, later calls leave it out', first.ok && second.ok && asked() === 'fake-small@-,fake-small-2@-,fake-small-2@-', asked());
+
+    process.env.DEVCTX_FAKE_MODELS = '1';
+    process.env.DEVCTX_FAKE_EFFORTS = 'low,high';
+    fresh({ extract: [{ __error: 'Model "fake-small" does not support reasoning effort configuration (requested: "low").', __kind: 'effort' }, { items: [] }] });
+    const refused = await call();
+    const plain = await call();
+    check('llm', 'a model that takes no effort setting is called once without it, not once per level', !refused.ok && plain.ok && plain.model === 'fake:fake-small' && asked() === 'fake-small@low,fake-small@-', asked());
+
+    // Evaluations: a refusal costs no model call, so it does not use up the run's evaluations.
+    delete process.env.DEVCTX_FAKE_EFFORTS;
+    process.env.DEVCTX_FAKE_MODELS = '2';
+    process.env.DEVCTX_FAKE_QUALIFY = '1';
+    fresh({ qualify: [{ __error: 'Model "fake-small" from --model flag is not available.', __kind: 'unavailable' }] });
+    const walk = (await qualifyProvider(cfg, 'fake', 'extract', 1, null)).map((r) => `${r.key}:${r.blocked ?? (r.pass ? 'pass' : 'fail')}`).join(',');
+    const again = await qualifyProvider(cfg, 'fake', 'extract', 1, null);
+    check('llm', 'a refused model does not count toward a run\'s evaluations and is not evaluated again', walk === 'fake:fake-small:unavailable,fake:fake-small-2:fail' && again.length === 0, `${walk} | again ${again.length}`);
+    PROVIDERS.fake.revision = 2;
+    try {
+      const reread = await qualifyProvider(cfg, 'fake', 'extract', 1, null);
+      check('llm', 'verdicts reached with an older way of reading the CLI are evaluated again', reread.map((r) => r.key).join() === 'fake:fake-small-2', reread.map((r) => r.key).join());
+    } finally {
+      delete PROVIDERS.fake.revision;
+    }
+
+    // The reported case: `devctx remember` while no model has passed its evaluation.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-held-'));
+    try {
+      process.env.DEVCTX_FAKE_MODELS = '1';
+      fresh({});
+      const insert = (prompt: string, flags: string[]): void => {
+        const db = StateDb.open(projectPaths(root).stateDb);
+        db.insertEvent({ ts: new Date().toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt', session: 's', cwd: root, prompt, lastAssistant: null, transcriptPath: null, model: null, flags, candidate: true });
+        db.close();
+      };
+      const pendingImplicit = (): number => {
+        const db = StateDb.open(projectPaths(root).stateDb);
+        try {
+          return db.pendingCandidates().implicit;
+        } finally {
+          db.close();
+        }
+      };
+      insert('DB 컬럼명은 snake_case', detectSignals('DB 컬럼명은 snake_case').flags);
+      const said = '코드 주석은 최소한으로 남긴다. 코드만 봐서는 알 수 없는 이유만 쓰고, 코드를 다시 설명하는 주석은 쓰지 않는다.';
+      insert(said, ['remember', 'durable', 'remember-cmd']);
+      const remembered = await runWorker({ root, host: null, reason: 'remember', allowLlm: true, allowQualify: false });
+      check('remember', 'without a model, remember keeps the whole text as one rule (every sentence)', remembered.applied.length === 1 && remembered.applied[0]?.summary === said, JSON.stringify(remembered.applied.map((a) => a.summary)));
+      check('capture', 'devctx remember without a model leaves a pending implicit prompt for one', pendingImplicit() === 1, `pending ${pendingImplicit()}`);
+
+      delete process.env.DEVCTX_FAKE_QUALIFY;
+      const item = { message: 1, title: 'DB 컬럼명', statement: 'DB 컬럼명은 snake_case로 짓는다.', type: 'rule', enforcement: 'should', durability: 'durable', audience: 'team', scope: { paths: [], topics: ['DB', 'column', '컬럼명', 'snake_case'] }, evidence_quote: 'DB 컬럼명은 snake_case', reason: null, valid_until: null, confidence: 0.9 };
+      fresh({ extract: [{ __error: 'boom' }, { items: [item] }] });
+      const failed = await runWorker({ root, host: null, reason: 'manual', allowLlm: true });
+      const heldAfterFailure = pendingImplicit();
+      const later = await runWorker({ root, host: null, reason: 'manual', allowLlm: true });
+      check('capture', 'a failed model call keeps the implicit prompt pending', failed.applied.length === 0 && heldAfterFailure === 1, `pending ${heldAfterFailure}`);
+      check('capture', 'once a model answers, the held prompt is extracted', later.applied.some((a) => a.summary === 'DB 컬럼명은 snake_case로 짓는다.') && pendingImplicit() === 0, JSON.stringify(later.applied.map((a) => a.summary)));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    // A backlog of held prompts larger than one run reads (10 rounds of 50) must not keep a newer
+    // explicit one waiting, nor be sent again batch after batch while the model fails.
+    const backlog = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-backlog-'));
+    try {
+      const db = StateDb.open(projectPaths(backlog).stateDb);
+      const base = Date.now() - 86_400_000;
+      for (let i = 0; i < 520; i++) {
+        db.insertEvent({ ts: new Date(base + i * 1000).toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt', session: 's', cwd: backlog, prompt: `서비스 ${i}번은 재시도 세 번으로 둔다`, lastAssistant: null, transcriptPath: null, model: null, flags: ['implicit'], candidate: true });
+      }
+      db.insertEvent({ ts: new Date().toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt', session: 's', cwd: backlog, prompt: '앞으로 로그는 pino로 남겨', lastAssistant: null, transcriptPath: null, model: null, flags: ['durable'], candidate: true });
+      db.close();
+      fresh({ extract: [{ __error: 'boom' }] });
+      const run = await runWorker({ root: backlog, host: null, reason: 'manual', allowLlm: true });
+      const after = StateDb.open(projectPaths(backlog).stateDb);
+      const left = after.pendingCandidates();
+      after.close();
+      const calls = asked().split(',').filter(Boolean).length;
+      check('capture', 'a backlog of held prompts does not keep a newer explicit one waiting', left.explicit === 0 && left.implicit === 520 && run.applied.some((a) => a.status === 'proposed'), JSON.stringify({ left, applied: run.applied.map((a) => a.status) }));
+      check('capture', 'while the model fails, a backlog is not sent batch after batch', calls <= 2, `${calls} call(s)`);
+    } finally {
+      fs.rmSync(backlog, { recursive: true, force: true });
+    }
+
+    // A prompt that keeps a working model from answering (a content filter, say) is given up after
+    // MAX_MODEL_FAILURES runs instead of being first in every run until it expires.
+    const poison = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-poison-'));
+    try {
+      const db = StateDb.open(projectPaths(poison).stateDb);
+      db.insertEvent({ ts: new Date().toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt', session: 's', cwd: poison, prompt: '배포 스크립트는 bash로 둔다', lastAssistant: null, transcriptPath: null, model: null, flags: ['implicit'], candidate: true });
+      db.close();
+      const leftAfter = async (runs: number): Promise<number> => {
+        for (let i = 0; i < runs; i++) {
+          fresh({ extract: [{ __error: 'content filtered' }] });
+          await runWorker({ root: poison, host: null, reason: 'manual', allowLlm: true });
+        }
+        const s = StateDb.open(projectPaths(poison).stateDb);
+        try {
+          return s.pendingCandidates().implicit;
+        } finally {
+          s.close();
+        }
+      };
+      const afterFour = await leftAfter(4);
+      const afterFive = await leftAfter(1);
+      check('capture', 'a prompt a model fails on in five runs is given up (not first in every run for 180 days)', afterFour === 1 && afterFive === 0, `after 4: ${afterFour}, after 5: ${afterFive}`);
+    } finally {
+      fs.rmSync(poison, { recursive: true, force: true });
+    }
+
+    // The failure of a batch counts against all its prompts; after that each goes alone, so the
+    // good ones are answered and only the one that fails keeps counting.
+    const mixed = fs.mkdtempSync(path.join(os.tmpdir(), 'devctx-bench-mixed-'));
+    try {
+      const db = StateDb.open(projectPaths(mixed).stateDb);
+      const base = Date.now() - 60_000;
+      for (let i = 0; i < 5; i++) {
+        db.insertEvent({ ts: new Date(base + i * 1000).toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt', session: 's', cwd: mixed, prompt: i === 0 ? '필터에 걸리는 문장' : `모듈 ${i}은 순수 함수로 둔다`, lastAssistant: null, transcriptPath: null, model: null, flags: ['implicit'], candidate: true });
+      }
+      db.close();
+      const run = async (queue: unknown[]): Promise<void> => {
+        fresh({ extract: queue });
+        await runWorker({ root: mixed, host: null, reason: 'manual', allowLlm: true });
+      };
+      await run([{ __error: 'content filtered' }]); // the batch of five fails: each counts 1
+      await run([{ __error: 'content filtered' }]); // now alone: the oldest (the bad one) fails first
+      await run([{ items: [] }, { items: [] }, { items: [] }, { items: [] }, { __error: 'content filtered' }]);
+      const s = StateDb.open(projectPaths(mixed).stateDb);
+      const left = s.pendingEvents(10).map((e) => e.prompt);
+      s.close();
+      check('capture', 'prompts that shared a failing batch are answered one by one; only the failing one keeps counting', left.length === 1 && left[0] === '필터에 걸리는 문장', JSON.stringify(left));
+    } finally {
+      fs.rmSync(mixed, { recursive: true, force: true });
+    }
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+
+  // Pasted without a fence: a review (bullets with labels, a severity tag, section and line
+  // references, "이런 리뷰가 있어" below it) and SQL with comments. Only the developer's lines count.
+  const review = '[중요]  successHttpStatuses  단독 사용 시 판정 모순 (2.1절, 4.1절)\n\n• 현상: 삭제 확인처럼  statusPointer  없이 등록할 수 있습니다.\n• 문제: 정상 대기 중에도 매번  last_error 가 기록됩니다.\n• 권장: 오류가 아닌 POLLING 유지로 판정하도록 규칙을 분리하세요\n\n이런 리뷰가 있는데\n에러시에도  재시도 count 가 남아있으면 재시도 진행해야할것같아';
+  const lines = '1. claim 중 취소되면 permit이 반환되지 않습니다.\n372–378행에서 permit을 확보한 뒤  claim() 이 취소되면, invokeOnCompletion 등록까지 도달하지 않습니다.\n\n이런 리뷰가 있어';
+  const sql = "postgresql db 사용해야하는데 schema 와 계정도 생성해줘야해\n아래 내용도 저장해놨으면 좋겠어\n\ncreate role rl_wdog_dml nologin;\ngrant usage on schema wdog to rl_wdog_dml;\n\n-- 앞으로 wdogown이 만들 객체에 자동 부여\nalter default privileges for role wdogown in schema wdog grant select on tables to rl_wdog_sel;\nalter role wdogapp set search_path = wdog;";
+  const pastedEvent = (prompt: string) => ({ id: 'p', ts: new Date().toISOString(), tool: 'copilot', host: 'copilot', kind: 'prompt' as const, session: 's', cwd: '/', prompt, lastAssistant: null, transcriptPath: null, model: null, flags: detectSignals(prompt).flags, candidate: true });
+  const fromPaste = [review, lines, sql].flatMap((p) => heuristicCandidates(pastedEvent(p)));
+  check('capture', 'without an LLM, a pasted review or unfenced SQL never becomes a proposal', fromPaste.length === 0, fromPaste.map((c) => c.statement).join(' | '));
+  check('capture', 'the developer\'s own lines around a paste are kept', stripPasted(review) === '이런 리뷰가 있는데\n에러시에도  재시도 count 가 남아있으면 재시도 진행해야할것같아' && stripPasted(lines) === '이런 리뷰가 있어' && stripPasted(sql).endsWith('아래 내용도 저장해놨으면 좋겠어'), JSON.stringify([stripPasted(review), stripPasted(lines), stripPasted(sql)]));
+  check('capture', 'markers inside a paste do not make the prompt explicit: a model judges it', [review, lines, sql].every((p) => detectSignals(p).flags.join() === 'implicit'), [review, lines, sql].map((p) => detectSignals(p).flags.join()).join(' | '));
+  const own = [
+    '앞으로 금액은 Long으로 해',
+    'Always use pnpm (not npm)',
+    'Update the README on every release',
+    '※ 참고: 앞으로 로그는 pino로 남겨',
+    '모델 학습엔 항상 L2 정규화를 써',
+    '이 에러 메시지는 앞으로 항상 한국어로 보여줘',
+    '- 금액: BigDecimal\n- 컬럼명: snake_case',
+    'DTO는 record로 작성해.\n\n이 로그 메시지 형식은 JSON으로 통일해',
+    'Java 1.8 절대 쓰지 마',
+    'Spring Boot 2.7 절대 쓰지 말고 3.2로 올려',
+    '함수는 항상 20~30행 이내로 작성해',
+    '앞으로 에러 로그는 반드시 이렇게 남겨:\nlogger.error({ err }, "message");',
+    '앞으로 import는 항상 이 순서로 써\nimport React from "react";',
+    'From now on, always end SQL statements with a semicolon;',
+    '앞으로 로그는 반드시 pino로 남겨.\n\n이 에러 좀 봐줘\nTypeError: x is not a function',
+    'From now on always use pnpm, never npm.\nNow fix the error above.',
+    '앞으로 테스트는 항상 vitest로 돌려.\n위 에러 해결해줘',
+    '앞으로 커밋 메시지는 한국어로 써줘.\n\n위 리뷰 반영해줘',
+    '앞으로 이 규칙 지켜줘\n• 네이밍: camelCase\n• 들여쓰기: 2칸',
+  ];
+  check('capture', 'the developer\'s own notes, bullets, versions and examples are not taken for pasted text', own.every((p) => stripPasted(p) === p), own.filter((p) => stripPasted(p) !== p).join(' | '));
+  const intro = ['Always log errors like this:\nlogger.error(err);\nlogger.warn(err);', '앞으로 에러 로그는 반드시 이렇게 남겨:\nlogger.error(a);\nlogger.warn(b);'];
+  check('capture', 'a line introducing unfenced code stays when the code goes', intro.every((p) => stripPasted(p) === p.split('\n')[0]), intro.map((p) => stripPasted(p)).join(' | '));
+
+  const topics = topicsFrom('코드 주석은 최소한으로 남긴다. 코드만 봐서는 알 수 없는 이유만 쓰고, 코드를 다시 설명하는 주석은 쓰지 않는다.');
+  check('topics', 'Korean topics without a model are whole nouns, not syllable pairs across particles ("드만", "서는")', topics.join() === '코드,주석,최소한,이유', topics.join());
 }
 
 // ---------------------------------------------------------------------------------------------

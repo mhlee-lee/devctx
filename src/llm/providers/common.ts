@@ -44,14 +44,21 @@ const AUTH_ERROR =
   /(authenticat|oauth|\blog ?in\b|logged in|sign ?in|unauthori[sz]ed|forbidden|credential|api[ _-]?key|\b401\b|\b403\b|session expired|token (has )?expired)/i;
 const QUOTA_ERROR =
   /(quota|rate.?limit|too many requests|\b429\b|usage limit|limit reached|exceeded your|insufficient (credit|balance)|out of credits)/i;
+const EFFORT_ERROR = /(does not support reasoning[ _-]?effort|reasoning[ _-]?effort[^\n.]{0,40}not supported|unsupported[^\n.]{0,40}reasoning[ _-]?effort)/i;
+const MODEL_ERROR =
+  /(\bmodel\b[^\n]{0,80}\b(is not available|not available|is not supported|not found|does not exist)|unknown model|invalid model|model not found|(do not|don't) have access to (the |this )?model)/i;
 
 /**
  * Account problems (expired login, exhausted quota) say nothing about a model's quality, so the
- * router treats them differently from a bad answer.
+ * router treats them differently from a bad answer. A model the CLI does not offer, or one that
+ * takes no reasoning effort, is told apart only from the CLI's own failure (an answer may mention
+ * models).
  */
 export function classifyFailure(text: string, fallback: FailureKind): FailureKind {
   if (AUTH_ERROR.test(text)) return 'auth';
   if (QUOTA_ERROR.test(text)) return 'quota';
+  if (fallback === 'infra' && EFFORT_ERROR.test(text)) return 'effort';
+  if (fallback === 'infra' && MODEL_ERROR.test(text)) return 'unavailable';
   return fallback;
 }
 
