@@ -13,7 +13,7 @@ import { ensureGitHooks, type GitHookResult } from './githooks.ts';
 import { installAgentAccess, removeLegacyMcp, type AccessResult } from './access.ts';
 import { installToolHooks, type HookFileResult } from './hookconfigs.ts';
 import { registerProject } from './projects.ts';
-import { defaultSource, npmSpecVersion, packageInfo, readToolsLock, renderShim, renderToolsLock, sourcePinProblem } from './shim.ts';
+import { defaultSource, npmSpecVersion, packageInfo, readToolsLock, rememberRuntime, renderShim, renderToolsLock, sourcePinProblem } from './shim.ts';
 
 export interface InitOptions {
   root: string;
@@ -75,6 +75,13 @@ export function runInit(opts: InitOptions): InitReport {
   const written: string[] = [];
   const notes: string[] = [];
 
+  // Resolve before writing any project files: npx cache directories must never become team pins.
+  const running = packageInfo().version;
+  const existing = readToolsLock(paths.toolsLock);
+  const lock = opts.source
+    ? { version: npmSpecVersion(opts.source) ?? running, source: opts.source }
+    : existing?.source && existing.version ? existing : { version: running, source: defaultSource() };
+
   for (const dir of [paths.decisions, paths.context, paths.runbooks, paths.lessons, paths.local, path.dirname(paths.shim)]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -88,24 +95,21 @@ export function runInit(opts: InitOptions): InitReport {
 
   // tools.lock is the team's pin: re-running init (to refresh hooks or skills) never moves it.
   // Only --source does, and then the version follows that source, so the two can't disagree.
-  const running = packageInfo().version;
-  const existing = readToolsLock(paths.toolsLock);
-  let lock: { version: string; source: string };
-  if (opts.source) {
-    lock = { version: npmSpecVersion(opts.source) ?? running, source: opts.source };
-  } else if (existing?.source && existing.version && !path.isAbsolute(existing.source)) {
-    lock = existing;
-    if (existing.version !== running) {
-      notes.push(
-        `tools.lock stays at ${existing.version} (${existing.source}); this devctx is ${running}. To move the team: devctx init --source <spec of ${running}>.`,
-      );
-    }
-  } else {
-    lock = { version: running, source: existing?.source || defaultSource() };
+  if (!opts.source && existing && existing.version !== running) {
+    notes.push(
+      `tools.lock stays at ${existing.version} (${existing.source}); this devctx is ${running}. To move the team: devctx init --source <spec of ${running}>.`,
+    );
   }
   const source = lock.source;
   writeFileAtomic(paths.toolsLock, renderToolsLock(lock));
   written.push('.devctx/tools.lock');
+  if (lock.version === running) {
+    try {
+      if (lock.source === defaultSource()) rememberRuntime(lock);
+    } catch {
+      // An explicit --source still works for private/local development packages without metadata.
+    }
+  }
   if (path.isAbsolute(source)) {
     notes.push(`tools.lock points at a local path (${source}); teammates need a git URL or npm spec there.`);
   } else {

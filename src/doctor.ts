@@ -249,6 +249,8 @@ export async function runDoctor(root: string, host: string | null): Promise<Chec
         'hook runtime',
         `${shim.cli}${shim.installedVersion ? ` (${shim.installedVersion})` : ''}${stale ? `; tools.lock says ${lock.version}` : ''}`,
       );
+    } else if (!lock.source || (path.isAbsolute(lock.source) && !fs.existsSync(path.join(lock.source, 'dist', 'cli.js')) && !fs.existsSync(path.join(lock.source, 'src', 'cli.ts')))) {
+      add('fail', 'hook runtime', `source ${lock.source || '(empty)'} is unavailable; hooks record nothing. Repair with devctx init --source <git URL with commit SHA or exact npm version>`);
     } else if (shim.failed) {
       add('fail', 'hook runtime', `installing ${lock.source} failed at ${shim.failed.at}; hooks record nothing until it works (hooks retry hourly; retry now: .devctx/bin/devctx version). ${shim.failed.log}`);
     } else {

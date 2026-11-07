@@ -30,23 +30,27 @@ AI 코딩 도구와 대화하며 정한 프로젝트 결정을 자동으로 기�
 
 ## 설치
 
-아직 npm에 배포하지 않아 소스에서 설치한다.
+전역 설치나 devctx 소스 폴더를 유지할 필요 없이, 적용할 프로젝트에서 `npx`로 실행한다.
 
 ```sh
-git clone https://github.com/mhlee-lee/devctx.git dev-context
-cd dev-context
-npm install   # 의존성 설치와 빌드(prepare)
-npm link      # devctx 명령을 전역에 연결
-devctx version
+cd <내 프로젝트>
+npx --yes @astrixmh/devctx init
+.devctx/bin/devctx version
 ```
 
-`npm link`는 clone한 폴더를 전역 `devctx` 명령으로 연결할 뿐이다. 프로젝트의 hook은 전역 명령을 쓰지 않고, 프로젝트마다 커밋된 `.devctx/bin/devctx`가 `.devctx/tools.lock`에 고정된 버전을 실행한다([팀원과 공유](#팀원과-공유)). 새 버전으로 옮기는 방법은 [devctx 업데이트](#devctx-업데이트)에 있다.
+`npx`가 패키지를 받고 `devctx init`을 실행한다. `init`은 실제로 받은 정확한 버전(`@astrixmh/devctx@0.1.4` 등)을 `.devctx/tools.lock`에 고정하며, 개인 PC의 경로나 npx 캐시 경로를 공유 파일에 기록하지 않는다. npm의 `devctx`는 다른 프로젝트이므로 `@astrixmh/devctx`를 사용한다.
+
+이하 문서의 `devctx <명령>`은 전역 설치가 없으면 프로젝트에서 `.devctx/bin/devctx <명령>`으로 실행한다. hook도 이 실행 스크립트를 사용한다([팀원과 공유](#팀원과-공유)). 새 버전으로 옮기는 방법은 [devctx 업데이트](#devctx-업데이트)에 있다.
+
+소스를 수정하며 개발할 때는 저장소를 clone한 뒤 `npm install`로 빌드하고, 원하면 `npm link`로 전역 명령을 연결할 수 있다. 로컬 수정본을 프로젝트에서 실행하려면 `devctx init --source <devctx 소스 경로>`로 명시한다.
+
+Git 커밋을 직접 실행할 수도 있다: `npx --yes --allow-git=all github:mhlee-lee/devctx#<커밋-SHA> init`. npm 12는 Git 설치에 `--allow-git=all`이 필요하다.
 
 ## 프로젝트에 적용
 
 ```sh
 cd <내 프로젝트>
-devctx init
+npx --yes @astrixmh/devctx init
 # init이 마지막에 출력하는 git add 명령을 그대로 실행한다. 예:
 git add -A -- .devctx AGENTS.md .gitattributes .gitignore .claude .github/hooks .agents .vscode/settings.json
 git commit -m "chore: devctx 설정"
@@ -106,19 +110,18 @@ AI 응답 원문은 턴 종료 hook이 넘겨줄 때 쓰고, 넘겨주지 않으
 
 ## 팀원과 공유
 
-팀원은 clone만 하면 된다. hook이 `.devctx/bin/devctx`를 부르고, 이 스크립트가 `.devctx/tools.lock`의 `devctx_source`에서 devctx를 이 PC에 설치한다(첫 호출 때 백그라운드로). git hook은 커밋되지 않지만 첫 AI 세션에서 자동으로 설치된다.
+팀원은 clone만 하면 된다. hook이 `.devctx/bin/devctx`를 부르고, 이 스크립트가 `.devctx/tools.lock`의 `devctx_source`를 `npx`로 받아 실행한다(첫 호출 때 백그라운드로). git hook은 커밋되지 않지만 첫 AI 세션에서 자동으로 설치된다.
 
-- 설치는 `npm install --allow-git=all`로 한다. npm 12부터 git 주소 설치가 기본으로 막혀 있어서다(`allow-git=none`, 이전 npm은 이 옵션을 무시한다).
-- AI 도구 hook과 git hook에서 부를 때는 설치를 백그라운드로 돌리고 아무것도 출력하지 않는다. 커밋이나 checkout에 npm 오류가 찍히지 않는다. 설치가 실패하면 hook은 1시간 뒤에 다시 시도하고, 그 사이 기록 없이 넘어간다. 사람이 직접 실행한 명령(`.devctx/bin/devctx version` 등)은 바로 다시 설치한다.
+- 설치는 `npx`와 같은 `npm exec --yes --package <고정된 위치>`로 한다. npm 12의 Git 설치를 위해 `--allow-git=all`도 전달한다.
+- AI 도구 hook과 git hook에서 부를 때는 설치를 백그라운드로 돌리고 작업을 막지 않는다. 설치가 실패하면 다음 hook에서 수집 불가와 진단 방법을 표준 오류로 하루 한 번 알리고 로그를 남긴다. 없는 로컬 경로나 Node 누락도 같은 방식으로 알린다. hook의 정상 출력 형식과 종료 코드 `0`은 유지한다. 설치는 1시간 뒤에 다시 시도하고, 사람이 직접 실행한 명령(`.devctx/bin/devctx version` 등)은 바로 다시 시도한다.
 - `devctx doctor`의 `hook runtime` 항목이 이 PC의 hook이 실제로 실행할 devctx(설치 위치·버전)와 마지막 설치 실패 로그를 보여준다. doctor 자신은 전역 설치본으로 돌아도, hook이 쓰는 쪽을 따로 확인한다.
-- 설치본은 버전과 설치 위치(`devctx_source`)마다 따로 둔다. 패키지 버전이 같아도 커밋 SHA가 바뀌면 새로 설치한다.
+- 패키지는 npx 캐시에 두고, 이 PC에서만 버전·설치 위치별 캐시 연결을 기억한다. `npx ... init`을 실행한 PC는 받은 패키지를 첫 hook부터 바로 쓴다. 캐시가 삭제되면 다시 받는다. 이전 방식의 설치 캐시도 계속 사용할 수 있다.
 - PATH에 node가 없을 때(Dock에서 연 IDE 등) nvm 폴더를 버전 숫자 순으로 보고 `node:sqlite`를 쓸 수 있는 것(22.13+, 23.4+, 24+)을 쓴다.
 
-`devctx_source` 기본값은 이 PC의 로컬 경로라 다른 PC에서는 동작하지 않는다. 팀과 쓰려면 설치 위치를 공개 저장소의 커밋으로 정하고, 바뀐 `tools.lock`을 커밋한다.
+`devctx_source` 기본값은 실행 중인 패키지의 Git 커밋 또는 정확한 npm 버전이다. 소스 checkout에서 실행해도 Git 원격 주소와 현재 커밋을 기록한다. 출처를 확인할 수 없는 비공개 패키지는 잘못된 경로를 저장하는 대신 `--source`를 요청한다. 기존 프로젝트에 다른 PC의 로컬 경로가 남아 있다면 한 번 명시적으로 바꾼다.
 
 ```sh
-SHA=$(git -C <devctx를 clone한 폴더> rev-parse HEAD)      # 지금 쓰는 devctx의 커밋
-devctx init --source github:mhlee-lee/devctx#$SHA         # npm에 배포한 뒤라면 정확한 버전: @scope/devctx@0.1.0
+npx --yes @astrixmh/devctx init --source @astrixmh/devctx@0.1.4
 # init이 출력하는 git add 명령으로 .devctx/tools.lock과 실행 스크립트를 커밋한다
 git add -A -- .devctx && git commit -m "chore: devctx 설치 위치 고정"
 ```
@@ -146,7 +149,7 @@ devctx update --root <프로젝트>  # 그 프로젝트만
 
 - 최신 버전은 프로젝트마다 `devctx_source`의 종류로 찾는다. git 주소면 그 저장소에서 가장 높은 `v<버전>` 태그를 찾아 그 커밋 SHA로 고정한다(태그가 아직 없으면 기본 브랜치의 최신 커밋). 정확한 npm 버전이면 레지스트리의 최신 버전, 로컬 경로면 그 checkout의 지금 버전이다. 같은 설치 위치를 쓰는 프로젝트끼리는 조회와 설치를 한 번만 한다.
 - `--source <위치>`를 주면 최신 대신 그 위치로 고정한다(되돌릴 때도 쓴다). 프로젝트마다 설치 위치가 다를 수 있어서 지금 있는 프로젝트(또는 `--root`)에만 적용한다.
-- 새 버전을 hook이 쓰는 자리(`~/.local/share/devctx/versions/`)에 설치한 뒤 **새 버전의** `devctx init --source <새 위치>`로 `tools.lock`, 실행 스크립트, hook, 스킬을 갱신한다. 지금 돌고 있는 이전 버전이 새 파일을 쓰지 않는다. 도구 선택은 `config.yaml`의 `targets`를 따르고, 설정과 결정 파일은 그대로다.
+- 새 버전을 npx 캐시에 받은 뒤 **새 버전의** `devctx init --source <새 위치>`로 `tools.lock`, 실행 스크립트, hook, 스킬을 갱신한다. 이 PC의 캐시 연결은 `~/.local/share/devctx/versions/`에 둔다. 지금 돌고 있는 이전 버전이 새 파일을 쓰지 않는다. 도구 선택은 `config.yaml`의 `targets`를 따르고, 설정과 결정 파일은 그대로다.
 - 커밋하면 clone한 팀원 PC의 hook이 다음 실행 때 새 버전을 백그라운드로 설치해 쓴다.
 - 디스크를 뒤지지 않는다. 이 PC에서 `devctx init`·`devctx update`를 실행했거나 hook이 하루 한 번 점검을 돈 저장소 목록(`~/.local/share/devctx/projects.json`)과, 지금 있는 프로젝트를 옮긴다. AI 도구가 만드는 linked worktree는 넣지 않고, `devctx uninstall`하거나 지운 저장소는 빠진다. 한 프로젝트가 실패해도 나머지는 계속하고, 끝에 프로젝트별 결과를 보여준다(하나라도 실패하면 종료 코드 1).
 - 목록이 생기기 전에 설치한 프로젝트는 그 안에서 `devctx update`를 한 번 실행하면 옮겨지고 목록에 들어간다. 이 프로젝트들은 `update` 명령이 없는 버전에 고정돼 있어 `.devctx/bin/devctx update`는 "알 수 없는 명령"으로 끝나므로, 처음 한 번은 새 버전의 전역 `devctx`(`git pull` 뒤 `npm install`, `npm link`)로 실행한다.
@@ -387,9 +390,10 @@ devctx uninstall --all --yes   # 이 PC에서 devctx를 모두 지운다
 
 - 백그라운드 작업(규칙 정리 worker, 코드 색인)이 돌고 있으면 최대 10초 기다리고, 그래도 돌고 있으면 멈춘 뒤 지운다. 지운 직후 다시 생기지 않게 하려는 것이다. lock 파일의 프로세스가 실제 devctx 작업일 때만 멈춘다.
 - `.gitignore`에는 `/.devctx/` 한 줄을 남긴다. 제거 커밋을 pull한 팀원 PC에는 각자의 `.devctx/local`(프롬프트 원문이 든 로컬 DB)이 남아 있어서, 이 줄이 없으면 `git add -A`에 함께 커밋될 수 있다. 나중에 다시 `devctx init`하면 이 줄은 지워진다.
-- 팀원은 pull한 뒤 각자 PC에 남은 것(`.devctx/local`, git hook 블록, Copilot·Kiro 허용 항목)을 한 번 지운다: `npx --yes github:mhlee-lee/devctx uninstall --yes`
+- 팀원은 pull한 뒤 각자 PC에 남은 것(`.devctx/local`, git hook 블록, Copilot·Kiro 허용 항목)을 한 번 지운다: `npx --yes @astrixmh/devctx uninstall --yes`
 - 이 PC의 공용 데이터(`~/.local/share/devctx/`: 설치본, 개인 선호, 모델 평가, 프로젝트 목록)는 다른 프로젝트가 쓸 수 있어서 프로젝트 하나를 지울 때는 남긴다. `--all`은 등록된 모든 프로젝트(와 지금 있는 프로젝트)에서 지운 뒤 이 폴더와, devctx가 Copilot CLI·Kiro 권한 파일을 처음 고칠 때 만든 백업(`*.devctx-backup`)까지 지운다.
-- 전역 `devctx` 명령은 npm이 관리하므로 직접 지운다: `npm rm -g devctx` (`npm link`로 연결했어도 같다). 목록에 없는 프로젝트(이 PC에서 init이나 hook이 한 번도 돌지 않은 clone)는 그 안에서 `devctx uninstall --yes`로 지운다.
+- npx가 관리하는 npm 캐시는 제거 대상에 포함하지 않는다.
+- 전역 `devctx` 명령은 npm이 관리하므로 직접 지운다: `npm rm -g @astrixmh/devctx` (`npm link`로 연결했어도 같다). 이전 이름으로 전역 연결했다면 `npm rm -g devctx`도 실행한다. 목록에 없는 프로젝트(이 PC에서 init이나 hook이 한 번도 돌지 않은 clone)는 그 안에서 `devctx uninstall --yes`로 지운다.
 
 ## 개발
 

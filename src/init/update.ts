@@ -146,9 +146,8 @@ export function isCurrent(lock: ToolsLock, target: UpdateTarget): boolean {
 }
 
 /**
- * Puts `target` where the shim looks for it (`<versions>/<version>-<source>`), so hooks find it as
- * soon as tools.lock names it. npm installs into a staging directory first: the version (part of
- * the directory name) of a git commit is known only from its package.json.
+ * Resolve the target with npx, then remember its cache location for this PC's hooks. A separate
+ * prefix prevents local/global devctx installs from satisfying a different pinned package.
  */
 export function installTarget(target: UpdateTarget, root: string): Installed {
   if (isLocalSource(target.source)) {
@@ -159,7 +158,6 @@ export function installTarget(target: UpdateTarget, root: string): Installed {
     return { cli, version };
   }
   const versions = versionsDir();
-  // Node never strips types under node_modules: an install runs only from a built dist/cli.js.
   const found = (dir: string): Installed | null => {
     const pkg = installedPackage(dir);
     const version = pkg ? packageVersion(pkg) : null;
@@ -174,27 +172,23 @@ export function installTarget(target: UpdateTarget, root: string): Installed {
   const staging = path.join(versions, `.update-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
   fs.mkdirSync(staging);
   try {
-    // npm 12 refuses git sources unless allowed; older npm only warns about the unknown flag.
-    const r = spawnSync(npmBin(), ['install', '--prefix', staging, '--no-save', '--no-audit', '--no-fund', '--allow-git=all', target.source], {
+    const r = spawnSync(npmBin(), ['exec', '--prefix', staging, '--yes', '--no-audit', '--no-fund', '--allow-git=all', '--package', target.source, '--call', 'command -v devctx'], {
       cwd: staging,
       encoding: 'utf8',
       timeout: 600_000,
     });
-    const staged = found(staging);
-    if (r.status !== 0) throw new Error(`npm install ${target.source} failed: ${lastLine(`${r.stderr ?? ''}\n${r.error?.message ?? ''}`) || `exit ${r.status}`}`);
-    if (!staged) {
-      throw new Error(
-        installedPackage(staging)
-          ? `${target.source} installed without dist/cli.js: npm did not run its "prepare" build (npm 12 blocks it for git sources unless allowed), and Node cannot run src/cli.ts from node_modules`
-          : `npm installed ${target.source} but no devctx package was found`,
-      );
-    }
-    const final = path.join(versions, installKey({ version: staged.version, source: target.source }));
-    if (!found(final)) {
-      fs.rmSync(final, { recursive: true, force: true });
-      fs.renameSync(staging, final);
-      fs.rmSync(`${final}.install-failed`, { force: true });
-    }
+    if (r.status !== 0) throw new Error(`npx ${target.source} failed: ${lastLine(`${r.stderr ?? ''}\n${r.error?.message ?? ''}`) || `exit ${r.status}`}`);
+    const bin = r.stdout.trim().split('\n').at(-1);
+    if (!bin) throw new Error(`npx installed ${target.source} but found no devctx command`);
+    const pkg = path.dirname(path.dirname(fs.realpathSync(bin)));
+    const version = packageVersion(pkg);
+    if (!version || !fs.existsSync(path.join(pkg, 'dist', 'cli.js'))) throw new Error(`${target.source} has no built dist/cli.js; its prepare build must run before use`);
+    if (target.version && target.version !== version) throw new Error(`npx resolved ${version}, but ${target.source} requires ${target.version}`);
+    const final = path.join(versions, installKey({ version, source: target.source }));
+    fs.mkdirSync(final, { recursive: true });
+    fs.writeFileSync(path.join(final, 'runtime'), `${pkg}\n`);
+    fs.rmSync(`${final}.install-failed`, { force: true });
+    fs.rmSync(`${final}.warned`, { force: true });
     const done = found(final);
     if (!done) throw new Error(`installed ${target.source} but found no devctx CLI in ${final}`);
     return done;

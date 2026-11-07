@@ -1,6 +1,6 @@
 # 처음 사용하는 사람을 위한 안내
 
-devctx를 처음 쓸 때 알아야 할 것만 모았다. 설치 명령은 [README](../README.md), 내부 구조는 [동작 방식](how-it-works.md)에 있다.
+devctx를 처음 쓸 때 알아야 할 것만 모았다. 프로젝트에서 `npx --yes @astrixmh/devctx init`으로 시작한다. 전역 설치가 없다면 아래의 `devctx <명령>`은 `.devctx/bin/devctx <명령>`으로 실행한다. 자세한 설치 명령은 [README](../README.md), 내부 구조는 [동작 방식](how-it-works.md)에 있다.
 
 ## 1. 한 줄 요약
 
@@ -19,13 +19,7 @@ AI 도구와 대화하며 정한 규칙을 자동으로 Git에 남기고, Claude
    - Cursor, VS Code: 신뢰한 워크스페이스로 연다
 3. 로그인된 AI CLI가 하나 이상 있어야 한다(`claude`, `codex`, `copilot`, `cursor-agent`, `kiro-cli`). 규칙 추출에 이 CLI를 쓴다. 없으면 "앞으로", "항상" 같은 표현이 있는 문장만 확인 대기로 남고, 표시 없이 말한 지시는 기록되지 않는다.
 4. `devctx doctor`로 hook, git hook, 실행 스크립트(`hook runtime`: hook이 실제로 실행할 devctx), 설치된 CLI를 확인한다. 여기서 `ok`는 파일과 설치가 맞다는 뜻이다. AI CLI가 로그인되어 실제로 답하는지는 아래 5분 확인의 4단계로 본다.
-5. 팀과 공유한다면 설치 위치를 공개 저장소의 커밋으로 정하고 커밋한다. 기본값은 이 PC의 경로라 다른 PC에서 동작하지 않는다.
-   ```sh
-   SHA=$(git -C <devctx를 clone한 폴더> rev-parse HEAD)
-   devctx init --source github:mhlee-lee/devctx#$SHA
-   git add -A -- .devctx && git commit -m "chore: devctx 설치 위치 고정"
-   ```
-   팀원 PC는 hook이 처음 실행될 때 이 코드를 설치해 실행하므로, 태그나 브랜치처럼 나중에 바뀔 수 있는 값은 쓰지 않는다. `init`을 다시 실행해도 이 값은 `--source`를 줄 때만 바뀐다.
+5. `.devctx/tools.lock`에 개인 경로가 아닌 Git 커밋 또는 정확한 npm 버전이 기록됐는지 확인한다. `npx ... init`이 받은 패키지의 출처로 자동 고정한다. 기존 프로젝트에 로컬 경로가 남아 있다면 `devctx init --source <커밋 SHA를 붙인 Git 주소>`로 한 번 바꾼다. 팀원 PC는 hook이 처음 실행될 때 같은 패키지를 npx로 받는다. `init`을 다시 실행해도 이 값은 `--source`를 줄 때만 바뀐다.
 
 ### 5분 확인: 규칙 하나가 저장되고 AI에 전달되는지
 

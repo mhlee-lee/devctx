@@ -53,7 +53,7 @@ import { ensureGitAttributes, ensureGitIgnore } from '../src/init/attributes.ts'
 import { GENERATED_MARKER, hasAgentsBlock, renderAgentsBlock, RULES_FILE, withAgentsBlock } from '../src/compile/render.ts';
 import { recentChanges, sessionContext } from '../src/hooks/context.ts';
 import { runInit } from '../src/init/init.ts';
-import { installKey, readToolsLock, renderShim, renderToolsLock, shimStatus } from '../src/init/shim.ts';
+import { defaultSource, installKey, readToolsLock, rememberRuntime, renderShim, renderToolsLock, shimStatus } from '../src/init/shim.ts';
 import { registeredProjects, registerProject } from '../src/init/projects.ts';
 import { gitRemoteUrls, latestReleaseTag } from '../src/init/update.ts';
 import { approveProposal, discardProposal, listProposals, resolveConflict } from '../src/memory/manual.ts';
@@ -1352,7 +1352,9 @@ let paraphraseLine = '';
     }
     check('install', 'a failing install prints nothing in a git hook and is reported by doctor', quiet.every((q) => q.status === 0 && q.stdout + q.stderr === '') && status.cli === null && status.failed?.log.includes('EALLOWGIT') === true, JSON.stringify({ out: quiet.map((q) => q.stdout + q.stderr), status }));
     check('install', 'a stale install lock is taken over by one call, not by every call', npmCalls() === 1, String(npmCalls()));
-    spawnSync('/bin/sh', [shim, 'hook', '--tool', 'claude', '--event', 'stop'], { encoding: 'utf8', env: hookEnv });
+    const warning = spawnSync('/bin/sh', [shim, 'hook', '--tool', 'claude', '--event', 'stop'], { encoding: 'utf8', env: hookEnv });
+    const repeated = spawnSync('/bin/sh', [shim, 'git-hook', 'pre-commit'], { encoding: 'utf8', env: hookEnv });
+    check('install', 'a background failure warns on the next hook without blocking or repeating on every call', warning.status === 0 && warning.stdout === '' && warning.stderr.includes('automatic capture is unavailable') && repeated.status === 0 && repeated.stdout + repeated.stderr === '', warning.stdout + warning.stderr + repeated.stderr);
     await new Promise((r) => setTimeout(r, 300));
     const afterBackoff = npmCalls();
     const again = spawnSync('/bin/sh', [shim, 'version'], { encoding: 'utf8', env: hookEnv });
@@ -1367,6 +1369,55 @@ let paraphraseLine = '';
     check('install', 'a new commit of the same package version gets its own install', installKey(lock) !== installKey({ ...lock, source: `github:nobody/devctx#${'1'.repeat(40)}` }));
     check('install', 'tools.lock suggests a commit SHA, not a movable tag', !renderToolsLock(lock).includes('#v1.2.3'));
 
+    // A teammate's missing checkout cannot be bootstrapped: report it even though hooks stay
+    // non-blocking, and preserve Cursor's JSON protocol rather than writing warnings to stdout.
+    const missing = { version: '9.9.9', source: path.join(tmp, 'another-computer/devctx') };
+    fs.writeFileSync(path.join(shimRepo, '.devctx/tools.lock'), renderToolsLock(missing));
+    const missingHook = () => spawnSync('/bin/sh', [shim, 'hook', '--tool', 'cursor', '--event', 'prompt'], { encoding: 'utf8', env: hookEnv });
+    const firstMissing = missingHook();
+    const repeatMissing = missingHook();
+    const missingStatus = shimStatus(shimRepo);
+    const missingCommand = spawnSync('/bin/sh', [shim, 'version'], { encoding: 'utf8', env: hookEnv });
+    check('install', 'a missing local source leaves a diagnostic and one warning, with a valid Cursor fallback and no npm attempt', firstMissing.status === 0 && firstMissing.stdout === '{"continue":true}' && firstMissing.stderr.includes('automatic capture is unavailable') && repeatMissing.stdout === '{"continue":true}' && repeatMissing.stderr === '' && missingStatus.failed?.log.includes(missing.source) === true && missingCommand.status === 1 && missingCommand.stderr.includes('init --source') && npmCalls() === 2, JSON.stringify({ firstMissing, repeatMissing, missingStatus, calls: npmCalls() }));
+
+    // npx installs a private Git package in a temporary path. Its npm provenance, rather than
+    // that path or an unpublished devctx@version, must become the shared source.
+    const npxModules = path.join(tmp, 'npx cache/node_modules');
+    const npxPackage = path.join(npxModules, 'devctx');
+    fs.mkdirSync(path.join(npxPackage, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(npxPackage, 'package.json'), JSON.stringify({ name: 'devctx', version: '9.9.9', private: true }));
+    fs.writeFileSync(path.join(npxPackage, 'dist/cli.js'), 'console.log("npx cache works")');
+    const npxSource = `github:team/devctx#${'a'.repeat(40)}`;
+    fs.writeFileSync(path.join(npxModules, '.package-lock.json'), JSON.stringify({ packages: { 'node_modules/devctx': { resolved: `git+ssh://git@github.com/team/devctx.git#${'a'.repeat(40)}` } } }));
+    check('install', 'npx Git installs default to their resolved commit, never the cache path or an unpublished npm version', defaultSource(npxPackage) === npxSource, defaultSource(npxPackage));
+    const npxLock = { version: '9.9.9', source: npxSource };
+    rememberRuntime(npxLock, npxPackage);
+    fs.writeFileSync(path.join(shimRepo, '.devctx/tools.lock'), renderToolsLock(npxLock));
+    const cachedRun = spawnSync('/bin/sh', [shim, 'version'], { encoding: 'utf8', env: { ...shimEnv, PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` } });
+    check('install', 'init can reuse its npx runtime immediately, and doctor resolves the same cache', cachedRun.status === 0 && cachedRun.stdout.trim() === 'npx cache works' && shimStatus(shimRepo).cli === path.join(npxPackage, 'dist/cli.js'), cachedRun.stdout + cachedRun.stderr);
+    fs.unlinkSync(path.join(npxModules, '.package-lock.json'));
+    let unknownPrivateRejected = false;
+    try { defaultSource(npxPackage); } catch { unknownPrivateRejected = true; }
+    check('install', 'private packages without provenance require an explicit source instead of recording an unusable path', unknownPrivateRejected);
+    fs.writeFileSync(path.join(npxModules, '.package-lock.json'), JSON.stringify({ packages: { 'node_modules/devctx': { resolved: `git+file://${path.join(tmp, 'local-upstream')}#${'a'.repeat(40)}` } } }));
+    let localGitRejected = false;
+    try { defaultSource(npxPackage); } catch { localGitRejected = true; }
+    check('install', 'a local Git transport is not mistaken for a portable package source', localGitRejected);
+    fs.unlinkSync(path.join(npxModules, '.package-lock.json'));
+    fs.writeFileSync(path.join(npxPackage, 'package.json'), JSON.stringify({ name: '@team/devctx', version: '9.9.9' }));
+    check('install', 'registry installations default to their exact npm version', defaultSource(npxPackage) === '@team/devctx@9.9.9');
+
+    const checkout = path.join(tmp, 'checkout');
+    fs.mkdirSync(checkout);
+    git(['init', '-q'], checkout);
+    git(['config', 'user.email', 'dev@example.com'], checkout);
+    git(['config', 'user.name', 'Dev'], checkout);
+    fs.writeFileSync(path.join(checkout, 'package.json'), '{"name":"devctx","version":"9.9.9","private":true}');
+    git(['add', 'package.json'], checkout);
+    git(['commit', '-qm', 'package'], checkout);
+    git(['remote', 'add', 'origin', 'https://github.com/team/devctx.git'], checkout);
+    check('install', 'a source checkout also defaults to its remote and full commit, not a personal directory', defaultSource(checkout) === `github:team/devctx#${git(['rev-parse', 'HEAD'], checkout).stdout}`, defaultSource(checkout));
+
     // The version in tools.lock always belongs to its source.
     const initRoot = path.join(tmp, 'init');
     fs.mkdirSync(initRoot);
@@ -1377,6 +1428,15 @@ let paraphraseLine = '';
     runInit({ ...base, source: null });
     const kept = readToolsLock(projectPaths(initRoot).toolsLock);
     check('install', 'an exact npm source sets the version; re-running init moves neither', pinned?.version === '0.3.0' && kept?.version === '0.3.0' && kept.source === '@team/devctx@0.3.0', JSON.stringify(kept));
+    fs.writeFileSync(projectPaths(initRoot).toolsLock, renderToolsLock({ ...missing, version: '0.0.1' }));
+    runInit({ ...base, source: null });
+    const keptLocal = readToolsLock(projectPaths(initRoot).toolsLock);
+    const missingDoctor = (await runDoctor(initRoot, null)).find((c) => c.name === 'hook runtime');
+    check('install', 'refreshing hooks preserves an existing local pin and version; doctor marks an unavailable runtime as failed before any hook', keptLocal?.version === '0.0.1' && keptLocal.source === missing.source && missingDoctor?.level === 'fail', JSON.stringify({ keptLocal, missingDoctor }));
+    fs.unlinkSync(projectPaths(initRoot).toolsLock);
+    runInit({ ...base, source: null });
+    const portable = readToolsLock(projectPaths(initRoot).toolsLock);
+    check('install', 'init without a source writes a portable immutable Git pin', portable?.source.startsWith('github:') === true && sourcePinProblem(portable.source) === null, JSON.stringify(portable));
 
     // `devctx update`: the newest release tag by number (annotated tags peeled, pre-releases skipped).
     const sha = (c: string) => c.repeat(40);
@@ -1410,7 +1470,7 @@ console.log('init by ' + v);
 `,
     );
     const release = (version: string, tag: string | null): string => {
-      fs.writeFileSync(path.join(upstream, 'package.json'), JSON.stringify({ name: 'devctx', version }));
+      fs.writeFileSync(path.join(upstream, 'package.json'), JSON.stringify({ name: 'devctx', version, bin: { devctx: 'dist/cli.js' } }));
       git(['add', '-A'], upstream);
       git(['commit', '-qm', version], upstream);
       if (tag) git(['tag', '-a', tag, '-m', tag], upstream);
@@ -1454,6 +1514,24 @@ console.log('init by ' + v);
     git(['worktree', 'add', '-q', path.join(tmp, 'app-wt')], app);
     registerProject(path.join(tmp, 'app-wt'));
     check('update', 'uninstall drops a project from the registry; linked worktrees are never added', JSON.stringify(registeredProjects()) === JSON.stringify([app]) && fs.existsSync(path.join(tmp, 'app-wt/.devctx/tools.lock')), JSON.stringify(registeredProjects()));
+
+    // A teammate's first direct command must resolve the same package through npx, without
+    // copying it into devctx's own versions directory. A lost cache pointer is recoverable.
+    process.env.DEVCTX_HOME = path.join(tmp, 'fresh-machine');
+    const fresh = path.join(tmp, 'fresh-project');
+    fs.mkdirSync(path.join(fresh, '.devctx/bin'), { recursive: true });
+    const freshShim = path.join(fresh, '.devctx/bin/devctx');
+    const freshLock = { version: '0.2.0', source: `git+file://${upstream}#${newSha}` };
+    fs.writeFileSync(freshShim, renderShim(), { mode: 0o755 });
+    fs.writeFileSync(path.join(fresh, '.devctx/tools.lock'), renderToolsLock(freshLock));
+    const bootstrap = () => spawnSync('/bin/sh', [freshShim, 'version'], { encoding: 'utf8', env: { ...process.env, DEVCTX_CLI: '' }, timeout: 60_000 });
+    const firstRun = bootstrap();
+    const freshStatus = shimStatus(fresh);
+    check('install', 'a fresh shim bootstraps through npx, then doctor and the hook use the same cached CLI', firstRun.status === 0 && firstRun.stdout.trim() === '0.2.0' && freshStatus.installedVersion === '0.2.0' && freshStatus.cli?.includes(`${path.sep}_npx${path.sep}`) === true, firstRun.stdout + firstRun.stderr + JSON.stringify(freshStatus));
+    const runtimeFile = path.join(process.env.DEVCTX_HOME, 'versions', installKey(freshLock), 'runtime');
+    fs.writeFileSync(runtimeFile, path.join(tmp, 'evicted-npx-cache'));
+    const repairedRun = bootstrap();
+    check('install', 'an evicted npx runtime pointer is automatically resolved again', repairedRun.status === 0 && repairedRun.stdout.trim() === '0.2.0' && shimStatus(fresh).cli === freshStatus.cli, repairedRun.stdout + repairedRun.stderr);
     process.env.DEVCTX_HOME = sectionHome;
 
     // A project for the commands below.

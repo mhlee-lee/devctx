@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readJson, readText } from '../util/fsx.ts';
+import { git } from '../util/git.ts';
 import { packageRoot } from '../util/paths.ts';
 
 export interface ToolsLock {
@@ -14,17 +15,52 @@ export function packageInfo(): { name: string; version: string } {
   return { name: pkg.name ?? 'devctx', version: pkg.version ?? '0.0.0' };
 }
 
-/**
- * Where teammates' shims install devctx from. A local checkout is recorded as a path (works on
- * this machine only); an installed package as `<name>@<version>`.
- */
-export function defaultSource(): string {
-  const root = packageRoot();
-  if (root.split(path.sep).includes('node_modules')) {
-    const { name, version } = packageInfo();
-    return `${name}@${version}`;
+/** Turn a remote into an npm git spec, keeping the exact commit (also for npx installs). */
+function pinnedGitSource(remote: string, sha: string): string | null {
+  if (!/^[0-9a-f]{40}$/i.test(sha) || /^git\+file:/.test(remote)) return null;
+  const hosted = /^(?:git\+)?(?:https?:\/\/|ssh:\/\/git@|git@)(github\.com|gitlab\.com|bitbucket\.org)[/:](.+?)(?:\.git)?$/.exec(remote);
+  if (hosted) {
+    const host = { 'github.com': 'github', 'gitlab.com': 'gitlab', 'bitbucket.org': 'bitbucket' }[hosted[1]!];
+    return `${host}:${hosted[2]}#${sha}`;
   }
-  return root;
+  if (/^(github:|gitlab:|bitbucket:|git\+|git:\/\/)/.test(remote)) return `${remote}#${sha}`;
+  if (/^(https?|ssh):\/\//.test(remote)) return `git+${remote}#${sha}`;
+  const ssh = /^([^@\s]+@[^:\s]+):(.+)$/.exec(remote);
+  return ssh ? `git+ssh://${ssh[1]}/${ssh[2]}#${sha}` : null;
+}
+
+/**
+ * Pin the package, never the temporary npx directory. Git installs keep their resolved commit;
+ * registry installs keep their exact version. An unidentifiable private package needs --source.
+ */
+export function defaultSource(root = packageRoot()): string {
+  const pkg = readJson<{ name?: string; version?: string; private?: boolean; _resolved?: string }>(path.join(root, 'package.json'), {});
+  let modules = root;
+  while (path.basename(modules) !== 'node_modules' && path.dirname(modules) !== modules) modules = path.dirname(modules);
+  if (path.basename(modules) === 'node_modules') {
+    const entry = path.relative(path.dirname(modules), root).split(path.sep).join('/');
+    const provenance = [pkg._resolved];
+    for (const file of [path.join(modules, '.package-lock.json'), path.join(path.dirname(modules), 'package-lock.json')]) {
+      const lock = readJson<{ packages?: Record<string, { resolved?: string }> }>(file, {});
+      provenance.push(lock.packages?.[entry]?.resolved);
+    }
+    const resolved = provenance.find((s) => s && isGitSource(s));
+    if (resolved) {
+      const source = sourcePinProblem(resolved) === null ? pinnedGitSource(resolved.replace(/#.*$/, ''), resolved.slice(resolved.indexOf('#') + 1)) : null;
+      if (source) return source;
+    } else if (!pkg.private && pkg.name && pkg.version) {
+      return `${pkg.name}@${pkg.version}`;
+    }
+  } else {
+    const top = git(['rev-parse', '--show-toplevel'], root);
+    if (top.ok && fs.realpathSync(top.stdout) === fs.realpathSync(root)) {
+      const remote = git(['remote', 'get-url', 'origin'], root);
+      const head = git(['rev-parse', 'HEAD'], root);
+      const source = remote.ok && head.ok ? pinnedGitSource(remote.stdout, head.stdout) : null;
+      if (source) return source;
+    }
+  }
+  throw new Error('Cannot determine a portable devctx package source. Run devctx init --source <git URL with commit SHA or exact npm version>. For local development, pass --source <checkout path> explicitly.');
 }
 
 export function renderToolsLock(lock: ToolsLock): string {
@@ -86,16 +122,26 @@ export function packageCli(pkg: string): string | null {
   return [path.join(pkg, 'dist', 'cli.js'), path.join(pkg, 'src', 'cli.ts')].find((f) => fs.existsSync(f)) ?? null;
 }
 
-/** The devctx package npm installed under `<prefix>/node_modules` (also a scoped one), as the shim looks for it. */
+/** The built npx package, or a legacy install under `<prefix>/node_modules`. */
 export function installedPackage(prefix: string): string | null {
   const base = path.join(prefix, 'node_modules');
-  const candidates = [path.join(base, 'devctx')];
+  // npx owns the install. Only this PC's pointer to its cache is kept here; never in tools.lock.
+  const runtime = readText(path.join(prefix, 'runtime'))?.trim();
+  const candidates = [...(runtime ? [runtime] : []), path.join(base, 'devctx')];
   try {
     for (const scope of fs.readdirSync(base)) if (scope.startsWith('@')) candidates.push(path.join(base, scope, 'devctx'));
   } catch {
     // not installed
   }
-  return candidates.find((pkg) => packageCli(pkg) !== null) ?? null;
+  return candidates.find((pkg) => fs.existsSync(path.join(pkg, 'dist', 'cli.js'))) ?? null;
+}
+
+/** Reuse the npx package that is already running init, so the first hook can capture immediately. */
+export function rememberRuntime(lock: ToolsLock, root = packageRoot()): void {
+  if (!root.split(path.sep).includes('node_modules') || !fs.existsSync(path.join(root, 'dist', 'cli.js'))) return;
+  const target = path.join(versionsDir(), installKey(lock));
+  fs.mkdirSync(target, { recursive: true });
+  fs.writeFileSync(path.join(target, 'runtime'), `${root}\n`);
 }
 
 /** A git URL or a hosted-git shortcut (`github:owner/repo`, `owner/repo`), as npm reads `devctx_source`. */
@@ -118,10 +164,6 @@ export function shimStatus(root: string): ShimStatus {
   if (pkg) {
     status.cli = packageCli(pkg);
     status.installedVersion = readJson<{ version?: string }>(path.join(pkg, 'package.json'), {}).version ?? null;
-  }
-  if (!status.cli) {
-    const local = path.join(root, 'node_modules', 'devctx', 'dist', 'cli.js');
-    if (fs.existsSync(local)) status.cli = local;
   }
   const failedFile = `${target}.install-failed`;
   if (!status.cli && fs.existsSync(failedFile)) {
@@ -160,7 +202,7 @@ export function sourcePinProblem(source: string): string | null {
 export function renderShim(): string {
   return `#!/bin/sh
 # devctx shim (generated by "devctx init", commit it). Runs the devctx version pinned in
-# .devctx/tools.lock. Hook calls (AI tools and git hooks) never fail, print errors or block.
+# .devctx/tools.lock. npx owns the installs. Hooks never block; failures warn at most daily.
 quiet=0
 case "\${1:-}" in hook|git-hook) quiet=1 ;; esac
 if [ "\${1:-}" = "hook" ] && [ -n "\${DEVCTX_INTERNAL:-}" ]; then exit 0; fi
@@ -183,6 +225,31 @@ if [ "\${#key_src}" -gt 120 ]; then
   key_src="$(printf '%s' "$key_src" | cut -c1-60)$(printf '%s' "$key_src" | tail -c 60)"
 fi
 key="$version-$key_src"
+target="$data/versions/$key"
+log="$target.install.log"
+failed="$target.install-failed"
+busy="$target.installing"
+warned="$target.warned"
+
+warn_failure() {
+  [ -f "$failed" ] || return 0
+  if [ -f "$warned" ] && [ -n "$(find "$warned" -mmin -1440 2>/dev/null)" ]; then return 0; fi
+  echo "devctx: automatic capture is unavailable in $root. Run devctx doctor; details: $log" >&2
+  date >"$warned" 2>/dev/null
+}
+
+runtime_failure() {
+  message="$1"; shift
+  mkdir -p "$data/versions" 2>/dev/null
+  if [ "$(cat "$log" 2>/dev/null)" != "$message" ]; then
+    printf '%s\\n' "$message" >"$log" 2>/dev/null
+    date >"$failed" 2>/dev/null
+    rm -f "$warned" 2>/dev/null
+  fi
+  if [ "$quiet" = 1 ]; then warn_failure; hook_fallback "$@"; fi
+  echo "devctx: $message" >&2
+  exit 1
+}
 
 # node:sqlite without a flag: Node 22.13+, 23.4+ or 24+. A binary that passed is remembered by path.
 node_ok() {
@@ -214,22 +281,17 @@ find_node() {
 }
 
 if ! node_bin=$(find_node); then
-  [ "$quiet" = 1 ] && hook_fallback "$@"
-  echo "devctx: node >= 22.13 not found" >&2
-  exit 1
+  runtime_failure "node >= 22.13 not found" "$@"
 fi
 
 cli=""
-# src/cli.ts runs through Node's type stripping: npm 12 blocks the "prepare" build of git
-# installs, so an installed package may ship sources without dist/.
+runtime=$(cat "$target/runtime" 2>/dev/null)
 for c in "\${DEVCTX_CLI:-}" \\
+  "\${runtime:+$runtime/dist/cli.js}" \\
   "$data/versions/$key/node_modules/devctx/dist/cli.js" \\
   "$data/versions/$key"/node_modules/@*/devctx/dist/cli.js \\
-  "$data/versions/$key/node_modules/devctx/src/cli.ts" \\
-  "$data/versions/$key"/node_modules/@*/devctx/src/cli.ts \\
   "$source/dist/cli.js" \\
-  "$source/src/cli.ts" \\
-  "$root/node_modules/devctx/dist/cli.js"; do
+  "$source/src/cli.ts"; do
   if [ -n "$c" ] && [ -f "$c" ]; then cli="$c"; break; fi
 done
 
@@ -240,19 +302,19 @@ if [ -z "$cli" ]; then
   # without this every hook call would spawn a failing npm install.
   case "$source" in /*|./*|../*) [ -e "$source" ] || installable=0 ;; esac
   if [ "$installable" = 0 ]; then
-    [ "$quiet" = 1 ] && hook_fallback "$@"
-    echo "devctx: CLI not found. Set devctx_source in .devctx/tools.lock to an npm spec or git URL" >&2
-    exit 1
+    runtime_failure "CLI not found at $source. Run devctx init --source <git URL with commit SHA or exact npm version> to repair .devctx/tools.lock" "$@"
   fi
   npm_bin="$(dirname "$node_bin")/npm"
   [ -x "$npm_bin" ] || npm_bin=npm
-  target="$data/versions/$key"
-  log="$target.install.log"
-  failed="$target.install-failed"
-  busy="$target.installing"
-  # npm 12 refuses git sources unless allowed; older npm only warns about the unknown flag.
+  # npm exec is npx. Use a separate prefix so the project's dependencies or a global devctx
+  # cannot satisfy the requested package. npx keeps the actual package in its own cache.
   do_install() {
-    mkdir -p "$target" && "$npm_bin" install --prefix "$target" --no-save --no-audit --no-fund --allow-git=all "$source"
+    mkdir -p "$target" || return 1
+    npx_cli=$(PATH="$(dirname "$node_bin"):$PATH" "$npm_bin" exec --prefix "$target" --yes --no-audit --no-fund --allow-git=all --package "$source" --call 'command -v devctx') || return 1
+    npx_cli=$(printf '%s\\n' "$npx_cli" | tail -n 1)
+    npx_pkg=$("$node_bin" -e 'const fs = require("node:fs"), p = require("node:path"); console.log(p.dirname(p.dirname(fs.realpathSync(process.argv[1]))))' "$npx_cli") || return 1
+    [ -f "$npx_pkg/dist/cli.js" ] || { echo "npx package has no dist/cli.js (its prepare build did not run)" >&2; return 1; }
+    printf '%s\\n' "$npx_pkg" >"$target/runtime"
   }
   # One install at a time. A lock left by an install that was killed (sleep, reboot) is taken
   # over after 30 minutes and recreated, so its age starts again.
@@ -264,11 +326,12 @@ if [ -z "$cli" ]; then
     mkdir "$busy" 2>/dev/null
   }
   if [ "$quiet" = 1 ]; then
+    warn_failure
     # Hooks: a failed install is retried after an hour, not on every hook call and commit.
     if [ -f "$failed" ] && [ -n "$(find "$failed" -mmin -60 2>/dev/null)" ]; then hook_fallback "$@"; fi
     # First run on this machine: install in the background, a later call uses it.
     if take_lock; then
-      ( if do_install >"$log" 2>&1; then rm -f "$failed"; else date >"$failed"; fi; rmdir "$busy" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+      ( if do_install >"$log" 2>&1; then rm -f "$failed" "$warned"; else date >"$failed"; fi; rmdir "$busy" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
     fi
     hook_fallback "$@"
   fi
@@ -277,14 +340,12 @@ if [ -z "$cli" ]; then
     echo "devctx: $source is being installed in the background; try again in a minute" >&2
     exit 1
   fi
-  if do_install >&2; then rm -f "$failed"; rmdir "$busy" 2>/dev/null; else date >"$failed"; rmdir "$busy" 2>/dev/null; exit 1; fi
-  for c in "$target/node_modules/devctx/dist/cli.js" "$target"/node_modules/@*/devctx/dist/cli.js \\
-    "$target/node_modules/devctx/src/cli.ts" "$target"/node_modules/@*/devctx/src/cli.ts; do
-    [ -f "$c" ] && cli="$c" && break
-  done
-  [ -n "$cli" ] || { echo "devctx: installed package has no dist/cli.js or src/cli.ts" >&2; exit 1; }
+  if do_install >"$log" 2>&1; then rm -f "$failed" "$warned"; rmdir "$busy" 2>/dev/null; else date >"$failed"; rmdir "$busy" 2>/dev/null; cat "$log" >&2; exit 1; fi
+  runtime=$(cat "$target/runtime" 2>/dev/null)
+  cli="$runtime/dist/cli.js"
 fi
 
+rm -f "$failed" "$warned" 2>/dev/null
 case "$cli" in
   *.ts) exec "$node_bin" --experimental-strip-types --disable-warning=ExperimentalWarning "$cli" "$@" ;;
 esac
